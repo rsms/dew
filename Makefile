@@ -99,7 +99,7 @@ dev-web:
 	'$(MAKE) DEBUG=1 TARGET=web'
 
 test:
-	$(MAKE) TEST=1 _test
+	$(MAKE) TEST=1 EMBED_SRC=0 _test
 _test: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew --selftest$(if $(filter 1,$(V)),=v,)
 
