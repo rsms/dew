@@ -237,6 +237,11 @@ export class Runtime {
 			syscall_I: syscall,
 			syscall_f: syscall,
 
+			clock() {
+				// WASI libc defines return value to be in nanoseconds
+				return BigInt((performance.now() * 1000000) >>> 0)
+			},
+
 			wlongjmp_scope(block_ptr) {
 				try {
 					rt.instance.exports.exec_block(block_ptr)

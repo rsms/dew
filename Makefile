@@ -12,6 +12,17 @@ LUA_SRCS    := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex
                lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c loslib.c \
                lstrlib.c ltablib.c lutf8lib.c linit.c
 LUA_SRCS    := $(sort $(addprefix lua/src/,$(LUA_SRCS)))
+LSRCS       := util.lua \
+               unit.lua \
+               diag.lua \
+               srcpos.lua \
+               tokenize.lua \
+               id.lua \
+               ast.lua \
+               parse.lua \
+               resolve.lua \
+               codegen.lua \
+               dew.lua
 JSSRCS      := $(wildcard web/*.ts web/index.html)
 LUA_OBJS    := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(LUA_SRCS)))
 DEW_OBJS    := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(SRCS)))
@@ -32,13 +43,21 @@ else ifeq ($(TARGET),linux)
 	LDFLAGS += -Wl,-E -ldl
 else ifeq ($(TARGET),web)
 	ALL := $(BUILDDIR)/dew.wasm $(BUILDDIR)/dew.js $(BUILDDIR)/index.html
-	CFLAGS += --target=wasm32-playbit -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS
+	CFLAGS += --target=wasm32-playbit
 	CFLAGS += -fvisibility=hidden
-	LDFLAGS += --target=wasm32-playbit -lwasi-emulated-signal -lwasi-emulated-process-clocks
+	LDFLAGS += --target=wasm32-playbit
+
+	CFLAGS += -D_WASI_EMULATED_SIGNAL
+	#LDFLAGS += -lwasi-emulated-signal
+
+	CFLAGS += -D_WASI_EMULATED_PROCESS_CLOCKS
+	#LDFLAGS += -lwasi-emulated-process-clocks
+
 	LDFLAGS += -Wl,--export-dynamic
 	LDFLAGS += -Wl,-allow-undefined-file,wasm.syms
 	CFLAGS += $(if $(shell [ -t 2 ] && echo 1),-fcolor-diagnostics,)
 	CFLAGS += -fblocks
+	CFLAGS += -DDEW_ENABLE_WIZER=1
 	LDFLAGS += -fblocks -lBlocksRuntime
 	WOPTFLAGS := --asyncify --no-validation \
 	             --enable-bulk-memory \
@@ -109,18 +128,7 @@ $(BUILDDIR)/dew: $(OBJS)
 	$(Q)mkdir -p $(@D)
 	$(Q)$(CC) -o $@ $^ $(LDFLAGS)
 
-LSRCS := \
-	util.lua \
-	unit.lua \
-	diag.lua \
-	srcpos.lua \
-	tokenize.lua \
-	id.lua \
-	ast.lua \
-	parse.lua \
-	resolve.lua \
-	codegen.lua
-$(BUILDDIR)/dew.lua: $(LSRCS) dew.lua
+$(BUILDDIR)/dew.lua: $(LSRCS)
 	$(QLOG) "GEN   $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)rm -f $@
@@ -149,6 +157,15 @@ $(BUILDDIR)/index.html: web/index.html
 	$(QLOG) "COPY  $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)cp $< $@
+
+run-wizer:
+	WASMTIME_BACKTRACE_DETAILS=1 \
+	/Users/rsms/Downloads/wizer-v7.0.5-aarch64-macos/wizer \
+		--wasm-bulk-memory true \
+		--allow-wasi \
+		-o o.web.debug/dew.wasm \
+		o.web.debug/dew.wasm
+.PHONY: run-wizer
 
 # tools that run on build host (NATIVE)
 ifeq ($(NATIVE_SYS),$(TARGET))
