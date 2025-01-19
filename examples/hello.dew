@@ -1,0 +1,2 @@
+fun print(... any) void
+print(123)

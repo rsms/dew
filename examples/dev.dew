@@ -1,0 +1,126 @@
+// // basic arithmetic
+// 1 + (2 + 3) * (4 - 5)
+// 6 + 7
+// 8 / (9 + 10)
+// 3 * 2.8
+
+// // functions
+// fun f(x, y int) int {
+// 	return x + y + z
+// }
+
+// fun print(... any) void
+
+// // function calls
+// print(f(3, 4))
+// fun (x, y int) { x * y }(2, 3)
+
+
+// foo
+// 18446744073709551615
+// 12345
+// 1234567.890123456789
+
+// x := i64(-9223372036854775808)
+// x := i32(-2147483648)
+
+// fun tuples {
+// 	t = (1, 2.0, 3, (4, 5.5))
+// }
+
+// fun int16.bitcast(self, v any) int16
+
+// fun f() int                     -- PRIMTYPE
+// fun f() (x int)                 -- PARAM
+// fun f() (x int, y float, z int) -- TUPLE
+// fun f() (int, float, int)       -- TUPLETYPE
+
+// // fun f(a, b int) (x int, y float, z int) {
+// fun f(x, y int) (r int, g float, b int) {
+// // fun f(x, y int) (int, float, int) {
+// 	return 1, 2.2, 2
+// }
+// // print(f())
+
+// fun f(x, y int) { return 1, 2 }
+// fun f(x, y int) (int, int) { return 1 } // error: not enough return values
+// fun f(x, y int) (int, int) { return 1, 2, 3 } // error: too many return values
+// fun f(x, y int) (int, int) { return 1, 2.2 } // error: cannot use value of type float as int
+// fun f(x, y int) int { return 2.2 } // error: cannot use value of type float as int
+
+fun f(x, ... int) ... int { return ... }
+// fun f(x, ... int) [int] { return ... }
+
+// fun example(f fun(int)int) {
+// 	return fun(x int)int {
+// 		return x*x
+// 	}
+// }
+
+// fun main {
+	// t = (1, 2)
+	// a, b, c = 1, 2.3, 4
+	// a, b, c = 1, 2 // error: missing value for 'c'
+	// a, b = 1 // error: missing value for 'b'
+	// a, b, c = (1, 2) // error: not enough values
+	// a, b = (1, 2, 3) // error: too many values
+	// a, b, c = 1, 2 // error: missing value for 'c'
+
+	// t = (1, 2.2, int8(3)) ; a, b, c = t
+	// a = 0; t = (1, 2.2, int8(3)) ; a, b, c = t
+	// a, b, c = 1, 2.2, int8(3)
+	// a = 0; a, b, c = 1, 2.2, int8(3)
+	// a, b, c = (1, 2.2, int8(3))
+	// a = 0; a, b, c = (1, 2.2, int8(3))
+	// a, b, c = f()
+	// return b
+
+	// a, c = 1, 3
+	// a, b, c, d = c, 2.1, a, 4
+
+	// a, c = 1, 3
+	// a = c
+
+	// a = 1
+	// a, b = 11, 2
+
+	// a, b = 1, a // invalid!
+	// a = 11
+// }
+// main()
+
+// fun main() {
+// 	a := uint(12345)
+// 	b := int16.bitcast(z)
+// }
+
+// TODO: unsigned-int to float conversion:
+// fun main(x any) { float(uint(12345)) }
+
+// fun main(x any) {
+// 	f := float(-12345)
+// 	i64 := int64(f)
+// 	u64 := uint64(i64)
+// 	i16 := int16(u64)
+// 	u16 := uint16(u64)
+// 	i12 := int12(u16)
+// 	u12 := uint12(u16)
+
+// 	print(i64); print(u64); print(i16); print(u16); print(i12); print(u12)
+// }
+// main(3.3)
+
+// // variables
+// fun main(x, y int) int {
+// 	// z := x * y
+// 	// return z
+// }
+// // print(main(2))
+// // main(2) // TODO: check argument arity
+
+// // variables
+// fun f(x int) int {
+// 	z := x * 2
+// 	return x + z
+// }
+// print(f(2))

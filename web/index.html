@@ -1,0 +1,35 @@
+<!DOCTYPE HTML>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<script type="module">
+import { Runtime } from "./dew.js"
+
+function log(msg) {
+    let li = document.createElement("LI");
+    let time = new Date().toISOString().replace('T', ' ')
+    li.innerText = `${time.substr(0,time.length-1)} ${msg}`
+    document.getElementById("log").appendChild(li)
+}
+
+log(`loading`)
+const rt = new Runtime()
+rt.onStdoutLine = line => log("stdout> " + line)
+rt.onStderrLine = line => log("stderr> " + line)
+rt.start(fetch("./dew.wasm"), `
+fun print(... any) void
+print(42 / 3)
+`)
+const [status, err] = await rt.done
+log(`exited with status ${status}` + (err ? ` (${err})` : ""))
+
+</script>
+<style type="text/css">
+ul { margin: 0; padding: 0; list-style: none; font:12px monospace; }
+</style>
+</head>
+<body>
+    <ul id=log>
+    </ul>
+</body>
+</html>

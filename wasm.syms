@@ -1,0 +1,5 @@
+syscall
+syscall_I
+syscall_f
+wlongjmp_scope
+wlongjmp
