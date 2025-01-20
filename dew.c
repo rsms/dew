@@ -114,6 +114,9 @@ static int do_call(lua_State* L, int narg, int nres) {
 #endif
 
 
+// #define ENABLE_SCHED
+
+
 static int pmain(lua_State* L) {
 	int argc = (int)lua_tointeger(L, 1);
 	char** argv = (char**)lua_touserdata(L, 2);
@@ -143,36 +146,67 @@ static int pmain(lua_State* L) {
 	lua_gc(L, LUA_GCRESTART);
 	lua_gc(L, LUA_GCGEN, 0, 0);  // ....
 
+	#ifdef ENABLE_SCHED
+		lua_State* L_co = lua_newthread(L);
+	#else
+		lua_State* L_co = L;
+	#endif
+
 	// load dew Lua script
 	#ifdef DEW_EMBED_SRC
 		// int status = luaL_loadfile(L, "o.darwin.debug/dew.lua");
-		int status = lua_load(L, src_readchunk, (void*)kDewLuaData, "dew.lua", "bt");
+		int status = lua_load(L_co, src_readchunk, (void*)kDewLuaData, "dew.lua", "bt");
 	#else
-		int status = luaL_loadfile(L, "dew.lua");
+		int status = luaL_loadfile(L_co, "dew.lua");
 	#endif
 	if (status != LUA_OK) {
-		check_status(L, status);
+		check_status(L_co, status);
 		return 0; // interrupt in case of error
 	}
 
 	// push on the stack the contents of table 'arg' from 1 to #arg
-	if (lua_getglobal(L, "arg") != LUA_TTABLE)
+	if (lua_getglobal(L_co, "arg") != LUA_TTABLE)
 		assert(!"'arg' is not a table");
-	int nargs = (int)luaL_len(L, -1);
-	luaL_checkstack(L, nargs + 3, "too many arguments to script"); // pre-grow stack or fail
+	int nargs = (int)luaL_len(L_co, -1);
+	luaL_checkstack(L_co, nargs + 3, "too many arguments to script"); // pre-grow stack or fail
 	for (int i = 1; i <= nargs; i++)
-		lua_rawgeti(L, -i, i);
-	lua_remove(L, -nargs); /* remove table from the stack */
+		lua_rawgeti(L_co, -i, i);
+	lua_remove(L_co, -nargs); /* remove table from the stack */
 
 	// run script
-	// #ifdef __wasm__
-	// 	return do_call(L, nargs, LUA_MULTRET);
-	// #else
-	status = do_pcall(L, nargs, LUA_MULTRET);
+
+	#ifdef ENABLE_SCHED
+	{
+		// adapted from do_pcall
+		int status;
+		int base = lua_gettop(L) - nargs;  /* function index */
+		lua_pushcfunction(L, msghandler); /* push message handler */
+		lua_insert(L, base);  /* put it under function and args */
+		g_L = L; /* for 'signal_handler' */
+		dew_setsignal(SIGINT, signal_handler); /* set C-signal handler */
+
+		int nresults;
+		for (;;) {
+			status = lua_resume(L_co, L, nargs, &nresults);
+			dlog("lua_resume => status=%d nresults=%d", status, nresults);
+			if (status != LUA_YIELD)
+				break;
+			nargs = 0;
+		}
+
+		dew_setsignal(SIGINT, SIG_DFL); /* reset C-signal handler */
+		lua_remove(L, base); /* remove message handler from the stack */
+	}
+	#else
+		status = do_pcall(L_co, nargs, LUA_MULTRET);
+	#endif
 	if (status != LUA_OK) {
-		check_status(L, status);
+		check_status(L_co, status);
 		return 0; // interrupt in case of error
 	}
+
+	// TODO: check for pending coroutines and print warnings (structured concurrency)
+
 	return 1;
 	// #endif
 }

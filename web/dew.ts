@@ -1,5 +1,6 @@
 import { WASI } from "./wasi/wasi"
 import * as WASISnapshotPreview1 from "./wasi/snapshot-preview1"
+import { Errno } from "./errno"
 
 const DEW_LUA = `
 local f, err = io.open("dew.lua")
@@ -180,8 +181,8 @@ export class Runtime {
 
 		const now = new Date()
 		this.wasi = new WASI(/*WASIContextOptions*/{
-			args: ["dew"],
-			// args: ["dew", "/input.dew"],
+			// args: ["dew"],
+			args: ["dew", "/input.dew"],
 			env: {}, // {string:string}
 			stdout: chunk => this.stdout.write(chunk),
 			stderr: chunk => this.stderr.write(chunk),
@@ -218,16 +219,22 @@ export class Runtime {
 		// const memory = new WebAssembly.Memory({ initial: 32, maximum: 65536 })
 
 		function syscall(op, ...args) {
-			rt.updateMemoryViewsIfChanged()
+			if (rt.memory.buffer.byteLength != rt.memorySize)
+				rt.updateMemoryViews()
 			if (rt.suspended)
 				return rt.finalizeResume()
 			// dlog("syscall", {op}, ...args)
 			const f = syscalls[op]
-			if (f)
+			if (f) try {
 				return f(rt, ...args)
-			console.warn("[dew] unsupported syscall", op)
-			return -ENOSYS;
+			} catch (err) {
+				console.error(`error in syscall handler #${op}:`, err)
+				return -Errno.EINVAL
+			}
+			dlog(`unsupported syscall #${op}`)
+			return -Errno.ENOSYS;
 		}
+
 		imports.env = {
 			// memory, // import memory
 
@@ -242,7 +249,21 @@ export class Runtime {
 			syscall_I: syscall,
 			syscall_f: syscall,
 
+			ipcrecv(arg) {
+				dlog("ipcrecv", arg)
+				setTimeout(() => {
+					dlog("calling ipcsend")
+					try {
+						let res = rt.instance.exports.ipcsend(456)
+						dlog("ipcsend =>", res)
+					} catch (err) {
+						console.error("ipcsend:", err)
+					}
+				}, 100)
+			},
+
 			wlongjmp_scope(block_ptr) {
+				// Note: This naturally crosses wasm/js call boundary while suspended
 				try {
 					rt.instance.exports.exec_block(block_ptr)
 					return 0
@@ -252,6 +273,7 @@ export class Runtime {
 			},
 
 			wlongjmp(arg) {
+				assert(rt.suspendState() == 0, "wasm/js call boundary crossed while suspended")
 				throw arg
 			},
 		}
@@ -263,8 +285,8 @@ export class Runtime {
 		this.module = module
 		this.instance = instance
 		// this.memory = instance.exports.memory || memory
-		this.memory = instance.exports.memory || memory
-		this.memorySize = this.memory.buffer.byteLength
+		this.memory = instance.exports.memory
+		this.memorySize = 0 // set by updateMemoryViews
 
 		this.wasi.hasBeenInitialized = true
 		this.wasi.instance = this.instance
@@ -276,7 +298,9 @@ export class Runtime {
 		// Get address of pre-allocated memory for asyncify suspension
 		this.suspend_data_addr = this.instance.exports.asyncify_data.value
 		// console.log(`suspend_data 0x${this.suspend_data_addr} ` +
-		//             `{ ${this.u32(this.suspend_data_addr)}, ${this.u32(this.suspend_data_addr + 4)} }`)
+		//             `{ ${this.u32(this.suspend_data_addr)}, ` +
+		//             `${this.u32(this.suspend_data_addr + 4)} }`)
+
 		// // See struct at https://github.com/WebAssembly/binaryen/blob/
 		// // fd8b2bd43d73cf1976426e60c22c5261fa343510/src/passes/Asyncify.cpp#L106-L120
 		// this.suspend_data_addr = this.instance.exports.suspend_data.value
@@ -284,27 +308,22 @@ export class Runtime {
 		// this.setU32(this.suspend_data_addr, this.suspend_data_addr + 8)
 		// this.setU32(this.suspend_data_addr + 4, this.suspend_data_addr + this.suspend_data_size)
 
-		// this.dumpmem(this.suspend_data_addr, 8 + this.suspend_data_size)
 
 		return this.resume1()
 	}
 
-	updateMemoryViewsIfChanged() {
-		const memorySize = this.memory.buffer.byteLength
-		if (this.memorySize == memorySize)
-			return
-		dlog(`wasm memory grown ${this.memorySize/1024} kiB -> ${memorySize/1024} kiB`)
-		this.memorySize = memorySize
-		this.updateMemoryViews()
-	}
-
 	updateMemoryViews() {
+		if (DEBUG && this.memorySize != 0) {
+			dlog(`wasm memory resized: ` +
+		         `${this.memorySize/1024} kiB -> ${this.memory.buffer.byteLength/1024} kiB`)
+		}
+		this.memorySize = this.memory.buffer.byteLength // for change tracking
 		this.mem_u8 = new Uint8Array(this.memory.buffer)
 		this.mem_i32 = new Int32Array(this.memory.buffer)
 		this.mem_u32 = new Uint32Array(this.memory.buffer)
 	}
 
-	dumpmem(addr, len) {
+	dumpmem(addr, len, label) {
 		function fmthex(uint8Array) {
 			return Array.from(uint8Array)
 				.map((byte, i) =>
@@ -312,8 +331,18 @@ export class Runtime {
 				     byte.toString(16).padStart(2, "0") )
 				.join("")
 		}
-		console.log(`dumpmem 0x${addr}…0x${addr+len} (${len})` +
+		function fmthex32(v) { return "0x" + addr.toString(16).padStart(8, "0") }
+		if (this.memory.buffer.byteLength != this.memorySize)
+			this.updateMemoryViews()
+		console.log(`${label || "dumpmem"} ${fmthex32(addr)}…${fmthex32(addr+len)} (${len})` +
 		            fmthex(this.mem_u8.subarray(addr, addr+len)))
+	}
+
+	dumpSuspendData() {
+		const start = this.u32(this.suspend_data_addr)
+		const end = this.u32(this.suspend_data_addr + 4)
+		const size = (end - start) + 8
+		this.dumpmem(this.suspend_data_addr, size, "suspend_data:")
 	}
 
 	// 0 = normal, 1 = unwinding, 2 = rewinding
@@ -325,16 +354,14 @@ export class Runtime {
 		// Fill in the data structure. The first value has the stack location,
 		// which for simplicity can start right after the data structure itself
 
-		// const mem_start = this.u32(this.suspend_data_addr)
-		// const mem_end = this.u32(this.suspend_data_addr + 4)
-		// this.dumpmem(mem_start, mem_end - mem_start)
+		this.dumpSuspendData()
 
 		// this.mem_i32[this.suspend_data_addr >> 2] = this.suspend_data_addr + 8
 		// this.mem_i32[(this.suspend_data_addr + 4) >> 2] = this.suspend_stack_size // end of stack
 		this.instance.exports.asyncify_start_unwind(this.suspend_data_addr)
 		this.suspended = true
 
-		// this.dumpmem(mem_start, mem_end - mem_start)
+		this.dumpSuspendData()
 
 		return true
 	}
@@ -366,7 +393,7 @@ export class Runtime {
 			if (suspendState == 0)
 				this.onExit(status === undefined ? 0 : status)
 		} catch (err) {
-			dlog("resume1: caught error", err)
+			// dlog("resume1: caught error", err)
 			this.suspended = false
 			// TODO: figure out if we need to clean up asyncify state:
 			// const sstate = this.suspendState()
@@ -378,7 +405,7 @@ export class Runtime {
 			if (err instanceof ProcExit) {
 				this.onExit(err.status, null)
 			} else if (err instanceof WebAssembly.RuntimeError) {
-				this.onExit(127, null)
+				this.onExit(127, err)
 			} else {
 				this.onExit(1, err)
 			}
@@ -403,6 +430,7 @@ export class Runtime {
 enum SysOp {
 	NANOSLEEP = 1,
 	IPCRECV = 2,
+	IOWAIT = 3,
 }
 
 
@@ -414,7 +442,7 @@ syscalls[SysOp.NANOSLEEP] = (
 	// dlog(`syscall_sleep: ${microseconds/1000.0}ms`)
 	// TODO: if interrupted, return remaining time:
 	// - populate rem_sec_ptr & rem_nsec_ptr (pointers to u32 values)
-	// - return rt.resume(-EINTR)
+	// - return rt.resume(-Errno.EINTR)
 	setTimeout(() => rt.resume(0), ms)
 }
 
@@ -423,9 +451,34 @@ syscalls[SysOp.IPCRECV] = (rt :Runtime, msg_ptr: ptr<void>, flags: u32) => {
 	rt.suspend()
 	rt.onIPCMsg = (msg) => {
 		// TODO: write message to memory at msg_ptr
+		const src = new TextEncoder().encode("fun print(... any) void\n" +
+		                                     "print(42 / 3)\n")
+		// const addr = ...
+		// dlog(`write msg data 0x${addr} + ${src.length}`)
+		// rt.mem_u8.set(src, addr)
+		// rt.setU32(msg_ptr, addr)
 	}
 	setTimeout(() => {
 		rt.onIPCMsg(/*TODO*/)
-		rt.resume(0)
+		return rt.resume(0)
 	}, 500)
+}
+
+
+syscalls[SysOp.IOWAIT] = (rt :Runtime) => {
+	dlog("TODO: sys IOWAIT")
+	// rt.suspend()
+	// rt.onIPCMsg = (msg) => {
+	// 	// TODO: write message to memory at msg_ptr
+	// 	const src = new TextEncoder().encode("fun print(... any) void\n" +
+	// 	                                     "print(42 / 3)\n")
+	// 	// const addr = ...
+	// 	// dlog(`write msg data 0x${addr} + ${src.length}`)
+	// 	// rt.mem_u8.set(src, addr)
+	// 	// rt.setU32(msg_ptr, addr)
+	// }
+	// setTimeout(() => {
+	// 	rt.onIPCMsg(/*TODO*/)
+	// 	return rt.resume(0)
+	// }, 500)
 }

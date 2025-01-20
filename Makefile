@@ -16,7 +16,8 @@ JSSRCS      := $(wildcard web/*.ts web/index.html)
 LUA_OBJS    := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(LUA_SRCS)))
 DEW_OBJS    := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(SRCS)))
 OBJS        := $(DEW_OBJS) $(LUA_OBJS)
-CFLAGS      := -std=c17 -g -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
+CFLAGS      := -std=c17 -g -fdebug-compilation-dir=/x/ \
+               -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
                -Ilua/src $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
 LDFLAGS     :=
 LUA_CFLAGS  :=
@@ -36,34 +37,44 @@ else ifeq ($(TARGET),web)
 	CFLAGS += -fvisibility=hidden
 	LDFLAGS += --target=wasm32-playbit -lwasi-emulated-signal -lwasi-emulated-process-clocks
 	#LDFLAGS += -Wl,--import-memory
-	LDFLAGS += -Wl,--initial-memory=1048576
+	#LDFLAGS += -Wl,--initial-memory=1048576
 	LDFLAGS += -Wl,--export-dynamic
 	LDFLAGS += -Wl,-allow-undefined-file,wasm.syms
 	CFLAGS += $(if $(shell [ -t 2 ] && echo 1),-fcolor-diagnostics,)
 	CFLAGS += -fblocks
 	LDFLAGS += -fblocks -lBlocksRuntime
-	WOPTFLAGS := --asyncify --no-validation \
+	WOPTFLAGS := --asyncify \
+	             --no-validation \
 	             --enable-bulk-memory \
+	             --enable-tail-call \
 	             --zero-filled-memory
-	#--enable-tail-call
+	WOPTFLAGS += --pass-arg=asyncify-imports@env.syscall,env.wlongjmp_scope,env.wawait_end
+	#WOPTFLAGS += --pass-arg=asyncify-addlist@lua_pcallk
+	#WOPTFLAGS += --pass-arg=asyncify-ignore-indirect
 	CXXFLAGS := -fno-rtti
 	JSFLAGS := --format=esm --platform=browser $(if $(filter 1,$(V)),,--log-level=warning)
 	ifeq ($(DEBUG),1)
 		JSFLAGS += --define:DEBUG=true --inject:web/dev_debug.ts
 		WOPTFLAGS += -O1 -g
+		# asyncify-asserts: raises WebAssembly.RuntimeError "unreachable" when a function
+		# that is not expected to be resumed is resumed. Stack trace tells us which function.
+		WOPTFLAGS += --pass-arg=asyncify-asserts
+		#WOPTFLAGS += --pass-arg=asyncify-verbose
 	else
 		JSFLAGS += --define:DEBUG=false --inject:web/dev_release.ts --minify --drop:debugger
 		# For now, keep optimizations to a minimum and include debug info, even in releases.
 		# Code size difference between -O1 -g vs --strip-all -O4: 1.2MiB vs 468KiB
-		WOPTFLAGS += -O1 -g
 		#LDFLAGS += -Wl,--strip-all
+		WOPTFLAGS += -O1 -g
 		#WOPTFLAGS += -O4
+		WOPTFLAGS += --precompute-propagate
+		WOPTFLAGS += --reorder-functions --reorder-globals
 	endif
 	# linux-arm64, linux-x64, darwin-arm64, darwin-x64
 	ESBUILD_T := $(NATIVE_SYS)-$(subst x86_64,x64,$(NATIVE_ARCH))
 	ESBUILD_V := 0.24.2
 	ESBUILD   := _deps/esbuild-$(ESBUILD_V)-$(ESBUILD_T)/esbuild
-	export PATH := $(PWD)/_deps/llvm/bin:$(PATH)
+	export PATH := $(PWD)/_deps/binaryen/bin:$(PWD)/_deps/llvm/bin:$(PATH)
 else
 	LUA_CFLAGS += -DLUA_USE_POSIX -DLUA_USE_DLOPEN
 endif
@@ -138,10 +149,14 @@ $(BUILDDIR)/dew.lua.h: $(BUILDDIR)/dew.lua.o $(LUA) etc/gen-embed.lua
 	$(QLOG) "GEN   $@"
 	$(Q)$(LUA) etc/gen-embed.lua $< $@ kDewLuaData
 
-$(BUILDDIR)/dew.wasm: $(OBJS)
+$(BUILDDIR)/dew.1.wasm: $(OBJS)
 	$(QLOG) "LINK  $@"
 	$(Q)mkdir -p $(@D)
-	$(Q)$(CC) -o - $^ $(LDFLAGS) | wasm-opt - $(WOPTFLAGS) -o $@
+	$(Q)$(CC) $(LDFLAGS) $^ -o $@
+
+$(BUILDDIR)/dew.wasm: $(BUILDDIR)/dew.1.wasm
+	$(QLOG) "WOPT  $@"
+	$(Q)wasm-opt $(WOPTFLAGS) $< -o $@
 
 $(BUILDDIR)/dew.js: web/dew.ts $(ESBUILD) $(JSSRCS)
 	$(QLOG) "ESBLD $@"
@@ -224,6 +239,10 @@ _deps/llvm/bin/clang:
 	tar -C _deps/llvm -xf _deps/download/llvm-17.0.3-toolchain-aarch64-macos.tar.xz
 	tar -C _deps/llvm -xf _deps/download/llvm-17.0.3-compiler-rt-wasm32-playbit.tar.xz
 	tar -C _deps/llvm -xf _deps/download/llvm-17.0.3-sysroot-wasm32-playbit.tar.xz
+	#@ Move wasm-opt aside to avoid wasm-ld running it, since we run it ourselves
+	rm -rf _deps/binaryen
+	mkdir -p _deps/binaryen/bin
+	mv _deps/llvm/bin/wasm-opt _deps/binaryen/bin/wasm-opt
 
 _deps/download/llvm-%:
 	mkdir -p $(@D)

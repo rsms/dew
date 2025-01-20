@@ -56,7 +56,7 @@ enum {
 };
 
 
-static bool x_luaL_optboolean(lua_State *L, int index, bool default_value) {
+static bool x_luaL_optboolean(lua_State* L, int index, bool default_value) {
 	if (lua_isnoneornil(L, index))
 		return default_value;
 	return lua_toboolean(L, index);
@@ -81,7 +81,7 @@ static int err_from_errno(int errno_val) {
 
 // errstr takes an integer argument that is one of the ERR_ constants and returns a string.
 // e.g. errstr(ERR_INVALID) == "INVALID"
-static int l_errstr(lua_State *L) {
+static int l_errstr(lua_State* L) {
 	const int err = luaL_checkinteger(L, 1);
 	const char* name = "ERROR";
 	const char* description = "unspecified error";
@@ -230,7 +230,7 @@ done:
 //   i.e. intscan( "123", 10, 0x80, true)
 //     == intscan("-123", 10, 0x80, false)
 //
-static int l_intscan(lua_State *L) {
+static int l_intscan(lua_State* L) {
 	size_t len;
 	const char *str = luaL_checklstring(L, 1, &len);
 	lua_Integer base = luaL_optinteger(L, 2, 10);
@@ -256,7 +256,7 @@ static int l_intscan(lua_State *L) {
 // Return value:
 //   A string representing the integer in the specified base.
 //   If an error occurs, raises a Lua error.
-static int l_intfmt(lua_State *L) {
+static int l_intfmt(lua_State* L) {
 	int err = 0;
 
 	// buf fits base-2 representations of all 64-bit numbers + NUL term
@@ -335,7 +335,7 @@ static i64 intconv(
 
 
 // fun intconv(value i64, src_bits, dst_bits uint, src_issigned, dst_issigned bool) int
-static int l_intconv(lua_State *L) {
+static int l_intconv(lua_State* L) {
 	i64 value = luaL_checkinteger(L, 1);
 	i64 src_bits = luaL_checkinteger(L, 2);
 	i64 dst_bits = luaL_checkinteger(L, 3);
@@ -356,7 +356,7 @@ static int l_intconv(lua_State *L) {
 
 #ifdef __wasm__
 #include "dew.h"
-static int l_ipcrecv(lua_State *L) {
+static int l_ipcrecv(lua_State* L) {
 	// TODO: this could be generalized into a io_uring like API.
 	// Could then use async reading of stdin instead of a dedicated "ipc" syscall.
 
@@ -368,6 +368,42 @@ static int l_ipcrecv(lua_State *L) {
 	lua_pushinteger(L, (lua_Integer)result);
 	return 1;
 }
+
+static lua_State* g_L = NULL;
+static lua_State* g_ipcrecv_co = NULL;
+
+extern int ipcrecv(int arg);
+
+__attribute__((visibility("default"))) int ipcsend(long value) {
+	// printf("ipcsend %ld\n", value);
+	if (g_ipcrecv_co == NULL)
+		return -EINVAL;
+	lua_State* L_from = g_L;
+	lua_State* L = g_ipcrecv_co;
+	g_ipcrecv_co = NULL;
+	lua_pushinteger(L, value);
+	int status = lua_resume(L, L_from, 1, NULL);
+	if (status == LUA_OK)
+		return 0;
+	fprintf(stderr, "Error resuming coroutine: %s\n", lua_tostring(L, -1));
+	return -ECHILD;
+}
+
+static int l_ipcrecv_co(lua_State* L) {
+	if (!lua_isyieldable(L))
+		return luaL_error(L, "not called from a coroutine");
+	int r = ipcrecv(123);
+	// TODO: can return result immediately here is there is some
+	g_ipcrecv_co = L;
+	return lua_yield(L, 0);
+}
+
+static int l_iowait(lua_State* L) {
+	long result = syscall(SysOp_IOWAIT, 0, 0, 0, 0, 0);
+	lua_pushinteger(L, (lua_Integer)result);
+	return 1;
+}
+
 #endif
 
 
@@ -379,12 +415,18 @@ static const luaL_Reg dew_lib[] = {
 
 	#ifdef __wasm__
 	{"ipcrecv", l_ipcrecv},
+	{"ipcrecv_co", l_ipcrecv_co},
+	{"iowait", l_iowait},
 	#endif
 
 	{NULL, NULL} // Sentinel
 };
 
-int luaopen_dew(lua_State *L) {
+int luaopen_dew(lua_State* L) {
+	#ifdef __wasm__
+	g_L = L; // FIXME!
+	#endif
+
 	luaL_newlib(L, dew_lib);
 
 	#define _(NAME, ERRNO, ...) \

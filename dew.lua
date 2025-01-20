@@ -125,6 +125,35 @@ function selftest(verbose)
 	require("intconv_test"){ verbose = verbose }
 end
 
+function compile_and_run(unit)
+	-- tokenize
+	tokens = tokenize_unit(unit)
+
+	-- parse
+	parse_unit(unit, tokens)
+	if unit.errcount > 0 then
+		dlog("stopping after %d error(s)", unit.errcount)
+		return os.exit(1)
+	end
+
+	-- resolve types & identifiers
+	resolve_unit(unit)
+	if unit.errcount > 0 then
+		dlog("stopping after %d error(s)", unit.errcount)
+		return os.exit(1)
+	end
+
+	-- generate code
+	code = codegen_unit(unit)
+	if unit.errcount > 0 then
+		dlog("stopping after %d error(s)", unit.errcount)
+		return os.exit(1)
+	end
+
+	-- run program
+	run(unit, code)
+end
+
 function main(args)
 	local prog = args[0]
 	local opt = parse_args(args)
@@ -133,17 +162,8 @@ function main(args)
 		os.exit(0)
 	end
 	if #opt.args == 0 then
-		if dew.ipcrecv ~= nil then
-			while true do
-				print("dew.ipcrecv...")
-				local msg = dew.ipcrecv()
-				print("dew.ipcrecv:", msg)
-				os.exit(0)
-			end
-		else
-			io.stderr:write(fmt("%s: missing <input>\n", prog))
-			os.exit(1)
-		end
+		io.stderr:write(fmt("%s: missing <input>\n", prog))
+		os.exit(1)
 	end
 	local unit, code
 	for i, filename in ipairs(opt.args) do
@@ -153,34 +173,18 @@ function main(args)
 		else
 			unit = unit_create_file(filename)
 		end
-
-		-- tokenize
-		tokens = tokenize_unit(unit)
-
-		-- parse
-		parse_unit(unit, tokens)
-		if unit.errcount > 0 then
-			dlog("stopping after %d error(s)", unit.errcount)
-			return os.exit(1)
-		end
-
-		-- resolve types & identifiers
-		resolve_unit(unit)
-		if unit.errcount > 0 then
-			dlog("stopping after %d error(s)", unit.errcount)
-			return os.exit(1)
-		end
-
-		-- generate code
-		code = codegen_unit(unit)
-		if unit.errcount > 0 then
-			dlog("stopping after %d error(s)", unit.errcount)
-			return os.exit(1)
-		end
-
-		-- run program
-		run(unit, code)
+		compile_and_run(unit)
 	end
 end
 
 main(arg)
+
+-- function main_sched_test(args)
+-- 	print("main_sched_test args:", table.unpack(args))
+-- 	error("MEOW")
+-- 	local r, s = coroutine.yield(1)
+-- 	print("coroutine.yield(1) =>", r, s)
+-- end
+
+-- main_sched_test(arg)
+
