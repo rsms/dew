@@ -136,8 +136,8 @@ export class Runtime {
 		this.mem_i32 = null
 		this.mem_u32 = null
 		this.suspended = false
-		this.suspend_data_addr = 16 // where the unwind/rewind data will live
-		this.suspend_stack_size = 1024
+		this.suspend_data_addr = 0
+		this.suspend_stack_size = 0
 		this.suspend_result = null // resumed return value
 		this.done = new Promise((resolve, reject) => {
 			this.doneResolve = resolve
@@ -180,7 +180,8 @@ export class Runtime {
 
 		const now = new Date()
 		this.wasi = new WASI(/*WASIContextOptions*/{
-			args: ["dew", "/input.dew"],
+			args: ["dew"],
+			// args: ["dew", "/input.dew"],
 			env: {}, // {string:string}
 			stdout: chunk => this.stdout.write(chunk),
 			stderr: chunk => this.stderr.write(chunk),
@@ -213,8 +214,11 @@ export class Runtime {
 		imports.wasi_snapshot_preview1.proc_exit = (status) => {
 			throw new ProcExit(status)
 		}
-		// const memory = new WebAssembly.Memory({ initial: 32, maximum: 10000 })
+
+		// const memory = new WebAssembly.Memory({ initial: 32, maximum: 65536 })
+
 		function syscall(op, ...args) {
+			rt.updateMemoryViewsIfChanged()
 			if (rt.suspended)
 				return rt.finalizeResume()
 			// dlog("syscall", {op}, ...args)
@@ -225,7 +229,8 @@ export class Runtime {
 			return -ENOSYS;
 		}
 		imports.env = {
-			// memory: memory,
+			// memory, // import memory
+
 			// syscall is the FFI boundary.
 			// Because of wasm-js FFI constraints, we use different functions depending on arg types:
 			//   i = i32 in wasm, represented as integer number in JS
@@ -257,17 +262,58 @@ export class Runtime {
 
 		this.module = module
 		this.instance = instance
-		this.memory = instance.exports.memory
-		this.mem_u8 = new Uint8Array(this.memory.buffer)
-		this.mem_i32 = new Int32Array(this.memory.buffer)
-		this.mem_u32 = new Uint32Array(this.memory.buffer)
+		// this.memory = instance.exports.memory || memory
+		this.memory = instance.exports.memory || memory
+		this.memorySize = this.memory.buffer.byteLength
 
 		this.wasi.hasBeenInitialized = true
 		this.wasi.instance = this.instance
 		this.wasi.module = this.module
 		this.wasi.memory = this.memory
 
+		this.updateMemoryViews()
+
+		// Get address of pre-allocated memory for asyncify suspension
+		this.suspend_data_addr = this.instance.exports.asyncify_data.value
+		// console.log(`suspend_data 0x${this.suspend_data_addr} ` +
+		//             `{ ${this.u32(this.suspend_data_addr)}, ${this.u32(this.suspend_data_addr + 4)} }`)
+		// // See struct at https://github.com/WebAssembly/binaryen/blob/
+		// // fd8b2bd43d73cf1976426e60c22c5261fa343510/src/passes/Asyncify.cpp#L106-L120
+		// this.suspend_data_addr = this.instance.exports.suspend_data.value
+		// this.suspend_data_size = this.u32(this.instance.exports.suspend_data_size.value)
+		// this.setU32(this.suspend_data_addr, this.suspend_data_addr + 8)
+		// this.setU32(this.suspend_data_addr + 4, this.suspend_data_addr + this.suspend_data_size)
+
+		// this.dumpmem(this.suspend_data_addr, 8 + this.suspend_data_size)
+
 		return this.resume1()
+	}
+
+	updateMemoryViewsIfChanged() {
+		const memorySize = this.memory.buffer.byteLength
+		if (this.memorySize == memorySize)
+			return
+		dlog(`wasm memory grown ${this.memorySize/1024} kiB -> ${memorySize/1024} kiB`)
+		this.memorySize = memorySize
+		this.updateMemoryViews()
+	}
+
+	updateMemoryViews() {
+		this.mem_u8 = new Uint8Array(this.memory.buffer)
+		this.mem_i32 = new Int32Array(this.memory.buffer)
+		this.mem_u32 = new Uint32Array(this.memory.buffer)
+	}
+
+	dumpmem(addr, len) {
+		function fmthex(uint8Array) {
+			return Array.from(uint8Array)
+				.map((byte, i) =>
+				     (i%16 == 0 ? "\n" + (addr + i).toString(16).padStart(8, "0") + " │ " : " ") +
+				     byte.toString(16).padStart(2, "0") )
+				.join("")
+		}
+		console.log(`dumpmem 0x${addr}…0x${addr+len} (${len})` +
+		            fmthex(this.mem_u8.subarray(addr, addr+len)))
 	}
 
 	// 0 = normal, 1 = unwinding, 2 = rewinding
@@ -278,10 +324,18 @@ export class Runtime {
 		assert(this.suspendState() == 0) // must not be suspended
 		// Fill in the data structure. The first value has the stack location,
 		// which for simplicity can start right after the data structure itself
-		this.mem_i32[this.suspend_data_addr >> 2] = this.suspend_data_addr + 8
-		this.mem_i32[this.suspend_data_addr + 4 >> 2] = this.suspend_stack_size // end of stack
+
+		// const mem_start = this.u32(this.suspend_data_addr)
+		// const mem_end = this.u32(this.suspend_data_addr + 4)
+		// this.dumpmem(mem_start, mem_end - mem_start)
+
+		// this.mem_i32[this.suspend_data_addr >> 2] = this.suspend_data_addr + 8
+		// this.mem_i32[(this.suspend_data_addr + 4) >> 2] = this.suspend_stack_size // end of stack
 		this.instance.exports.asyncify_start_unwind(this.suspend_data_addr)
 		this.suspended = true
+
+		// this.dumpmem(mem_start, mem_end - mem_start)
+
 		return true
 	}
 
@@ -348,6 +402,7 @@ export class Runtime {
 
 enum SysOp {
 	NANOSLEEP = 1,
+	IPCRECV = 2,
 }
 
 
@@ -361,4 +416,16 @@ syscalls[SysOp.NANOSLEEP] = (
 	// - populate rem_sec_ptr & rem_nsec_ptr (pointers to u32 values)
 	// - return rt.resume(-EINTR)
 	setTimeout(() => rt.resume(0), ms)
+}
+
+
+syscalls[SysOp.IPCRECV] = (rt :Runtime, msg_ptr: ptr<void>, flags: u32) => {
+	rt.suspend()
+	rt.onIPCMsg = (msg) => {
+		// TODO: write message to memory at msg_ptr
+	}
+	setTimeout(() => {
+		rt.onIPCMsg(/*TODO*/)
+		rt.resume(0)
+	}, 500)
 }

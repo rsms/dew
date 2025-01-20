@@ -133,8 +133,17 @@ function main(args)
 		os.exit(0)
 	end
 	if #opt.args == 0 then
-		io.stderr:write(fmt("%s: missing <input>\n", prog))
-		os.exit(1)
+		if dew.ipcrecv ~= nil then
+			while true do
+				print("dew.ipcrecv...")
+				local msg = dew.ipcrecv()
+				print("dew.ipcrecv:", msg)
+				os.exit(0)
+			end
+		else
+			io.stderr:write(fmt("%s: missing <input>\n", prog))
+			os.exit(1)
+		end
 	end
 	local unit, code
 	for i, filename in ipairs(opt.args) do

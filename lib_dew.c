@@ -1,5 +1,9 @@
 #include "dew.h"
 
+#ifdef __wasm__
+#include "wasm.h"
+#endif
+
 static const u8 g_intdectab[256] = { // decoding table, base 2-36
 	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
 	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -350,11 +354,33 @@ static int l_intconv(lua_State *L) {
 }
 
 
+#ifdef __wasm__
+#include "dew.h"
+static int l_ipcrecv(lua_State *L) {
+	// TODO: this could be generalized into a io_uring like API.
+	// Could then use async reading of stdin instead of a dedicated "ipc" syscall.
+
+	// TODO: arguments
+	IPCMsg msg = {};
+	u32 flags = 0;
+	long result = syscall(SysOp_IPCRECV, (uintptr)&msg, (long)flags, 0, 0, 0);
+	// TODO: return message
+	lua_pushinteger(L, (lua_Integer)result);
+	return 1;
+}
+#endif
+
+
 static const luaL_Reg dew_lib[] = {
 	{"intscan", l_intscan},
 	{"intfmt", l_intfmt},
 	{"intconv", l_intconv},
 	{"errstr", l_errstr},
+
+	#ifdef __wasm__
+	{"ipcrecv", l_ipcrecv},
+	#endif
+
 	{NULL, NULL} // Sentinel
 };
 

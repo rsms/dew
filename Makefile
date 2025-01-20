@@ -35,6 +35,8 @@ else ifeq ($(TARGET),web)
 	CFLAGS += --target=wasm32-playbit -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS
 	CFLAGS += -fvisibility=hidden
 	LDFLAGS += --target=wasm32-playbit -lwasi-emulated-signal -lwasi-emulated-process-clocks
+	#LDFLAGS += -Wl,--import-memory
+	LDFLAGS += -Wl,--initial-memory=1048576
 	LDFLAGS += -Wl,--export-dynamic
 	LDFLAGS += -Wl,-allow-undefined-file,wasm.syms
 	CFLAGS += $(if $(shell [ -t 2 ] && echo 1),-fcolor-diagnostics,)

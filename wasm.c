@@ -1,6 +1,29 @@
 #include "wasm.h"
 API_BEGIN
 
+enum { ASYNCIFY_STACK_SIZE = 64*1024 };
+WASM_EXPORT struct {
+	// See struct at https://github.com/WebAssembly/binaryen/blob/
+	// fd8b2bd43d73cf1976426e60c22c5261fa343510/src/passes/Asyncify.cpp#L106-L120
+	void* stack_start;
+	void* stack_end;
+	u8    data[ASYNCIFY_STACK_SIZE - 8];
+} asyncify_data = {
+	.stack_start = asyncify_data.data,
+	.stack_end = asyncify_data.data + ASYNCIFY_STACK_SIZE,
+};
+
+// extern char __heap_base;
+// extern char __heap_end;
+
+__attribute__((constructor)) static void wasm_init() {
+	// printf("__heap_base:              %p\n", &__heap_base);
+	// printf("__heap_end:               %p\n", &__heap_end);
+	// printf("asyncify_data             %p\n", &asyncify_data);
+	// printf("asyncify_data.stack_start %p\n", asyncify_data.stack_start);
+	// printf("asyncify_data.stack_end   %p\n", asyncify_data.stack_end);
+}
+
 
 WASM_EXPORT void exec_block(void(^block)()) {
 	block();

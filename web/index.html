@@ -14,8 +14,8 @@ function log(msg) {
 
 log(`loading`)
 const rt = new Runtime()
-rt.onStdoutLine = line => log("stdout> " + line)
-rt.onStderrLine = line => log("stderr> " + line)
+rt.onStdoutLine = line => { console.log("stdout>", line); log("stdout> " + line) }
+rt.onStderrLine = line => { console.log("stderr>", line); log("stderr> " + line) }
 rt.start(fetch("./dew.wasm"), `
 fun print(... any) void
 print(42 / 3)
