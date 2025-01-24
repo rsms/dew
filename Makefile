@@ -1,37 +1,36 @@
-NATIVE_SYS  := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))
-NATIVE_ARCH := $(subst aarch64,arm64,$(shell uname -m))
-TARGET      := $(NATIVE_SYS)
-BUILDDIR    ?= o.$(TARGET)$(if $(filter $(DEBUG),1),.debug,)$(if $(filter $(TEST),1),.test,)
-Q            = $(if $(filter 1,$(V)),,@)
-QLOG         = $(if $(filter 1,$(V)),@#,@echo)
-EMBED_SRC   := 1
-OBJDIR      := $(BUILDDIR)/obj
-SRCS        := dew.c lib_dew.c lib_bignum.c bn.c $(if $(filter $(TARGET),web),wasm.c,)
-LUA_SRCS    := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c lobject.c \
-               lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c lzio.c \
-               lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c loslib.c \
-               lstrlib.c ltablib.c lutf8lib.c linit.c
-LUA_SRCS    := $(sort $(addprefix lua/src/,$(LUA_SRCS)))
-JSSRCS      := $(wildcard web/*.ts web/index.html)
-LUA_OBJS    := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(LUA_SRCS)))
-DEW_OBJS    := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(SRCS)))
-OBJS        := $(DEW_OBJS) $(LUA_OBJS)
-CFLAGS      := -std=c17 -g -fdebug-compilation-dir=/x/ \
-               -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
-               -Ilua/src $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
-LDFLAGS     :=
-LUA_CFLAGS  :=
-LUA         := o.$(NATIVE_SYS)/lua
-LUAC        := o.$(NATIVE_SYS)/luac
-ALL         := $(BUILDDIR)/dew
-ORIGPATH    := ${PATH}
+NATIVE_SYS   := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))
+NATIVE_ARCH  := $(subst aarch64,arm64,$(shell uname -m))
+TARGET       := $(NATIVE_SYS)
+BUILDDIR     ?= o.$(TARGET)$(if $(filter $(DEBUG),1),.debug,)$(if $(filter $(TEST),1),.test,)
+Q             = $(if $(filter 1,$(V)),,@)
+QLOG          = $(if $(filter 1,$(V)),@#,@echo)
+EMBED_SRC    := 1
+OBJDIR       := $(BUILDDIR)/obj
+SRCS         := dew.c lib_dew.c lib_bignum.c bn.c time.c logmsg.c
+LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c lobject.c \
+                lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c lzio.c \
+                lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c loslib.c \
+                lstrlib.c ltablib.c lutf8lib.c linit.c
+LUA_SRCS     := $(sort $(addprefix lua/src/,$(LUA_SRCS)))
+JSSRCS       := $(wildcard web/*.ts web/index.html)
+CFLAGS       := -std=c17 -g -fdebug-compilation-dir=/x/ \
+                -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
+                -Ilua/src $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
+LDFLAGS      :=
+LUA_CFLAGS   :=
+LUA          := o.$(NATIVE_SYS)/lua
+LUAC         := o.$(NATIVE_SYS)/luac
+ALL          := $(BUILDDIR)/dew
+ORIGPATH     := ${PATH}
 
 ifeq ($(TARGET),darwin)
+	SRCS += runloop_kqueue.c
 	LUA_CFLAGS += -DLUA_USE_MACOSX
 else ifeq ($(TARGET),linux)
 	LUA_CFLAGS += -DLUA_USE_LINUX
 	LDFLAGS += -Wl,-E -ldl
 else ifeq ($(TARGET),web)
+	SRCS += wasm.c
 	ALL := $(BUILDDIR)/dew.wasm $(BUILDDIR)/dew.js $(BUILDDIR)/index.html
 	CFLAGS += --target=wasm32-playbit -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS
 	CFLAGS += -fvisibility=hidden
@@ -97,6 +96,10 @@ ifeq ($(TARGET),darwin)
 else
 	LDFLAGS += -Wl,--thinlto-cache-dir=$(BUILDDIR)/lto
 endif
+
+LUA_OBJS := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(LUA_SRCS)))
+DEW_OBJS := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(SRCS)))
+OBJS     := $(DEW_OBJS) $(LUA_OBJS)
 
 all: $(ALL)
 clean:

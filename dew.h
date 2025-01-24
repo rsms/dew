@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <lprefix.h>
+
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
@@ -12,6 +13,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <fcntl.h>
+#include <time.h>
+#include <assert.h>
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -28,6 +31,8 @@ typedef uint64_t  u64;
 typedef size_t    usize;
 typedef ssize_t   isize;
 typedef uintptr_t uintptr;
+typedef float     float32;
+typedef double    float64;
 
 #define I8_MAX    0x7f
 #define I16_MAX   0x7fff
@@ -70,6 +75,21 @@ typedef uintptr_t uintptr;
 #define nullable _Nullable
 #define NORET void __attribute__((noreturn))
 
+#if __has_attribute(warn_unused_result)
+  #define WARN_UNUSED_RESULT __attribute__((warn_unused_result))
+#else
+  #define WARN_UNUSED_RESULT
+#endif
+
+// __attribute__((noreturn)) void unreachable()
+#if __has_builtin(__builtin_unreachable)
+	#define unreachable() (assert(!"unreachable"),__builtin_unreachable())
+#elif __has_builtin(__builtin_trap)
+	#define unreachable() (assert(!"unreachable"),__builtin_trap)
+#else
+	#define unreachable() (assert(!"unreachable"),abort())
+#endif
+
 #define API_BEGIN \
 	_Pragma("clang diagnostic push") \
 	_Pragma("clang diagnostic ignored \"-Wnullability-completeness\"") \
@@ -84,20 +104,150 @@ typedef uintptr_t uintptr;
 		( (sizeof(x)/sizeof(0[x])) / ((usize)(!(sizeof(x) % sizeof(0[x])))) )
 #endif
 
+#define MAX(a,b) ( \
+  __builtin_constant_p(a) && __builtin_constant_p(b) ? ((a) > (b) ? (a) : (b)) : \
+  ({__typeof__ (a) _a = (a); \
+    __typeof__ (b) _b = (b); \
+    _a > _b ? _a : _b; }) \
+)
+#define MIN(a,b) ( \
+  __builtin_constant_p(a) && __builtin_constant_p(b) ? ((a) < (b) ? (a) : (b)) : \
+  ({__typeof__ (a) _a = (a); \
+    __typeof__ (b) _b = (b); \
+    _a < _b ? _a : _b; }) \
+)
+
 // bool IS_POW2(T x) returns true if x is a power-of-two value
 #define IS_POW2(x)    ({ __typeof__(x) xtmp__ = (x); IS_POW2_X(xtmp__); })
 #define IS_POW2_X(x)  ( ((x) & ((x) - 1)) == 0 )
 
+// T ALIGN2<T>(T x, anyuint a) rounds up x to nearest a (a must be a power of two)
+#define ALIGN2(x,a) ({ \
+  __typeof__(x) atmp__ = (__typeof__(x))(a) - 1; \
+  ( (x) + atmp__ ) & ~atmp__; \
+})
+#define ALIGN2_X(x,a) ( \
+  ( (x) + ((__typeof__(x))(a) - 1) ) & ~((__typeof__(x))(a) - 1) \
+)
 
+// logging (0=error, 1=warning, 2=info, 3=debug)
+#define logerr(fmt, args...)  _logmsg(0, "error: " fmt " (%s %d)", ##args, __FUNCTION__, __LINE__)
+#define logwarn(fmt, args...) _logmsg(1, "warning: " fmt, ##args)
+#define logmsg(fmt, args...)  _logmsg(2, fmt, ##args)
 #ifdef DEBUG
-	#define dlog(fmt, ...) ( \
-		fprintf(stderr, "[%s] " fmt " (%s:%d)\n", \
-		        __FUNCTION__, ##__VA_ARGS__, __FILE__, __LINE__), \
-		fflush(stderr) \
-	)
+	#define dlog(format, args...) \
+		_logmsg(3, format " \e[2m(%s:%d)\e[0m", ##args, __FILE__, __LINE__)
 #else
-	#define dlog(fmt, ...) ((void)0)
+	#define dlog(...) ((void)0)
 #endif
 
-#define logerr(fmt, ...) \
-	(fprintf(stderr, "%s: " fmt "\n", g_prog, ##__VA_ARGS__), fflush(stderr))
+API_BEGIN
+
+extern const char* g_prog; // dew.c
+
+void _logmsg(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+
+
+static inline WARN_UNUSED_RESULT bool __must_check_unlikely(bool unlikely) {
+	return UNLIKELY(unlikely);
+}
+
+// check_add_overflow(T a, T b, T* dst) -> bool did_overflow
+#define check_add_overflow(a, b, dst) __must_check_unlikely(({  \
+	__typeof__(a) a__ = (a);                 \
+	__typeof__(b) b__ = (b);                 \
+	__typeof__(dst) dst__ = (dst);           \
+	(void) (&a__ == &b__);                   \
+	(void) (&a__ == dst__);                  \
+	__builtin_add_overflow(a__, b__, dst__); \
+}))
+
+#define check_sub_overflow(a, b, dst) __must_check_unlikely(({  \
+	__typeof__(a) a__ = (a);                 \
+	__typeof__(b) b__ = (b);                 \
+	__typeof__(dst) dst__ = (dst);           \
+	(void) (&a__ == &b__);                   \
+	(void) (&a__ == dst__);                  \
+	__builtin_sub_overflow(a__, b__, dst__); \
+}))
+
+#define check_mul_overflow(a, b, dst) __must_check_unlikely(({  \
+	__typeof__(a) a__ = (a);                 \
+	__typeof__(b) b__ = (b);                 \
+	__typeof__(dst) dst__ = (dst);           \
+	(void) (&a__ == &b__);                   \
+	(void) (&a__ == dst__);                  \
+	__builtin_mul_overflow(a__, b__, dst__); \
+}))
+
+
+typedef u64 DTime;         // monotonic high-resolution clock with undefined base
+typedef i64 DTimeDuration; // duration, like 134ms or -1.2h
+
+#define D_TIME_HOUR        ((DTimeDuration)3600e9)
+#define D_TIME_MINUTE      ((DTimeDuration)60e9)
+#define D_TIME_SECOND      ((DTimeDuration)1e9)
+#define D_TIME_MILLISECOND ((DTimeDuration)1e6)
+#define D_TIME_MICROSECOND ((DTimeDuration)1e3)
+#define D_TIME_NANOSECOND  ((DTimeDuration)1)
+
+// DTimeNow returns the current monotonic clock value (not "wall clock" time.)
+// DTime is compatible with DTimeDuration so to make a time in the future, simply
+// add to DTime, i.e. "10 seconds from now" = DTimeNow() + 10*D_TIME_SECOND
+DTime DTimeNow();
+
+// DTimeSince returns the time delta between now and a point in time in the past
+DTimeDuration DTimeSince(DTime past);
+
+// DTimeUntil returns the time delta between now and a point in time in the future
+DTimeDuration DTimeUntil(DTime future);
+
+// DTimeBetween returns the time delta between a and b.
+// i.e. DTimeBetween(1, 3) == -2, DTimeBetween(3, 1) == 2.
+DTimeDuration DTimeBetween(DTime a, DTime b);
+
+// DTimeTimespec populates a timespec struct with the value of t
+void DTimeTimespec(DTime t, struct timespec* ts);
+
+// DTimeDurationTimespec populates a timespec struct with the value of d
+void DTimeDurationTimespec(DTimeDuration d, struct timespec* ts);
+
+// DTimeDurationFormat writes a human-readable string like "1.6s" to buf.
+// Returns a pointer to beginning of buf.
+const char* DTimeDurationFormat(DTimeDuration d, char buf[26]);
+
+float64 DTimeDurationHours(DTimeDuration d);
+float64 DTimeDurationMinutes(DTimeDuration d);
+float64 DTimeDurationSeconds(DTimeDuration d);
+i64 DTimeDurationMilliseconds(DTimeDuration d);
+i64 DTimeDurationMicroseconds(DTimeDuration d);
+i64 DTimeDurationNanoseconds(DTimeDuration d);
+
+
+
+typedef struct Runloop Runloop;
+typedef void(*RunloopCallback)(
+	Runloop*       rl,
+	int            reqid,   // value returned from RunloopAdd function
+	i64            result,  // meaning depends on event type
+	void* nullable userdata // value passed to RunloopAdd function
+);
+int RunloopCreate(Runloop** result);
+void RunloopFree(Runloop* rl);
+int RunloopSubmit(Runloop* rl);
+int RunloopProcess(Runloop* rl, u32 min_completions, DTime deadline);
+int RunloopTimerCancel(Runloop* rl, int reqid);
+int RunloopTimerStart(
+	Runloop*        rl,
+	RunloopCallback cb,
+	void* nullable  userdata,
+	DTime           deadline, // timer completes immediately if deadline is in the past
+	DTimeDuration   leeway);  // -1 for "system decides", 0 for "critical"
+int RunloopAddRepeatingTimer(
+	Runloop*        rl,
+	RunloopCallback cb,
+	void* nullable  userdata,
+	DTimeDuration   interval, // must be >=0 (returns -EINVAL if negative)
+	DTimeDuration   leeway);  // -1 for "system decides", 0 for "critical"
+
+API_END

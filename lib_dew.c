@@ -404,7 +404,77 @@ static int l_iowait(lua_State* L) {
 	return 1;
 }
 
-#endif
+#endif // __wasm__
+
+
+
+// Note: can check if called on a coroutine with this:
+// if (!lua_isyieldable(L))
+// 	return luaL_error(L, "not a coroutine");
+// lua_pushthread(L);
+
+
+
+static Runloop* g_main_runloop = NULL;
+
+
+static int l_time(lua_State* L) {
+	lua_pushinteger(L, DTimeNow());
+	return 1;
+}
+
+
+static void timer_handler(
+	Runloop*       rl,
+	int            reqid,   // matched that returned from RunloopAdd function
+	i64            result,  // depends on event type
+	void* nullable userdata // value passed to RunloopAdd function
+) {
+	dlog("timer_handler reqid=%d result=%lld", reqid, result);
+}
+
+
+static int l_runloop_add_timer(lua_State* L) {
+	DTime deadline = luaL_checkinteger(L, 1);
+	u64 leeway_nsec = luaL_checkinteger(L, 2);
+	// luaL_checktype(L, 3, LUA_TFUNCTION);
+	int reqid = RunloopTimerStart(g_main_runloop, timer_handler, NULL, deadline, leeway_nsec);
+	if (reqid < 0)
+		return luaL_error(L, strerror(-reqid));
+	RunloopSubmit(g_main_runloop);
+	RunloopTimerCancel(g_main_runloop, reqid);
+	lua_pushinteger(L, reqid);
+	return 1;
+}
+
+
+static int l_runloop_add_repeating_timer(lua_State* L) {
+	u64 interval_nsec = luaL_checkinteger(L, 1);
+	u64 leeway_nsec = luaL_checkinteger(L, 2);
+	int reqid = RunloopAddRepeatingTimer(
+		g_main_runloop, timer_handler, NULL, interval_nsec, leeway_nsec);
+	if (reqid < 0)
+		return luaL_error(L, strerror(-reqid));
+	lua_pushinteger(L, reqid);
+	return 1;
+}
+
+
+static int l_runloop_process(lua_State* L) {
+	u32 min_completions = 1;
+	DTime deadline = 0; // no timeout
+	// deadline = DTimeNow() + 10*D_TIME_MILLISECOND;
+	int n = RunloopProcess(g_main_runloop, min_completions, deadline);
+	if (n < 0) {
+		if (n == -ETIMEDOUT) {
+			n = 0;
+		} else {
+			return luaL_error(L, strerror(-n));
+		}
+	}
+	lua_pushboolean(L, n);
+	return 1;
+}
 
 
 static const luaL_Reg dew_lib[] = {
@@ -412,6 +482,10 @@ static const luaL_Reg dew_lib[] = {
 	{"intfmt", l_intfmt},
 	{"intconv", l_intconv},
 	{"errstr", l_errstr},
+	{"time", l_time},
+	{"runloop_process", l_runloop_process},
+	{"runloop_add_timer", l_runloop_add_timer},
+	{"runloop_add_repeating_timer", l_runloop_add_repeating_timer},
 
 	#ifdef __wasm__
 	{"ipcrecv", l_ipcrecv},
@@ -435,6 +509,10 @@ int luaopen_dew(lua_State* L) {
 	FOREACH_ERR(_)
 	// note: not including ERR_ERROR on purpose as it's "unknown error"
 	#undef _
+
+	int err = RunloopCreate(&g_main_runloop);
+	if (err)
+		logerr("RunloopCreate failed: %s", strerror(-err));
 
 	return 1;
 }

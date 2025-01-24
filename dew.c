@@ -7,7 +7,7 @@
 
 // static u8 reserved[4096];
 
-static const char* g_prog = NULL;
+const char* g_prog = NULL;
 static lua_State* g_L = NULL;
 
 
