@@ -4,7 +4,7 @@
 #endif
 
 
-#if defined(__linux__)
+#if defined(__linux__) || defined(__wasm__)
 
 	DTime DTimeNow() {
 		struct timespec ts;

@@ -2,6 +2,19 @@
 #include <sys/time.h>
 
 
+#ifdef __wasm__
+
+void _logmsg(int level, const char* fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
+	if (level < 1 || level > 2)
+		fflush(stderr);
+}
+
+#else
+
 void _logmsg(int level, const char* fmt, ...) {
 	FILE* fp = stderr;
 	flockfile(fp);
@@ -60,9 +73,7 @@ void _logmsg(int level, const char* fmt, ...) {
 	va_end(ap);
 
 	#if 1 /* enable ANSI colors */
-		fprintf(fp, "\e[0m\n");
-	#else
-		fprintf(fp, "\n");
+		fprintf(fp, "\e[0m");
 	#endif
 
 	funlockfile(fp);
@@ -71,3 +82,5 @@ void _logmsg(int level, const char* fmt, ...) {
 		fsync(STDERR_FILENO);
 	}
 }
+
+#endif

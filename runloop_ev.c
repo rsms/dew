@@ -98,6 +98,13 @@ static void wblock_free(WBlock* wb) {
 
 
 void RunloopFree(Runloop* rl) {
+	// From the libev documentation on ev_loop_destroy:
+	//   None of the active event watchers will be stopped in the normal sense, so e.g.
+	//   ev_is_active might still return true. It is your responsibility to either stop
+	//   all watchers cleanly yourself before calling this function, or cope with the
+	//   fact afterwards (which is usually the easiest thing, you can just ignore the
+	//   watchers and/or free () them for example).
+	//
 	ev_loop_destroy(rl->loop);
 	if (rl->wblock.next)
 		wblock_free(rl->wblock.next);

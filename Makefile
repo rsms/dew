@@ -6,8 +6,8 @@ Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
 OBJDIR       := $(BUILDDIR)/obj
-SRCS         := dew.c lib_dew.c lib_bignum.c bn.c time.c logmsg.c runloop.c \
-                $(if $(filter $(TARGET),web),,libev/ev.c)
+SRCS         := dew.c lib_dew.c lib_bignum.c bn.c time.c logmsg.c \
+                $(if $(filter $(TARGET),web),runloop_wasm.c,runloop_ev.c libev/ev.c)
 LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c lobject.c \
                 lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c lzio.c \
                 lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c loslib.c \

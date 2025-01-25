@@ -1,3 +1,4 @@
+#pragma once
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <lprefix.h>
@@ -131,12 +132,13 @@ typedef double    float64;
 )
 
 // logging (0=error, 1=warning, 2=info, 3=debug)
-#define logerr(fmt, args...)  _logmsg(0, "error: " fmt " (%s %d)", ##args, __FUNCTION__, __LINE__)
-#define logwarn(fmt, args...) _logmsg(1, "warning: " fmt, ##args)
-#define logmsg(fmt, args...)  _logmsg(2, fmt, ##args)
+#define logerr(fmt, args...)  \
+	_logmsg(0, "error: " fmt " (%s %d)\n", ##args, __FUNCTION__, __LINE__)
+#define logwarn(fmt, args...) _logmsg(1, "warning: " fmt "\n", ##args)
+#define logmsg(fmt, args...)  _logmsg(2, fmt "\n", ##args)
 #ifdef DEBUG
 	#define dlog(format, args...) \
-		_logmsg(3, format " \e[2m(%s:%d)\e[0m", ##args, __FILE__, __LINE__)
+		_logmsg(3, format " \e[2m(%s:%d)\e[0m\n", ##args, __FILE__, __LINE__)
 #else
 	#define dlog(...) ((void)0)
 #endif
