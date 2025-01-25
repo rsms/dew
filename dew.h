@@ -226,28 +226,22 @@ i64 DTimeDurationNanoseconds(DTimeDuration d);
 
 
 typedef struct Runloop Runloop;
-typedef void(*RunloopCallback)(
-	Runloop*       rl,
-	int            reqid,   // value returned from RunloopAdd function
-	i64            result,  // meaning depends on event type
-	void* nullable userdata // value passed to RunloopAdd function
-);
+
 int RunloopCreate(Runloop** result);
 void RunloopFree(Runloop* rl);
-int RunloopSubmit(Runloop* rl);
-int RunloopProcess(Runloop* rl, u32 min_completions, DTime deadline);
-int RunloopTimerCancel(Runloop* rl, int reqid);
-int RunloopTimerStart(
-	Runloop*        rl,
-	RunloopCallback cb,
-	void* nullable  userdata,
-	DTime           deadline, // timer completes immediately if deadline is in the past
-	DTimeDuration   leeway);  // -1 for "system decides", 0 for "critical"
-int RunloopAddRepeatingTimer(
-	Runloop*        rl,
-	RunloopCallback cb,
-	void* nullable  userdata,
-	DTimeDuration   interval, // must be >=0 (returns -EINVAL if negative)
-	DTimeDuration   leeway);  // -1 for "system decides", 0 for "critical"
+int RunloopRun(Runloop* rl, u32 flags); // -> -errno on error, 1 if more events, 0 if empty
+int RunloopRemove(Runloop* rl, int w); // -errno on error, 0 on success
+
+typedef void(*TimerCallback)(Runloop* rl, int w, void* nullable ud);
+
+// RunloopAddTimeout schedules a timer for a specific time in the future.
+// If deadline is in the past, the timer completes immediately, in the current runloop frame.
+// Returns watcher id 'w' (>=0) on success, or -errno on error.
+int RunloopAddTimeout(Runloop*, TimerCallback, void* nullable ud, DTime deadline);
+
+// RunloopAddInterval schedules an interval timer, triggered every 'interval' time.
+// 'interval' must be >=0 (returns -EINVAL if negative).
+// Returns watcher id 'w' (>=0) on success, or -errno on error.
+int RunloopAddInterval(Runloop*, TimerCallback, void* nullable ud, DTimeDuration interval);
 
 API_END

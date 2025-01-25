@@ -6,7 +6,8 @@ Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
 OBJDIR       := $(BUILDDIR)/obj
-SRCS         := dew.c lib_dew.c lib_bignum.c bn.c time.c logmsg.c
+SRCS         := dew.c lib_dew.c lib_bignum.c bn.c time.c logmsg.c runloop.c \
+                $(if $(filter $(TARGET),web),,libev/ev.c)
 LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c lobject.c \
                 lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c lzio.c \
                 lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c loslib.c \
@@ -17,6 +18,7 @@ CFLAGS       := -std=c17 -g -fdebug-compilation-dir=/x/ \
                 -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
                 -Ilua/src $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
 LDFLAGS      :=
+LIBEV_CFLAGS := -Wno-comment -Wno-sign-compare -Wno-extern-initializer -Wno-bitwise-op-parentheses
 LUA_CFLAGS   :=
 LUA          := o.$(NATIVE_SYS)/lua
 LUAC         := o.$(NATIVE_SYS)/luac
@@ -24,7 +26,6 @@ ALL          := $(BUILDDIR)/dew
 ORIGPATH     := ${PATH}
 
 ifeq ($(TARGET),darwin)
-	SRCS += runloop_kqueue.c
 	LUA_CFLAGS += -DLUA_USE_MACOSX
 else ifeq ($(TARGET),linux)
 	LUA_CFLAGS += -DLUA_USE_LINUX
@@ -106,7 +107,7 @@ clean:
 	rm -rf o.*
 
 dev:
-	autorun *.c *.h *.lua lua/src/*.c examples/*.dew -- '$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
+	autorun *.c *.h *.lua lua/src/*.c libev/*.* examples/*.dew -- '$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
 _dev: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew examples/dev.dew --debug-tokens --debug-parse --debug-resolve --debug-codegen
 
@@ -186,6 +187,8 @@ endif
 ifeq ($(EMBED_SRC),1)
 $(OBJDIR)/dew.c.o: $(BUILDDIR)/dew.lua.h
 endif
+
+$(OBJDIR)/libev/ev.c.o: CFLAGS += $(LIBEV_CFLAGS)
 
 ifeq ($(TARGET),web)
 $(OBJS): _deps/llvm/bin/clang

@@ -439,10 +439,16 @@ function main_sched_test(args)
 	co_recv() -- wait for exit signal from child]]
 
 	-- (interval_usec, leeway_usec, callback)
-	local timer = dew.runloop_add_timer(dew.time()+800000000, 0, function()
-		print("dew.runloop_add_timer callback")
-	end)
-	dlog("dew.runloop_add_timer => #%d", timer)
+	local deadline = dew.time()+800000000 -- in 800ms
+	-- for i = 1, 3 do
+		local timer = dew.runloop_add_timeout(deadline, function()
+			print("dew.runloop_add_timeout callback")
+		end)
+		dlog("dew.runloop_add_timeout => #%d", timer)
+	-- end
+
+	-- local timer2 = dew.runloop_add_interval(600000000)
+	-- dlog("dew.runloop_add_interval => #%d", timer2)
 
 	-- local n = 4
 	-- local timer = dew.runloop_add_repeating_timer(400000000, 10000000, function()
@@ -452,10 +458,10 @@ function main_sched_test(args)
 	-- end)
 	-- dlog("dew.runloop_add_repeating_timer => #%d", timer)
 
-	while dew.runloop_process() do
-		dlog("dew.runloop_process() tick")
+	while dew.runloop_run() do
+		dlog("dew.runloop_run() tick")
 	end
-	dlog("dew.runloop_process() has no work; exiting")
+	dlog("dew.runloop_run() has no work; exiting")
 
 	--[[-- structured concurrency: child terminated when parent exits
 	co_spawn(function()
