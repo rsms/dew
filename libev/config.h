@@ -1,7 +1,7 @@
 // common fields of all watcher structs
 #define EV_COMMON \
+	uint64_t ud; \
 	void*    udcb; \
-	void*    ud; \
 	int      reqid; \
 	uint8_t  evtype;
 

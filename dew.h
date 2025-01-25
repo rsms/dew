@@ -234,16 +234,16 @@ void RunloopFree(Runloop* rl);
 int RunloopRun(Runloop* rl, u32 flags); // -> -errno on error, 1 if more events, 0 if empty
 int RunloopRemove(Runloop* rl, int w); // -errno on error, 0 on success
 
-typedef void(*TimerCallback)(Runloop* rl, int w, void* nullable ud);
+typedef void(*TimerCallback)(Runloop* rl, int w, u64 ud);
 
 // RunloopAddTimeout schedules a timer for a specific time in the future.
 // If deadline is in the past, the timer completes immediately, in the current runloop frame.
 // Returns watcher id 'w' (>=0) on success, or -errno on error.
-int RunloopAddTimeout(Runloop*, TimerCallback, void* nullable ud, DTime deadline);
+int RunloopAddTimeout(Runloop*, TimerCallback, u64 ud, DTime deadline);
 
 // RunloopAddInterval schedules an interval timer, triggered every 'interval' time.
 // 'interval' must be >=0 (returns -EINVAL if negative).
 // Returns watcher id 'w' (>=0) on success, or -errno on error.
-int RunloopAddInterval(Runloop*, TimerCallback, void* nullable ud, DTimeDuration interval);
+int RunloopAddInterval(Runloop*, TimerCallback, u64 ud, DTimeDuration interval);
 
 API_END

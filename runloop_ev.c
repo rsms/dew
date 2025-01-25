@@ -169,7 +169,7 @@ static bool w_moreblock(Runloop* rl, WBlock* tail_block) {
 }
 
 
-static void* nullable w_alloc(Runloop* rl, EVType evtype, void* udcb, void* nullable ud) {
+static void* nullable w_alloc(Runloop* rl, EVType evtype, void* udcb, u64 ud) {
 	// we're using blocks instead of a heap or slab since an ev_watcher cannot be relocated in
 	// memory while active.
 	WBlock* wb = &rl->wblock;
@@ -249,7 +249,7 @@ static void timer_cb(struct ev_loop* loop, ev_timer* w, int revents) {
 }
 
 
-int RunloopAddTimeout(Runloop* rl, TimerCallback cb, void* nullable ud, DTime deadline) {
+int RunloopAddTimeout(Runloop* rl, TimerCallback cb, u64 ud, DTime deadline) {
 	ev_timer* w = w_alloc(rl, EVType_TIMER, cb, ud); if (!w) return -ENOMEM;
 	const i64 estimated_minimum_overhead = 1000; //ns
 	i64 ns = DTimeUntil(deadline) - estimated_minimum_overhead;
@@ -260,7 +260,7 @@ int RunloopAddTimeout(Runloop* rl, TimerCallback cb, void* nullable ud, DTime de
 }
 
 
-int RunloopAddInterval(Runloop* rl, TimerCallback cb, void* nullable ud, DTimeDuration interval) {
+int RunloopAddInterval(Runloop* rl, TimerCallback cb, u64 ud, DTimeDuration interval) {
 	if (interval < 0) return -EINVAL;
 	ev_timer* w = w_alloc(rl, EVType_TIMER, cb, ud);  if (!w) return -ENOMEM;
 	const double interval_sec = (double)interval / 1000000000.0;

@@ -21,11 +21,11 @@ int RunloopRemove(Runloop* rl, int reqid) {
 }
 
 
-int RunloopAddTimeout(Runloop* rl, TimerCallback cb, void* nullable ud, DTime deadline) {
+int RunloopAddTimeout(Runloop* rl, TimerCallback cb, u64 ud, DTime deadline) {
 	return -ENOSYS;
 }
 
 
-int RunloopAddInterval(Runloop* rl, TimerCallback cb, void* nullable ud, DTimeDuration interval) {
+int RunloopAddInterval(Runloop* rl, TimerCallback cb, u64 ud, DTimeDuration interval) {
 	return -ENOSYS;
 }

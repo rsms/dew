@@ -1,5 +1,5 @@
 --[[
-'dew' library (lib_dew.c) API:
+'runtime' library exported as '__rt' implemented in runtime.c:
 
 type error int
 fun errstr(e error) (name, description str)
@@ -439,29 +439,34 @@ function main_sched_test(args)
 	co_recv() -- wait for exit signal from child]]
 
 	-- (interval_usec, leeway_usec, callback)
-	local deadline = dew.time()+800000000 -- in 800ms
+	local deadline = __rt.time()+800000000 -- in 800ms
+	A = co_spawn(function()
+		co_runq_enq(co_current())
+		__rt.runloop_add_timeout(deadline)
+		dlog("__rt.runloop_add_timeout finished")
+	end)
 	-- for i = 1, 3 do
-		local timer = dew.runloop_add_timeout(deadline, function()
-			print("dew.runloop_add_timeout callback")
-		end)
-		dlog("dew.runloop_add_timeout => #%d", timer)
+		-- local timer = __rt.runloop_add_timeout(deadline, function()
+		-- 	print("__rt.runloop_add_timeout callback")
+		-- end)
+		-- dlog("__rt.runloop_add_timeout => #%d", timer)
 	-- end
 
-	-- local timer2 = dew.runloop_add_interval(600000000)
-	-- dlog("dew.runloop_add_interval => #%d", timer2)
+	-- local timer2 = __rt.runloop_add_interval(600000000)
+	-- dlog("__rt.runloop_add_interval => #%d", timer2)
 
 	-- local n = 4
-	-- local timer = dew.runloop_add_repeating_timer(400000000, 10000000, function()
-	-- 	print("dew.runloop_add_repeating_timer callback")
-	-- 	if n == 0 then dew.runloop_add_cancel(timer) end
+	-- local timer = __rt.runloop_add_repeating_timer(400000000, 10000000, function()
+	-- 	print("__rt.runloop_add_repeating_timer callback")
+	-- 	if n == 0 then __rt.runloop_add_cancel(timer) end
 	-- 	n = n - 1
 	-- end)
-	-- dlog("dew.runloop_add_repeating_timer => #%d", timer)
+	-- dlog("__rt.runloop_add_repeating_timer => #%d", timer)
 
-	while dew.runloop_run() do
-		dlog("dew.runloop_run() tick")
+	while __rt.runloop_run() do
+		dlog("__rt.runloop_run() tick")
 	end
-	dlog("dew.runloop_run() has no work; exiting")
+	dlog("__rt.runloop_run() has no work; exiting")
 
 	--[[-- structured concurrency: child terminated when parent exits
 	co_spawn(function()
@@ -494,20 +499,20 @@ function main_sched_test(args)
 end
 
 
--- setup main coroutine
-local co = {
-	f = select(1, coroutine.running()),
-	id = 0,
-	parent = nil,
-	wait = 0,
-}
-co_tab[co.f] = co
-if xpcall(main_sched_test, function(err, b, c)
-	print("xpcall", err, b, c)
-	return co_finalize(co, err)
-end, arg) then
-	return co_finalize(co)
-end
+-- -- setup main coroutine
+-- local co = {
+-- 	f = select(1, coroutine.running()),
+-- 	id = 0,
+-- 	parent = nil,
+-- 	wait = 0,
+-- }
+-- co_tab[co.f] = co
+-- if xpcall(main_sched_test, function(err, b, c)
+-- 	print("xpcall", err, b, c)
+-- 	return co_finalize(co, err)
+-- end, arg) then
+-- 	return co_finalize(co)
+-- end
 
 -- -- run detached coroutines until run queue is empty
 -- while true do
@@ -518,3 +523,41 @@ end
 -- 	end
 -- 	co_resume(co)
 -- end
+
+
+------------------------------------------------------------------------------------------------
+
+function main2()
+	print("main2 coroutine.running() =>", coroutine.running())
+	print("main2 coroutine.status()  =>", coroutine.status(select(1, coroutine.running())))
+	-- coroutine.yield(123, 456)
+
+	local t1 = __rt.spawn(function()
+		print("child1 enter")
+		local r = coroutine.yield(9, 8, 7, 6)
+		print("child1 working", r)
+		r = coroutine.yield(9)
+		-- error("LOL")
+		print("child1 exit", r)
+	end)
+	print("t0: t1=", t1)
+
+	-- print("child1")
+	-- local function b()
+	-- 	print("child1/b enter")
+	-- 	__rt.spawn(function()
+	-- 	end)
+	-- 	coroutine.yield(9)
+	-- 	print("child1/b exit")
+	-- end
+	-- local function a()
+	-- 	print("child1/a enter")
+	-- 	b()
+	-- 	print("child1/a exit")
+	-- end
+	-- a()
+
+	-- error("Meow")
+end
+
+__rt.main(main2)

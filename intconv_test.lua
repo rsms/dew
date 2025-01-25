@@ -1,7 +1,7 @@
 local verbose = false
 local fmt = string.format
 
--- Local Lua implementation of dew.intconv
+-- Local Lua implementation of __rt.intconv
 function intconv_lua(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
     -- Ensure value fits in the source bit size
     if src_bits < 64 then
@@ -215,7 +215,7 @@ function t(srcval, src_sign, src_bits, dst_sign, dst_bits)
     assert(math.type(srcval) == 'integer')
 
     -- local dstval = intconv_lua(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
-    local dstval = dew.intconv(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
+    local dstval = __rt.intconv(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
 
     assert(math.type(dstval) == 'integer',
            fmt("(%s, %s, %s, %s, %s) => %s",

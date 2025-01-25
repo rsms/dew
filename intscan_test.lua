@@ -14,7 +14,7 @@ function unpack_csv_row(row)
 end
 
 function print_intscan_invocation(input, base, limit, isneg, comment, value, err)
-	local err_name, err_desc = dew.errstr(err)
+	local err_name, err_desc = __rt.errstr(err)
 	printf("intscan('%s', %d, 0x%x, isneg=%s)%s\n" ..
 	       ">> %d %x [%s (%s)]",
 	       input, base, limit, isneg and "true" or "false",
@@ -23,7 +23,7 @@ function print_intscan_invocation(input, base, limit, isneg, comment, value, err
 end
 
 function test_one_good_input(nbits, base, is_signed, limit, isneg, input, expected_value, comment)
-	local value, err = dew.intscan(input, base, limit, isneg)
+	local value, err = __rt.intscan(input, base, limit, isneg)
 	if verbose then print_intscan_invocation(input, base, limit, isneg, comment, value, err) end
 
 	if err ~= 0 then
@@ -32,7 +32,7 @@ function test_one_good_input(nbits, base, is_signed, limit, isneg, input, expect
 		          "  >> %s (%s)",
 		          input, base, limit, isneg and "true" or "false",
 		          comment == nil and "" or " -- " .. comment,
-		          dew.errstr(err)))
+		          __rt.errstr(err)))
 	end
 
 	local expected_value_int = tonumber(expected_value, 10)
@@ -71,7 +71,7 @@ function test_good_input()
 end
 
 function test_one_bad_input(nbits, base, is_signed, limit, isneg, input, comment, expect_err)
-	local value, err = dew.intscan(input, base, limit, isneg)
+	local value, err = __rt.intscan(input, base, limit, isneg)
 	if verbose then print_intscan_invocation(input, base, limit, isneg, comment, value, err) end
 
 	if err ~= expect_err then
@@ -79,8 +79,8 @@ function test_one_bad_input(nbits, base, is_signed, limit, isneg, input, comment
 		          "  expected: %s (%s)" ..
 		          "  actual:   %s (%s)",
 		          input, base, limit, isneg and "true" or "false",
-		          dew.errstr(expect_err),
-		          dew.errstr(err)))
+		          __rt.errstr(expect_err),
+		          __rt.errstr(err)))
 	end
 end
 
@@ -108,7 +108,7 @@ return function(options)
 	verbose = options.verbose == true
 	local testcount = 0
 	testcount = testcount + test_good_input()
-	testcount = testcount + test_bad_input("intscan_test_data_err_input.csv", dew.ERR_INPUT)
-	testcount = testcount + test_bad_input("intscan_test_data_err_range.csv", dew.ERR_RANGE)
+	testcount = testcount + test_bad_input("intscan_test_data_err_input.csv", __rt.ERR_INPUT)
+	testcount = testcount + test_bad_input("intscan_test_data_err_range.csv", __rt.ERR_RANGE)
 	printf("intscan_test: OK (%d test cases)", testcount)
 end

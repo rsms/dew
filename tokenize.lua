@@ -179,12 +179,12 @@ function tokenize_unit(unit, include_comments)
 		value = string.sub(src, tokstart + tokstart_off, tokend - 1)
 		if value_is_int then
 			-- since we don't know the type, interpret number as u64; limit=0xffffffffffffffff
-			value, err = dew.intscan(value, base, 0xffffffffffffffff)
+			value, err = __rt.intscan(value, base, 0xffffffffffffffff)
 			if err ~= 0 then
-				if err == dew.ERR_RANGE then
+				if err == __rt.ERR_RANGE then
 					err_invalid("; too large, overflows i64")
 				else
-					local errname, errdesc = dew.errstr(err)
+					local errname, errdesc = __rt.errstr(err)
 					err_invalid("; %s", errdesc)
 				end
 			end
@@ -410,7 +410,7 @@ function dlog_tokens(tokens, unit)
 		if tok == nil then break end
 		local srcpos_str = unit == nil and "" or srcpos_fmt(srcpos, unit.src)
 		if tok == TOK_INT then
-			value = dew.intfmt(value, 10) .. "\t0x" .. dew.intfmt(value, 16, true)
+			value = __rt.intfmt(value, 10) .. "\t0x" .. __rt.intfmt(value, 16, true)
 		elseif tok == TOK_FLOAT then
 			value = fmt("%g", value)
 		else

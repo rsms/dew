@@ -8,11 +8,11 @@
 // static u8 reserved[4096];
 
 const char* g_prog = NULL;
-static lua_State* g_L = NULL;
+lua_State* g_L = NULL;
 
 
 int luaopen_bignum(lua_State *L); // lib_bignum.c
-int luaopen_dew(lua_State *L); // lib_dew.c
+int luaopen_runtime(lua_State *L); // runtime.c
 
 
 static int check_status(lua_State* L, int status) {
@@ -25,7 +25,6 @@ static int check_status(lua_State* L, int status) {
 	}
 	return status;
 }
-static int report(lua_State* L, int status) { return check_status(L, status); }
 
 
 static int msghandler(lua_State* L) {
@@ -129,8 +128,8 @@ static int pmain(lua_State* L) {
 	luaL_openlibs(L); // standard libraries
 	luaL_requiref(L, "bignum", luaopen_bignum, 1);
 	lua_setglobal(L, "bignum");
-	luaL_requiref(L, "dew", luaopen_dew, 1);
-	lua_setglobal(L, "dew");
+	luaL_requiref(L, "__rt", luaopen_runtime, 1);
+	lua_setglobal(L, "__rt");
 
 	// create input argument table/array
 	lua_createtable(L, argc, 1);

@@ -61,8 +61,8 @@ function codegen_intconv(g, src_issigned, src_bits, dst_issigned, dst_bits, src_
 		local mask = (1 << math.min(src_bits, dst_bits)) - 1
 		g.write(fmt(" & 0x%x)", mask))
 	else
-		-- dew.intconv(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
-		g.write("dew.intconv(")
+		-- __rt.intconv(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
+		g.write("__rt.intconv(")
 		src_expr_gen()
 		g.write(fmt(",%d,%d,%s,%s)",
 		            src_bits,
