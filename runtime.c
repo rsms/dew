@@ -478,6 +478,9 @@ static int l_runloop_run(lua_State* L) {
 
 #define trace(fmt, ...) dlog("\e[1;34m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
 
+// #define trace_runq(fmt, ...) dlog("\e[1;35m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
+#define trace_runq(fmt, ...) ((void)0)
+
 
 typedef struct S S; // scheduler (M+P in Go lingo)
 typedef struct T T; // task
@@ -490,12 +493,13 @@ typedef enum TStatus : u8 {
 } TStatus;
 
 struct T {
-	S*            s;            // owning S
-	T* nullable   parent;       // task that spawned this task (0 means this is S's main task)
-	u32* nullable next_sibling;
-	u32* nullable first_child;
-	int           nres;         // number of results on stack, to be returned via resume
-	int           _unused;
+	S*          s;            // owning S
+	T* nullable parent;       // task that spawned this task (0 means this is S's main task)
+	T* nullable next_sibling;
+	T* nullable first_child;
+	int         nres;         // number of results on stack, to be returned via resume
+	u8          is_live;      // 1 when running or waiting, 0 when not yet started or exited
+	u8          _unused[3];
 	// rest of struct is a lua_State struct
 	// Note: With Lua 5.4, the total size of T + lua_State is 240 B
 };
@@ -533,7 +537,7 @@ static const char* l_status_str(int status) {
 
 
 // L_t returns Lua state of task
-inline static lua_State* t_L(T* t) {
+inline static lua_State* t_L(const T* t) {
 	// T is stored in the LUA_EXTRASPACE in the head of Lua managed lua_State
 	return (void*)t + sizeof(*t);
 }
@@ -581,15 +585,26 @@ static bool s_runq_put(S* s, T* t) {
 	u32 head = s->runq_head;
 	u32 tail = s->runq_tail;
 	if (tail - head < s->runq_cap) {
-		// trace("runq put [%u] = " T_ID_F, tail % s->runq_cap, t_id(t));
+		trace_runq("runq put [%u] = " T_ID_F, tail % s->runq_cap, t_id(t));
 		s->runq[tail % s->runq_cap] = t;
 		s->runq_tail = tail + 1;
 		return true;
 	}
-	// Note: Go uses a fixed-size runq and moves half of the locally scheduled runnables
-	// to global runq un this scenario, and then proceeds to add t to the local runq.
 	dlog("TODO: grow runq");
 	return false;
+}
+
+
+static bool s_runq_put_runnext(S* s, T* t) {
+	trace_runq("runq put runnext = " T_ID_F, t_id(t));
+	if (s->runnext) {
+		// kick out previous runnext to runq
+		trace_runq("runq kick out runnext " T_ID_F " to runq", t_id(s->runnext));
+		if UNLIKELY(!s_runq_put(s, s->runnext))
+			return false;
+	}
+	s->runnext = t;
+	return true;
 }
 
 
@@ -598,17 +613,71 @@ static T* nullable s_runq_get(S* s) {
 	if (s->runnext) {
 		t = s->runnext;
 		s->runnext = NULL;
+		trace_runq("runq get runnext = " T_ID_F, t_id(t));
 	} else {
 		if (s->runq_head == s->runq_tail) // empty
 			return NULL;
 		t = s->runq[s->runq_head % s->runq_cap];
+		trace_runq("runq get [%u] = " T_ID_F, s->runq_head % s->runq_cap, t_id(t));
 		s->runq_head = s->runq_head + 1;
 	}
 	return t;
 }
 
 
-static void t_report_error(T* t) {
+static void s_runq_remove(S* s, T* t) {
+	if (s->runnext == t) {
+		trace_runq("runq remove runnext " T_ID_F, t_id(t));
+		s->runnext = NULL;
+	} else if (s->runq_head <= s->runq_tail) {
+		for (u32 i = s->runq_head, end = s->runq_tail; i < end; i++) {
+			if (s->runq[i] == t) {
+				trace_runq("runq remove [%u] " T_ID_F, i, t_id(t));
+				memmove(&s->runq[i], &s->runq[i + 1], end - i);
+				s->runq_tail--;
+				return;
+			}
+		}
+	} else {
+		assert(!"TODO wrapped (s->runq_head > s->runq_tail)");
+	}
+}
+
+
+static void t_add_child(T* parent, T* child) {
+	assert(child->next_sibling == NULL /* not in a list */);
+	child->next_sibling = parent->first_child;
+	parent->first_child = child;
+}
+
+
+static void t_remove_child_r(T* prev_sibling, T* child) {
+	if (prev_sibling->next_sibling == child) {
+		prev_sibling->next_sibling = child->next_sibling;
+		child->next_sibling = NULL;
+	} else if LIKELY(prev_sibling->next_sibling != NULL) {
+		t_remove_child_r(prev_sibling->next_sibling, child);
+	} else {
+		dlog("  child not found: " T_ID_F, t_id(child));
+		assert(!"child not found");
+	}
+}
+
+
+static void t_remove_child(T* parent, T* child) {
+	trace("remove child " T_ID_F " from " T_ID_F, t_id(child), t_id(parent));
+	assert(child->parent == parent);
+	child->parent = NULL;
+	if (parent->first_child == child) {
+		parent->first_child = child->next_sibling;
+		child->next_sibling = NULL;
+	} else {
+		return t_remove_child_r(parent->first_child, child);
+	}
+}
+
+
+static void t_report_error(T* t, const char* context_msg) {
 	lua_State* L = t_L(t);
 
 	const char* msg = lua_tostring(L, -1);
@@ -625,8 +694,83 @@ static void t_report_error(T* t) {
 	const char* msg2 = lua_tostring(L, -1);
 	if (msg2) msg = msg2;
 
-	logerr("uncaught error in "T_ID_F ":\n%s", t_id(t), msg);
+	fprintf(stderr, "%s: ["T_ID_F "]\n%s\n", context_msg, t_id(t), msg);
 	lua_pop(L, 1);
+}
+
+
+static void dlog_task_tree(const T* t, int level) {
+	for (T* child = t->first_child; child; child = child->next_sibling) {
+		dlog("%*s" T_ID_F, level*4, "", t_id(child));
+		dlog_task_tree(child, level + 1);
+	}
+}
+
+
+static void t_finalize(T* t, int status);
+
+
+static void t_stop(T* parent, T* child) {
+	trace("stop " T_ID_F " by parent " T_ID_F, t_id(child), t_id(parent));
+
+	// set is_live to 0 _before_ calling lua_closethread to ensure that any to-be-closed variables
+	// with __close metamethods that call into our API are properly handled.
+	child->is_live = 0;
+
+	// Shut down Lua "thread"
+	//
+	// Note that a __close metatable entry can be used to clean up things like open files.
+	// For example:
+	//     local _ <close> = setmetatable({}, { __close = function()
+	//         print("cleanup here")
+	//     end })
+	//
+	// Note: status will be OK in the common case and ERRRUN if an error occurred inside a
+	// to-be-closed variable with __close metamethods.
+	//
+	int status = lua_closethread(t_L(child), t_L(parent));
+	if (status != LUA_OK) {
+		trace("warning: lua_closethread => %s", l_status_str(status));
+		t_report_error(child, "Error in defer handler");
+	}
+
+	// remove from runq
+	s_runq_remove(child->s, child);
+
+	// // finalize as "runtime error"
+	// lua_pushstring(t_L(child), "parent task exited");
+	// return t_finalize(child, LUA_ERRRUN);
+
+	// finalize as "clean exit"
+	return t_finalize(child, LUA_OK);
+}
+
+
+static void t_stop_r(T* parent, T* child) {
+	if (child->next_sibling)
+		t_stop_r(parent, child->next_sibling);
+	if (child->first_child)
+		t_stop_r(child, child->first_child);
+	return t_stop(parent, child);
+}
+
+
+static void t_finalize(T* t, int status) {
+	// task is dead, either from clean exit or error (LUA_OK or LUA_ERR* status)
+	trace(T_ID_F " exited (%s)", t_id(t), l_status_str(status));
+	if UNLIKELY(status != LUA_OK)
+		t_report_error(t, "Uncaught error");
+	t->s->nlive--;
+	t->is_live = 0;
+
+	// dlog("task tree for " T_ID_F ":", t_id(t)); dlog_task_tree(t, 1);
+
+	// stop child tasks
+	if (t->first_child)
+		t_stop_r(t, t->first_child);
+
+	if (t->parent)
+		t_remove_child(t->parent, t);
 }
 
 
@@ -644,21 +788,12 @@ static void t_resume(T* t) {
 	trace("resume " T_ID_F " nargs=%d", t_id(t), nargs);
 	int status = lua_resume(L, t->s->L, nargs, &nres);
 
-	// check if task was suspended (common case)
-	if (status == LUA_YIELD) {
-		// trace(T_ID_F " suspended after resume nres=%d", t_id(t), nres);
-		if (nres > 0) // discard results
-			return lua_pop(L, nres);
-		return;
-	}
+	// discard results
+	lua_pop(L, nres);
 
-	// task is dead, either from clean exit or error (LUA_OK or LUA_ERR* status)
-	trace(T_ID_F " exited (%s nres=%d)", t_id(t), l_status_str(status), nres);
-	lua_pop(L, nres); // discard results
-	trace("finalize " T_ID_F, t_id(t));
-	if UNLIKELY(status != LUA_OK)
-		t_report_error(t);
-	t->s->nlive--;
+	// check if task exited
+	if UNLIKELY(status != LUA_YIELD)
+		return t_finalize(t, status);
 }
 
 
@@ -669,15 +804,6 @@ static int t_yield(T* t, int nresults) {
 	if UNLIKELY(!s_runq_put(t->s, t))
 		return luaL_error(t_L(t), "out of memory");
 	return lua_yield(t_L(t), nresults);
-}
-
-
-static int l_yield(lua_State* L) {
-	T* t = L_t(L);
-	if UNLIKELY(t->s == NULL)
-		return luaL_error(L, "not called from a task");
-	int nargs = lua_gettop(L);
-	return t_yield(t, nargs);
 }
 
 
@@ -702,17 +828,17 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	t->next_sibling = NULL;
 	t->first_child = NULL;
 	t->nres = 0;
+	t->is_live = 1;
 
-	// setup t to be run next by schedule (kicking out any current runnext to runq)
-	T* old_runnext = s->runnext;
-	s->runnext = t;
-	if (old_runnext) {
-		if UNLIKELY(!s_runq_put(s, old_runnext)) {
-			lua_closethread(NL, L);
-			s->runnext = old_runnext;
-			return luaL_error(L, "out of runq space (TODO: grow)");
-		}
+	// setup t to be run next by schedule
+	if UNLIKELY(!s_runq_put_runnext(s, t)) {
+		lua_closethread(NL, L);
+		return luaL_error(L, "out of runq space (TODO: grow)");
 	}
+
+	// add t as a child of parent
+	if (parent)
+		t_add_child(parent, t);
 
 	s->nlive++;
 
@@ -726,56 +852,37 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 }
 
 
-static int l_spawn(lua_State* L) {
-	T* t = L_t(L);
-	if UNLIKELY(t->s == NULL)
-		return luaL_error(L, "not called from a task");
-
-	assert(t->nres == 0);
-	t->nres = s_spawntask(t->s, L, t);
-	if UNLIKELY(t->nres == 0)
-		return 0;
-	dlog("s_spawntask => nres %d", t->nres);
-
-	// suspend the calling task, switching control back to s_schedule loop
-	return t_yield(t, 0);
-}
-
-
 static int s_schedule(S* s) {
 	// Scheduler loop: find a runnable task and execute it.
 	// Stops when all tasks have finished or an error occurred.
 	static int debug_nwait = 0;
-	for (;;) {
+	while (s->nlive > 0) {
 		// find a task to run
-		trace("looking for runnable...");
 		T* t = s_runq_get(s);
 		if (t) {
 			// trace(T_ID_F " taken from runq", t_id(t));
 			debug_nwait = 0;
 			t_resume(t);
-		}
-		if (s->nlive == 0) {
-			// all tasks completed
-			trace("no tasks; finalize " S_ID_F, s_id(s));
-			RunloopFree(s->runloop);
-			return 0;
-		}
-		// wait for an event to wake a T up
-		trace("wait I/O");
-		int n = RunloopRun(s->runloop, 0);
-		if UNLIKELY(n < 0) {
-			logerr("internal I/O error: %s", strerror(-n));
-			luaL_error(s->L, strerror(-n));
-			return 0;
-		}
-		// check runq & allt again
-		// debug check for logic errors (TODO: remove this when I know scheduler works)
-		if (++debug_nwait == 4) {
-			dlog("s->nlive %u", s->nlive);
-			assert(!"XXX");
+		} else {
+			// wait for an event to wake a T up
+			trace("wait I/O");
+			int n = RunloopRun(s->runloop, 0);
+			if UNLIKELY(n < 0) {
+				logerr("internal I/O error: %s", strerror(-n));
+				luaL_error(s->L, strerror(-n));
+				return 0;
+			}
+			// check runq & allt again
+			// debug check for logic errors (TODO: remove this when I know scheduler works)
+			if (++debug_nwait == 4) {
+				dlog("s->nlive %u", s->nlive);
+				assert(!"XXX");
+			}
 		}
 	}
+	trace("shutdown " S_ID_F, s_id(s));
+	RunloopFree(s->runloop);
+	return 0;
 }
 
 
@@ -810,6 +917,44 @@ static int l_main(lua_State* L) {
 
 	// enter scheduling loop
 	return s_schedule(s);
+}
+
+
+// Lua API functions exported as __rt.NAME
+
+
+#define REQUIRE_TASK(L) ({ \
+	T* __t = L_t(L); \
+	if UNLIKELY(!__t->is_live) { \
+		/* note: this can happen in two scenarios: \
+		 * 1. calling a task-specific API function from a non-task, or \
+		 * 2. calling a task-specific API function from a to-be-closed variable (__close) \
+		 *    during task shutdown. */ \
+		const char* msg = __t->s ? "task is shutting down" : "not called from a task"; \
+		trace("%s: invalid call by user: %s", __FUNCTION__, msg); \
+		return luaL_error(L, msg); \
+	} \
+	__t; \
+})
+
+
+static int l_yield(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	int nargs = lua_gettop(L);
+	return t_yield(t, nargs);
+}
+
+
+static int l_spawn(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+
+	assert(t->nres == 0);
+	t->nres = s_spawntask(t->s, L, t);
+	if UNLIKELY(t->nres == 0)
+		return 0;
+
+	// suspend the calling task, switching control back to s_schedule loop
+	return t_yield(t, 0);
 }
 
 
