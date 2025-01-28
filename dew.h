@@ -131,6 +131,15 @@ typedef double    float64;
   ( (x) + ((__typeof__(x))(a) - 1) ) & ~((__typeof__(x))(a) - 1) \
 )
 
+// T IDIV_CEIL(T x, ANY divisor) divides x by divisor, rounding up.
+// If x is zero, returns max value of x (wraps.)
+#define IDIV_CEIL(x, divisor) ({ \
+	__typeof__(x) div__ = (__typeof__(x))(divisor); \
+	( (x) + div__ - 1 ) / div__; \
+})
+#define IDIV_CEIL_X(x, divisor) \
+	( ( (x) + (__typeof__(x))(divisor) - 1 ) / (__typeof__(x))(divisor) )
+
 // logging (0=error, 1=warning, 2=info, 3=debug)
 #define logerr(fmt, args...)  \
 	_logmsg(0, "error: " fmt " (%s %d)\n", ##args, __FUNCTION__, __LINE__)

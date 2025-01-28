@@ -490,31 +490,33 @@ typedef enum TStatus : u8 {
 } TStatus;
 
 struct T {
-	S*          s;      // S which owns this task
-	T* nullable parent; // task that spawned this task
-	lua_State*  L;      // Lua coroutine
+	S*            s;            // owning S
+	T* nullable   parent;       // task that spawned this task (0 means this is S's main task)
+	u32* nullable next_sibling;
+	u32* nullable first_child;
+	int           nres;         // number of results on stack, to be returned via resume
+	int           _unused;
+	// rest of struct is a lua_State struct
+	// Note: With Lua 5.4, the total size of T + lua_State is 240 B
 };
 
+static_assert(sizeof(T) == LUA_EXTRASPACE, "");
+
 struct S {
-	lua_State* L; // Lua environment
-	Runloop*   runloop;
-	T          t0; // main task
+	lua_State* L;       // base Lua environment
+	Runloop*   runloop; //
+	u32        nlive;   // number of live tasks
 
-	u32 nlive; // number of live tasks
-
-	// runq is a queue of tasks ready to run (circular buffer)
+	// runq is a queue of tasks (TIDs) ready to run; a circular buffer.
+	// (We could get fancy with a red-black tree a la Linux kernel. Let's keep it simple for now.)
 	u32 runq_head;
 	u32 runq_tail;
 	u32 runq_cap;
 	T** runq;
 
-	// runnext is non-null if a task is to be run immediately, skipping runq
+	// runnext is a TID (>0) if a task is to be run immediately, skipping runq
 	T* nullable runnext;
 };
-
-
-#define t_id(t) ((unsigned long)(uintptr)(t)->L)
-#define T_ID_F  "T#%lx"
 
 
 static const char* l_status_str(int status) {
@@ -530,19 +532,41 @@ static const char* l_status_str(int status) {
 }
 
 
+// L_t returns Lua state of task
+inline static lua_State* t_L(T* t) {
+	// T is stored in the LUA_EXTRASPACE in the head of Lua managed lua_State
+	return (void*)t + sizeof(*t);
+}
+
+
+// L_t returns task of Lua state
+inline static T* L_t(lua_State* L) {
+	return (void*)L - sizeof(T);
+}
+
+
+// s_id formats an identifier of a S for logging
+#define s_id(s) ((unsigned long)(uintptr)(s))
+#define S_ID_F  "S#%lx"
+
+// t_id formats an identifier of a T for logging
+#define t_id(t) ((unsigned long)(uintptr)t_L(t))
+#define T_ID_F  "T#%lx"
+
+
 // s_tstatus returns the status of a task.
 // Based on auxstatus from lcorolib.c
 static TStatus s_tstatus(S* s, T* t) {
-	if (s->L == t->L)
+	if (s->L == t_L(t))
 		return TStatus_RUN;
-	switch (lua_status(t->L)) {
+	switch (lua_status(t_L(t))) {
 		case LUA_YIELD:
 			return TStatus_YIELD;
 		case LUA_OK: {
 			lua_Debug ar;
-			if (lua_getstack(t->L, 0, &ar))  /* does it have frames? */
+			if (lua_getstack(t_L(t), 0, &ar))  /* does it have frames? */
 				return TStatus_NORM;  /* it is running */
-			else if (lua_gettop(t->L) == 0)
+			else if (lua_gettop(t_L(t)) == 0)
 				return TStatus_DEAD;
 			else
 				return TStatus_YIELD;  /* initial state */
@@ -553,18 +577,19 @@ static TStatus s_tstatus(S* s, T* t) {
 }
 
 
-static void s_runq_put(S* s, T* t) {
+static bool s_runq_put(S* s, T* t) {
 	u32 head = s->runq_head;
 	u32 tail = s->runq_tail;
 	if (tail - head < s->runq_cap) {
-		trace("runq put [%u] = " T_ID_F, tail % s->runq_cap, t_id(t));
+		// trace("runq put [%u] = " T_ID_F, tail % s->runq_cap, t_id(t));
 		s->runq[tail % s->runq_cap] = t;
 		s->runq_tail = tail + 1;
-		return;
+		return true;
 	}
 	// Note: Go uses a fixed-size runq and moves half of the locally scheduled runnables
 	// to global runq un this scenario, and then proceeds to add t to the local runq.
-	assert(!"TODO: grow runq");
+	dlog("TODO: grow runq");
+	return false;
 }
 
 
@@ -583,31 +608,8 @@ static T* nullable s_runq_get(S* s) {
 }
 
 
-static void t_assoc_l(T* t, lua_State* L) {
-	// T -> L
-	t->L = L;
-
-	// L -> T
-	lua_pushlightuserdata(L, (void*)&t_assoc_l);
-	lua_pushlightuserdata(L, t);
-    lua_settable(L, LUA_REGISTRYINDEX);
-}
-
-
-// l_get_t returns the task which owns Lua coroutine (aka thread) L
-static T* l_get_t(lua_State* L) {
-	assert(lua_isyieldable(L) || !"not a coroutine");
-	lua_pushlightuserdata(L, (void*)&t_assoc_l);
-	lua_gettable(L, LUA_REGISTRYINDEX);
-	T* t = (T*)lua_touserdata(L, -1);
-	assert(t != NULL);
-	lua_pop(L, 1);
-	return t;
-}
-
-
 static void t_report_error(T* t) {
-	lua_State* L = t->L;
+	lua_State* L = t_L(t);
 
 	const char* msg = lua_tostring(L, -1);
 	if (msg == NULL) { /* is error object not a string? */
@@ -620,145 +622,194 @@ static void t_report_error(T* t) {
 		}
 	}
 	luaL_traceback(L, L, msg, 1);  /* append a standard traceback */
-	const char* msg2 = lua_tostring(t->L, -1);
+	const char* msg2 = lua_tostring(L, -1);
 	if (msg2) msg = msg2;
 
 	logerr("uncaught error in "T_ID_F ":\n%s", t_id(t), msg);
-	lua_pop(t->L, 1);
+	lua_pop(L, 1);
 }
 
 
-static void s_tfinalize(S* s, T* t, bool clean_exit) {
-	trace("finalize " T_ID_F, t_id(t));
+static void t_resume(T* t) {
+	// get Lua "thread" for task
+	lua_State* L = t_L(t);
+	assert(t->s != NULL);
+	assert(t->s->L != L);
 
-	if UNLIKELY(!clean_exit)
-		t_report_error(t);
+	// switch from l_main to task
+	// nargs: number of values on T's stack to be returned from 'yield' inside task.
+	// nres:  number of values passed to 'yield' by task.
+	int nargs = t->nres, nres;
+	t->nres = 0;
+	trace("resume " T_ID_F " nargs=%d", t_id(t), nargs);
+	int status = lua_resume(L, t->s->L, nargs, &nres);
 
-	assert(s->nlive > 0);
-	s->nlive--;
-	if (t != &s->t0)
-		free(t);
-}
-
-
-static int t_resume(T* t, lua_State* L) {
-	trace("resume " T_ID_F, t_id(t));
-	assert(L != t->L);
-	int narg = 0, nres;
-	int status = lua_resume(t->L, L, narg, &nres);
-	// check if task was suspended or exited
+	// check if task was suspended (common case)
 	if (status == LUA_YIELD) {
-		trace(T_ID_F " suspended (nres=%d)", t_id(t), nres);
-		lua_pop(t->L, nres); // discard results
-		s_runq_put(t->s, t);
-		// Note: we return 1 here simply to allow tail recursion when used by l_spawn
-		return 1;
-	} else {
-		// task is dead, either from clean exit or error (LUA_OK or LUA_ERR* status)
-		trace(T_ID_F " exited (%s nres=%d)", t_id(t), l_status_str(status), nres);
-		lua_pop(t->L, nres);
-		s_tfinalize(t->s, t, status == LUA_OK);
-		return 0;
+		// trace(T_ID_F " suspended after resume nres=%d", t_id(t), nres);
+		if (nres > 0) // discard results
+			return lua_pop(L, nres);
+		return;
 	}
+
+	// task is dead, either from clean exit or error (LUA_OK or LUA_ERR* status)
+	trace(T_ID_F " exited (%s nres=%d)", t_id(t), l_status_str(status), nres);
+	lua_pop(L, nres); // discard results
+	trace("finalize " T_ID_F, t_id(t));
+	if UNLIKELY(status != LUA_OK)
+		t_report_error(t);
+	t->s->nlive--;
 }
 
 
-// t_create creates a new task, which function should be on stack L (the spawner thread.)
+// t_yield suspends t, switching control back to s_schedule loop
+// Must only be called from a task, never l_main.
+static int t_yield(T* t, int nresults) {
+	trace("suspend " T_ID_F, t_id(t));
+	if UNLIKELY(!s_runq_put(t->s, t))
+		return luaL_error(t_L(t), "out of memory");
+	return lua_yield(t_L(t), nresults);
+}
+
+
+static int l_yield(lua_State* L) {
+	T* t = L_t(L);
+	if UNLIKELY(t->s == NULL)
+		return luaL_error(L, "not called from a task");
+	int nargs = lua_gettop(L);
+	return t_yield(t, nargs);
+}
+
+
+// s_spawntask creates a new task, which function should be on stack L (the spawner thread),
+// and adds it to the runq as runnext.
 // L should also be the Lua thread that initiated the spawn (S's L or a task's L.)
-static int t_create(T* t, lua_State* L) {
-	// create Lua coroutine
-	// Note: See coroutine.create in luaB_cocreate (lcorolib.c)
+// Returns 1 on success with Lua "thread" on L stack, or 0 on failure with Lua error set in L.
+static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
+	// create Lua "thread".
+	// Note: See coroutine.create in luaB_cocreate (lcorolib.c).
 	if UNLIKELY(lua_type(L, 1) != LUA_TFUNCTION)
 		return luaL_typeerror(L, 1, lua_typename(L, LUA_TFUNCTION));
+
 	lua_State* NL = lua_newthread(L);
-	lua_pushvalue(L, 1); // move function to top
+	lua_pushvalue(L, 1); // move function to top of caller stack
 	lua_xmove(L, NL, 1); // move function from L to NL
 
-	// assign coroutine handle to T
-	t_assoc_l(t, NL);
+	// initialize T struct (which lives in the LUA_EXTRASPACE header of lua_State)
+	T* t = L_t(NL);
+	t->s = s;
+	t->parent = parent;
+	t->next_sibling = NULL;
+	t->first_child = NULL;
+	t->nres = 0;
+
+	// setup t to be run next by schedule (kicking out any current runnext to runq)
+	T* old_runnext = s->runnext;
+	s->runnext = t;
+	if (old_runnext) {
+		if UNLIKELY(!s_runq_put(s, old_runnext)) {
+			lua_closethread(NL, L);
+			s->runnext = old_runnext;
+			return luaL_error(L, "out of runq space (TODO: grow)");
+		}
+	}
+
+	s->nlive++;
+
+	if (parent) {
+		trace(T_ID_F " spawns " T_ID_F, t_id(parent), t_id(t));
+	} else {
+		trace("spawn main task " T_ID_F, t_id(t));
+	}
 
 	return 1;
 }
 
 
+static int l_spawn(lua_State* L) {
+	T* t = L_t(L);
+	if UNLIKELY(t->s == NULL)
+		return luaL_error(L, "not called from a task");
+
+	assert(t->nres == 0);
+	t->nres = s_spawntask(t->s, L, t);
+	if UNLIKELY(t->nres == 0)
+		return 0;
+	dlog("s_spawntask => nres %d", t->nres);
+
+	// suspend the calling task, switching control back to s_schedule loop
+	return t_yield(t, 0);
+}
+
+
+static int s_schedule(S* s) {
+	// Scheduler loop: find a runnable task and execute it.
+	// Stops when all tasks have finished or an error occurred.
+	static int debug_nwait = 0;
+	for (;;) {
+		// find a task to run
+		trace("looking for runnable...");
+		T* t = s_runq_get(s);
+		if (t) {
+			// trace(T_ID_F " taken from runq", t_id(t));
+			debug_nwait = 0;
+			t_resume(t);
+		}
+		if (s->nlive == 0) {
+			// all tasks completed
+			trace("no tasks; finalize " S_ID_F, s_id(s));
+			RunloopFree(s->runloop);
+			return 0;
+		}
+		// wait for an event to wake a T up
+		trace("wait I/O");
+		int n = RunloopRun(s->runloop, 0);
+		if UNLIKELY(n < 0) {
+			logerr("internal I/O error: %s", strerror(-n));
+			luaL_error(s->L, strerror(-n));
+			return 0;
+		}
+		// check runq & allt again
+		// debug check for logic errors (TODO: remove this when I know scheduler works)
+		if (++debug_nwait == 4) {
+			dlog("s->nlive %u", s->nlive);
+			assert(!"XXX");
+		}
+	}
+}
+
+
 static int l_main(lua_State* L) {
 	// create scheduler for this OS thread & Lua context
-	T* runq[64]; // TODO: dynamic allocation
 	S* s = &(S){
 		.L = L,
-		.runq_cap = countof(runq),
-		.runq = runq,
+		.runq_cap = 8,
 	};
+
+	// allocate initial runq array
+	s->runq = malloc(sizeof(*s->runq) * s->runq_cap);
+	if (!s->runq)
+		return luaL_error(L, strerror(ENOMEM));
 
 	// create runloop for scheduler.
 	// TODO: integrate runloop into scheduler.
 	int err = RunloopCreate(&s->runloop);
-	if (err) {
+	if UNLIKELY(err) {
 		trace("RunloopCreate failed: %s", strerror(-err));
+		free(s->runq);
 		return luaL_error(L, strerror(-err));
 	}
 
-	// create and immediately switch to the main coroutine
-	s->t0.s = s;
-	int nres = t_create(&s->t0, L);
-	if (nres == 0) // error
+	// create main task
+	int nres = s_spawntask(s, L, NULL);
+	if UNLIKELY(nres == 0) // error
 		return 0;
-	trace("main spawn " T_ID_F, t_id(&s->t0));
-	s->nlive++;
-	t_resume(&s->t0, L);
 
-	// Scheduler loop: find a runnable task and execute it.
-	// Stops when all tasks have finished or an error occurred.
-	T* t;
-	for (;;) {
-		// find a task to run
-		if (( t = s_runq_get(s) )) {
-			trace("found "T_ID_F" on runq", t_id(t));
-		} else if (s->nlive == 0) {
-			// all tasks completed
-			trace("no tasks");
-			break;
-		} else {
-			// wait for an event to wake a T up
-			trace("wait I/O");
-			int n = RunloopRun(s->runloop, 0);
-			if UNLIKELY(n < 0) {
-				logerr("internal I/O error: %s", strerror(-n));
-				luaL_error(L, strerror(-n));
-				break;
-			}
-			// check runq & allt again
-			// assert(!"XXX");
-			continue;
-		}
-		t_resume(t, L);
-	}
+	// discard thread on result stack
+	lua_pop(L, 1);
 
-	trace("finalize S#%lx", (unsigned long)(uintptr)s);
-	RunloopFree(s->runloop);
-	return 0;
-}
-
-
-static int l_spawn(lua_State* L) {
-	T* t = l_get_t(L); // parent
-
-	// create new task
-	T* newt = calloc(1, sizeof(T));
-	newt->s = t->s;
-	newt->parent = t;
-
-	// spawn task
-	int nres = t_create(newt, L);
-	if UNLIKELY(nres == 0) {
-		// error
-		free(newt);
-		return 0;
-	}
-	assert(nres == 1);
-	t->s->nlive++;
-	trace(T_ID_F " spawn " T_ID_F, t_id(t), t_id(newt));
-	return t_resume(newt, L);
+	// enter scheduling loop
+	return s_schedule(s);
 }
 
 
@@ -774,6 +825,7 @@ static const luaL_Reg dew_lib[] = {
 
 	{"main", l_main},
 	{"spawn", l_spawn},
+	{"yield", l_yield},
 
 	#ifdef __wasm__
 	{"ipcrecv", l_ipcrecv},
@@ -804,3 +856,9 @@ int luaopen_runtime(lua_State* L) {
 
 	return 1;
 }
+
+
+// #include "lua/src/lstate.h"
+// __attribute__((constructor)) static void init() {
+// 	printf("sizeof(lua_State): %zu B\n", sizeof(T) + sizeof(lua_State));
+// }

@@ -769,7 +769,8 @@
 ** a Lua state with very fast access.
 ** CHANGE it if you need a different size.
 */
-#define LUA_EXTRASPACE		(sizeof(void *))
+// #define LUA_EXTRASPACE		(sizeof(void *))
+#define LUA_EXTRASPACE		(sizeof(void*)*4 + sizeof(int)*2) /* dew's struct T */
 
 
 /*
