@@ -532,37 +532,108 @@ function main2()
 	-- print("main2 coroutine.status()  =>", coroutine.status(select(1, coroutine.running())))
 	-- __rt.yield(123, 456)
 
-	local function spawnchild(name)
-		return __rt.spawn(function()
-			print(name .. " enter")
-			__rt.spawn(function()
-				print(name .. "/A enter")
-				__rt.spawn(function()
-					print(name .. "/A/A enter")
+	local function spawnchild(name) return __rt.spawn(function()
+		print(name .. " enter")
+		__rt.yield()
+		print(name .. " yield")
+		__rt.yield()
+		print(name .. " exit")
+	end) end
 
-					local _ <close> = setmetatable({}, { __close = function()
-						print(name .. "/A/A __close")
-						-- __rt.yield() -- error if called during task shutdown
-					end })
-
-					__rt.yield()
-					print(name .. "/A/A exit")
-				end)
-				__rt.yield()
-				print(name .. "/A exit")
-			end)
-			__rt.yield()
-			-- while true do
-			--	__rt.yield()
-			-- 	print(name .. " yield")
-			-- end
-			print(name .. " exit")
-		end)
+	do
+		__rt.taskblock_begin()
+		spawnchild("A")
+		spawnchild("B")
+		__rt.taskblock_end()
 	end
-	spawnchild("A")
+	-- Semantics should be that this ("main") task is waiting for the taskblock
+	-- to signal completion.
+	-- Can do something like this:
+	--    taskblock_begin() {
+	--        t = current_task()
+	--        b = taskblock_alloc(t)
+	--        t->taskblock_stack = b // push
+	--        return 0
+	--    }
+	--    taskblock_end() {
+	--        t = current_task()
+	--        assert(t->taskblock_stack)
+	--        return t_yield(t)
+	--    }
+	--    spawn() {
+	--        t = current_task()
+	--        if (t->parent && t->parent->taskblock_stack)
+	--            taskblock_incr(t->parent->taskblock_stack)
+	--    }
+	--    t_finalize(t) {
+	--        if (t->parent && t->parent->taskblock_stack) {
+	--            if (taskblock_decr(t->parent->taskblock_stack) == 0) {
+	--                 taskblock_free(t->parent->taskblock_stack)
+	--                 t->parent->taskblock_stack = NULL // pop
+	--                 s_runq_add(t->parent) // block done; resume parent
+	--            }
+	--        }
+	--    }
+
+	-- __rt.yield()
+	-- __rt.yield()
+	-- __rt.yield()
+	-- __rt.yield()
+	-- __rt.yield()
+	-- __rt.yield()
+	-- __rt.yield()
+	-- print("all tasks finished")
+	print("main exit")
+
+
+
+	-- local function spawnchild(name) return __rt.spawn(function()
+	-- 	print(name .. " enter")
+	-- 	local _ <close> = setmetatable({}, { __close = function() print(name .. " __close") end })
+	-- 	__rt.yield()
+	-- 	print(name .. " exit")
+	-- end) end
+	-- local _ <close> = setmetatable({}, { __close = function() print("main __close") end })
+	-- spawnchild("A")
 	-- spawnchild("B")
 	-- spawnchild("C")
-	print("main exit")
+	-- print("main exit")
+
+
+
+	-- local function spawnchild(name)
+	-- 	return __rt.spawn(function()
+	-- 		print(name .. " enter")
+	-- 		__rt.spawn(function()
+	-- 			print(name .. "/A enter")
+	-- 			__rt.spawn(function()
+	-- 				print(name .. "/A/A enter")
+
+	-- 				local _ <close> = setmetatable({}, { __close = function()
+	-- 					print(name .. "/A/A __close")
+	-- 					-- __rt.yield() -- error if called during task shutdown
+	-- 				end })
+
+	-- 				__rt.yield()
+	-- 				print(name .. "/A/A exit")
+	-- 			end)
+	-- 			__rt.yield()
+	-- 			print(name .. "/A exit")
+	-- 		end)
+	-- 		__rt.yield()
+	-- 		-- while true do
+	-- 		--	__rt.yield()
+	-- 		-- 	print(name .. " yield")
+	-- 		-- end
+	-- 		print(name .. " exit")
+	-- 	end)
+	-- end
+	-- spawnchild("A")
+	-- -- spawnchild("B")
+	-- -- spawnchild("C")
+	-- print("main exit")
+
+
 
 	-- local t1 = __rt.spawn(function()
 	-- 	print("child1 enter")
@@ -598,7 +669,6 @@ function main2()
 	-- end)
 	-- print("t0: t1=", t1)
 	-- -- __rt.yield()
-	print("t0 exit")
 
 	-- print("child1")
 	-- local function b()
@@ -619,3 +689,4 @@ function main2()
 end
 
 __rt.main(main2)
+collectgarbage("collect")

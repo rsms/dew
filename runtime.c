@@ -523,6 +523,9 @@ struct S {
 };
 
 
+static u8 g_thread_table_key;
+
+
 static const char* l_status_str(int status) {
 	switch (status) {
 		case LUA_OK:        return "OK";
@@ -582,22 +585,23 @@ static TStatus s_tstatus(S* s, T* t) {
 
 
 static bool s_runq_put(S* s, T* t) {
-	u32 head = s->runq_head;
-	u32 tail = s->runq_tail;
-	if (tail - head < s->runq_cap) {
-		trace_runq("runq put [%u] = " T_ID_F, tail % s->runq_cap, t_id(t));
-		s->runq[tail % s->runq_cap] = t;
-		s->runq_tail = tail + 1;
-		return true;
+	u32 next_tail = s->runq_tail + 1;
+	if (next_tail == s->runq_cap)
+		next_tail = 0;
+	if UNLIKELY(next_tail == s->runq_head) {
+		dlog("TODO: grow runq");
+		return false;
 	}
-	dlog("TODO: grow runq");
-	return false;
+	trace_runq("runq put [%u] = " T_ID_F, s->runq_tail, t_id(t));
+	s->runq[s->runq_tail] = t;
+	s->runq_tail = next_tail;
+	return true;
 }
 
 
 static bool s_runq_put_runnext(S* s, T* t) {
 	trace_runq("runq put runnext = " T_ID_F, t_id(t));
-	if (s->runnext) {
+	if UNLIKELY(s->runnext) {
 		// kick out previous runnext to runq
 		trace_runq("runq kick out runnext " T_ID_F " to runq", t_id(s->runnext));
 		if UNLIKELY(!s_runq_put(s, s->runnext))
@@ -617,9 +621,11 @@ static T* nullable s_runq_get(S* s) {
 	} else {
 		if (s->runq_head == s->runq_tail) // empty
 			return NULL;
-		t = s->runq[s->runq_head % s->runq_cap];
-		trace_runq("runq get [%u] = " T_ID_F, s->runq_head % s->runq_cap, t_id(t));
-		s->runq_head = s->runq_head + 1;
+		t = s->runq[s->runq_head];
+		trace_runq("runq get [%u] = " T_ID_F, s->runq_head, t_id(t));
+		s->runq_head++;
+		if (s->runq_head == s->runq_cap)
+			s->runq_head = 0;
 	}
 	return t;
 }
@@ -629,17 +635,22 @@ static void s_runq_remove(S* s, T* t) {
 	if (s->runnext == t) {
 		trace_runq("runq remove runnext " T_ID_F, t_id(t));
 		s->runnext = NULL;
-	} else if (s->runq_head <= s->runq_tail) {
-		for (u32 i = s->runq_head, end = s->runq_tail; i < end; i++) {
+	} else if (s->runq_head != s->runq_tail) { // not empty
+		u32 i = s->runq_head;
+		u32 count = (s->runq_tail >= s->runq_head) ?
+					(s->runq_tail - s->runq_head) :
+					(s->runq_cap - s->runq_head + s->runq_tail);
+		for (u32 j = 0; j < count; j++) {
 			if (s->runq[i] == t) {
 				trace_runq("runq remove [%u] " T_ID_F, i, t_id(t));
-				memmove(&s->runq[i], &s->runq[i + 1], end - i);
-				s->runq_tail--;
+				u32 next = (i + 1 == s->runq_cap) ? 0 : i + 1;
+				memmove(&s->runq[i], &s->runq[next], (s->runq_tail - next) * sizeof(*s->runq));
+				s->runq_tail = (s->runq_tail == 0) ? s->runq_cap - 1 : s->runq_tail - 1;
 				return;
 			}
+			i = (i + 1 == s->runq_cap) ? 0 : i + 1;
 		}
-	} else {
-		assert(!"TODO wrapped (s->runq_head > s->runq_tail)");
+		trace("warning: s_runq_remove(" T_ID_F ") called but task not found", t_id(t));
 	}
 }
 
@@ -769,8 +780,19 @@ static void t_finalize(T* t, int status) {
 	if (t->first_child)
 		t_stop_r(t, t->first_child);
 
+	// remove task from parent's list of children
 	if (t->parent)
 		t_remove_child(t->parent, t);
+
+	// remove GC ref to allow task (Lua thread) to be garbage collected
+	lua_State* TL = t_L(t);
+	lua_State* SL = t->s->L;
+	lua_rawgetp(SL, LUA_REGISTRYINDEX, &g_thread_table_key);  // Get the thread table
+	lua_pushthread(TL);   // Push the thread onto its own stack
+	lua_xmove(TL, SL, 1); // Move the thread object to the `SL` state
+	lua_pushnil(SL);      // Use `nil` to remove the key
+	lua_rawset(SL, -3);   // thread_table[thread] = nil in `SL`
+	lua_pop(SL, 1);       // Remove the thread table from the stack
 }
 
 
@@ -788,12 +810,12 @@ static void t_resume(T* t) {
 	trace("resume " T_ID_F " nargs=%d", t_id(t), nargs);
 	int status = lua_resume(L, t->s->L, nargs, &nres);
 
-	// discard results
-	lua_pop(L, nres);
-
 	// check if task exited
 	if UNLIKELY(status != LUA_YIELD)
 		return t_finalize(t, status);
+
+	// discard results
+	return lua_pop(L, nres);
 }
 
 
@@ -809,17 +831,28 @@ static int t_yield(T* t, int nresults) {
 
 // s_spawntask creates a new task, which function should be on stack L (the spawner thread),
 // and adds it to the runq as runnext.
-// L should also be the Lua thread that initiated the spawn (S's L or a task's L.)
+// L should be the Lua thread that initiated the spawn (S's L or a task's L.)
 // Returns 1 on success with Lua "thread" on L stack, or 0 on failure with Lua error set in L.
 static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	// create Lua "thread".
 	// Note: See coroutine.create in luaB_cocreate (lcorolib.c).
 	if UNLIKELY(lua_type(L, 1) != LUA_TFUNCTION)
 		return luaL_typeerror(L, 1, lua_typename(L, LUA_TFUNCTION));
-
 	lua_State* NL = lua_newthread(L);
 	lua_pushvalue(L, 1); // move function to top of caller stack
 	lua_xmove(L, NL, 1); // move function from L to NL
+
+	// Hold on to a GC reference to thread, e.g. "S.L.thread_table[thread] = true"
+	// Note: this is quite complex of a Lua stack operation. In particular lua_pushthread is
+	// gnarly as it pushes the thread onto its own stack, which we then move over to S's stack.
+	// If we get things wrong we (at best) get a memory bus error in asan with no stack trace,
+	// making this tricky to debug.
+	lua_rawgetp(s->L, LUA_REGISTRYINDEX, &g_thread_table_key);
+	lua_pushthread(NL);     // Push thread as key onto its own stack
+	lua_xmove(NL, s->L, 1); // Move the thread object to the `L` state
+	lua_pushboolean(s->L, 1);  // "true"
+	lua_rawset(s->L, -3);  // thread_table[thread] = true
+	lua_pop(s->L, 1);  // Remove table from stack
 
 	// initialize T struct (which lives in the LUA_EXTRASPACE header of lua_State)
 	T* t = L_t(NL);
@@ -860,7 +893,7 @@ static int s_schedule(S* s) {
 		// find a task to run
 		T* t = s_runq_get(s);
 		if (t) {
-			// trace(T_ID_F " taken from runq", t_id(t));
+			trace(T_ID_F " taken from runq", t_id(t));
 			debug_nwait = 0;
 			t_resume(t);
 		} else {
@@ -906,6 +939,10 @@ static int l_main(lua_State* L) {
 		free(s->runq);
 		return luaL_error(L, strerror(-err));
 	}
+
+	// create threads table (for GC refs)
+	lua_createtable(L, 0, /*estimated common-case lowball Lua-thread count*/8);
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_thread_table_key);
 
 	// create main task
 	int nres = s_spawntask(s, L, NULL);
@@ -958,6 +995,21 @@ static int l_spawn(lua_State* L) {
 }
 
 
+static int l_taskblock_begin(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	trace("taskblock_begin");
+	// TODO
+	return t_yield(t, 0);
+}
+
+
+static int l_taskblock_end(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	trace("taskblock_end");
+	return t_yield(t, 0);
+}
+
+
 static const luaL_Reg dew_lib[] = {
 	{"intscan", l_intscan},
 	{"intfmt", l_intfmt},
@@ -971,6 +1023,8 @@ static const luaL_Reg dew_lib[] = {
 	{"main", l_main},
 	{"spawn", l_spawn},
 	{"yield", l_yield},
+	{"taskblock_begin", l_taskblock_begin},
+	{"taskblock_end", l_taskblock_end},
 
 	#ifdef __wasm__
 	{"ipcrecv", l_ipcrecv},
