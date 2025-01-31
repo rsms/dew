@@ -6,7 +6,7 @@ Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
 OBJDIR       := $(BUILDDIR)/obj
-SRCS         := dew.c runtime.c lib_bignum.c bn.c time.c logmsg.c \
+SRCS         := dew.c runtime.c lib_bignum.c bn.c time.c logmsg.c platform.c \
                 $(if $(filter $(TARGET),web),runloop_wasm.c,runloop_ev.c libev/ev.c)
 LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c lobject.c \
                 lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c lzio.c \
@@ -107,7 +107,8 @@ clean:
 	rm -rf o.*
 
 dev:
-	autorun *.c *.h *.lua lua/src/*.c libev/*.* examples/*.dew -- '$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
+	autorun *.c *.h *.lua lua/src/*.c libev/*.* examples/*.dew \
+	-- '$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
 _dev: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew examples/dev.dew --debug-tokens --debug-parse --debug-resolve --debug-codegen
 

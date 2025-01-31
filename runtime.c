@@ -1,8 +1,14 @@
-#include "dew.h"
+#include "runtime.h"
 
-#ifdef __wasm__
-#include "wasm.h"
-#endif
+#define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
+#include <sys/socket.h>
+#include <netinet/in.h>
+
+static_assert(sizeof(T) == LUA_EXTRASPACE, "");
+
+
+
 
 static const u8 g_intdectab[256] = { // decoding table, base 2-36
 	-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
@@ -474,53 +480,15 @@ static int l_runloop_run(lua_State* L) {
 }
 
 
+// old runtime stuff above
+//——————————————————————————————————————————————————————————————————————————————————————————————
+// new runtime below
 
 
 #define trace(fmt, ...) dlog("\e[1;34m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
 
 // #define trace_runq(fmt, ...) dlog("\e[1;35m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
 #define trace_runq(fmt, ...) ((void)0)
-
-
-typedef struct S S; // scheduler (M+P in Go lingo)
-typedef struct T T; // task
-
-typedef enum TStatus : u8 {
-	TStatus_RUN,   // running
-	TStatus_DEAD,  // dead
-	TStatus_YIELD, // suspended
-	TStatus_NORM,  // normal
-} TStatus;
-
-struct T {
-	S*          s;            // owning S
-	T* nullable parent;       // task that spawned this task (0 means this is S's main task)
-	T* nullable next_sibling;
-	T* nullable first_child;
-	int         nres;         // number of results on stack, to be returned via resume
-	u8          is_live;      // 1 when running or waiting, 0 when not yet started or exited
-	u8          _unused[3];
-	// rest of struct is a lua_State struct
-	// Note: With Lua 5.4, the total size of T + lua_State is 240 B
-};
-
-static_assert(sizeof(T) == LUA_EXTRASPACE, "");
-
-struct S {
-	lua_State* L;       // base Lua environment
-	Runloop*   runloop; //
-	u32        nlive;   // number of live tasks
-
-	// runq is a queue of tasks (TIDs) ready to run; a circular buffer.
-	// (We could get fancy with a red-black tree a la Linux kernel. Let's keep it simple for now.)
-	u32 runq_head;
-	u32 runq_tail;
-	u32 runq_cap;
-	T** runq;
-
-	// runnext is a TID (>0) if a task is to be run immediately, skipping runq
-	T* nullable runnext;
-};
 
 
 static u8 g_thread_table_key;
@@ -537,28 +505,6 @@ static const char* l_status_str(int status) {
 	}
 	return "?";
 }
-
-
-// L_t returns Lua state of task
-inline static lua_State* t_L(const T* t) {
-	// T is stored in the LUA_EXTRASPACE in the head of Lua managed lua_State
-	return (void*)t + sizeof(*t);
-}
-
-
-// L_t returns task of Lua state
-inline static T* L_t(lua_State* L) {
-	return (void*)L - sizeof(T);
-}
-
-
-// s_id formats an identifier of a S for logging
-#define s_id(s) ((unsigned long)(uintptr)(s))
-#define S_ID_F  "S#%lx"
-
-// t_id formats an identifier of a T for logging
-#define t_id(t) ((unsigned long)(uintptr)t_L(t))
-#define T_ID_F  "T#%lx"
 
 
 // s_tstatus returns the status of a task.
@@ -655,6 +601,24 @@ static void s_runq_remove(S* s, T* t) {
 }
 
 
+static i32 s_runq_find(const S* s, const T* t) {
+	if (s->runnext == t)
+		return I32_MAX;
+	if (s->runq_head != s->runq_tail) { // not empty
+		u32 i = s->runq_head;
+		u32 count = (s->runq_tail >= s->runq_head) ?
+					(s->runq_tail - s->runq_head) :
+					(s->runq_cap - s->runq_head + s->runq_tail);
+		for (u32 j = 0; j < count; j++) {
+			if (s->runq[i] == t)
+				return (i32)i;
+			i = (i + 1 == s->runq_cap) ? 0 : i + 1;
+		}
+	}
+	return -1;
+}
+
+
 static void t_add_child(T* parent, T* child) {
 	assert(child->next_sibling == NULL /* not in a list */);
 	child->next_sibling = parent->first_child;
@@ -715,6 +679,21 @@ static void dlog_task_tree(const T* t, int level) {
 		dlog("%*s" T_ID_F, level*4, "", t_id(child));
 		dlog_task_tree(child, level + 1);
 	}
+}
+
+
+static IOPollDesc* nullable s_iopolldesc_alloc(S* s) {
+	// TODO: pool
+	IOPollDesc* pd = calloc(1, sizeof(IOPollDesc));
+	// d->seq++; // TODO: when pooled
+	return pd;
+}
+
+
+static void s_iopolldesc_free(S* s, IOPollDesc* pd) {
+	// TODO: pool
+	pd->t->polldesc = NULL;
+	free(pd);
 }
 
 
@@ -805,8 +784,12 @@ static void t_resume(T* t) {
 	// switch from l_main to task
 	// nargs: number of values on T's stack to be returned from 'yield' inside task.
 	// nres:  number of values passed to 'yield' by task.
-	int nargs = t->nres, nres;
-	t->nres = 0;
+	int nargs = 0, nres;
+	if (t->polldesc == NULL) {
+		// not using l_yield_cont_iopoll, so return values now
+		nargs = t->resume_nres;
+	}
+
 	trace("resume " T_ID_F " nargs=%d", t_id(t), nargs);
 	int status = lua_resume(L, t->s->L, nargs, &nres);
 
@@ -819,10 +802,47 @@ static void t_resume(T* t) {
 }
 
 
-// t_yield suspends t, switching control back to s_schedule loop
-// Must only be called from a task, never l_main.
+// l_yield_cont_iopoll is a continuation used with all API functions which uses IOPollDesc.
+// This function is run after we resume a task with t_resume but before continuing execution
+// of the task.
+static int l_yield_cont_iopoll(lua_State* L, int status, lua_KContext ctx) {
+	T* t = L_t(L);
+	trace(T_ID_F " %s", t_id(t), l_status_str(status));
+	assert(t->is_live);
+	assert(t->polldesc != NULL || !"should not use l_yield_cont_iopoll without polldesc");
+
+	trace(T_ID_F " setup polldesc result", t_id(t));
+
+	if UNLIKELY(t->polldesc->result < 0) {
+		int err_no = (int)-t->polldesc->result;
+		if (!t->polldesc->active) {
+			s_iopolldesc_free(t->s, t->polldesc);
+			t->polldesc = NULL;
+		}
+		// TODO: Do we need to lua_pop(L, t->resume_nres) here?
+		return luaL_error(L, strerror(err_no));
+	}
+
+	// return result of polldesc unless t->resume_nres > -1
+	if (t->resume_nres < 0) {
+		lua_pushinteger(L, t->polldesc->result);
+		t->resume_nres = 1;
+	}
+
+	if (!t->polldesc->active) {
+		s_iopolldesc_free(t->s, t->polldesc);
+		t->polldesc = NULL;
+	}
+
+	return t->resume_nres;
+}
+
+
+// t_yield schedules t for immediate resumption,
+// suspends t and switches control back to s_schedule loop.
+// (Must only be called from a task, never l_main.)
 static int t_yield(T* t, int nresults) {
-	trace("suspend " T_ID_F, t_id(t));
+	trace(T_ID_F " yield", t_id(t));
 	if UNLIKELY(!s_runq_put(t->s, t))
 		return luaL_error(t_L(t), "out of memory");
 	return lua_yield(t_L(t), nresults);
@@ -860,7 +880,8 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	t->parent = parent;
 	t->next_sibling = NULL;
 	t->first_child = NULL;
-	t->nres = 0;
+	t->polldesc = NULL;
+	t->resume_nres = 0;
 	t->is_live = 1;
 
 	// setup t to be run next by schedule
@@ -885,36 +906,57 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 }
 
 
+int s_iopoll_wake(S* s, IOPollDesc* pd) {
+	trace(T_ID_F " woken by iopoll" , t_id(pd->t));
+
+	// TODO: check if t is already on runq and don't add it if so.
+	// For now, use an assertion (note: this is likely to happen)
+	assert(s_runq_find(s, pd->t) == -1);
+
+	if UNLIKELY(!s_runq_put(s, pd->t)) {
+		s_iopolldesc_free(s, pd);
+		return -ENOMEM;
+	}
+	return 0;
+}
+
+
 static int s_schedule(S* s) {
 	// Scheduler loop: find a runnable task and execute it.
 	// Stops when all tasks have finished or an error occurred.
+
+	// TODO: track min timer deadline in this loop and make sure to iopoll when reaching that
+	// deadline, else we might never get to timers if tasks are spawned at the same rate as we
+	// are running them.
+
 	static int debug_nwait = 0;
 	while (s->nlive > 0) {
 		// find a task to run
 		T* t = s_runq_get(s);
 		if (t) {
 			trace(T_ID_F " taken from runq", t_id(t));
-			debug_nwait = 0;
+			debug_nwait = 0; // XXX
 			t_resume(t);
-		} else {
-			// wait for an event to wake a T up
-			trace("wait I/O");
-			int n = RunloopRun(s->runloop, 0);
-			if UNLIKELY(n < 0) {
-				logerr("internal I/O error: %s", strerror(-n));
-				luaL_error(s->L, strerror(-n));
-				return 0;
-			}
-			// check runq & allt again
-			// debug check for logic errors (TODO: remove this when I know scheduler works)
-			if (++debug_nwait == 4) {
-				dlog("s->nlive %u", s->nlive);
-				assert(!"XXX");
-			}
+			continue;
+		}
+		// wait for an event to wake a T up
+		trace("iopoll_poll");
+		int n = iopoll_poll(&s->iopoll, /*deadline*/-1);
+		if UNLIKELY(n < 0) {
+			logerr("internal I/O error: %s", strerror(-n));
+			luaL_error(s->L, strerror(-n));
+			return 0;
+		}
+
+		// check runq & allt again
+		// debug check for logic errors (TODO: remove this when I know scheduler works)
+		if (n == 0 && ++debug_nwait == 4) {
+			dlog("s->nlive %u", s->nlive);
+			assert(!"XXX");
 		}
 	}
 	trace("shutdown " S_ID_F, s_id(s));
-	RunloopFree(s->runloop);
+	iopoll_close(&s->iopoll);
 	return 0;
 }
 
@@ -931,12 +973,10 @@ static int l_main(lua_State* L) {
 	if (!s->runq)
 		return luaL_error(L, strerror(ENOMEM));
 
-	// create runloop for scheduler.
-	// TODO: integrate runloop into scheduler.
-	int err = RunloopCreate(&s->runloop);
-	if UNLIKELY(err) {
-		trace("RunloopCreate failed: %s", strerror(-err));
-		free(s->runq);
+	// open platform I/O facility
+	int err = iopoll_open(&s->iopoll, s);
+	if (err) {
+		dlog("error: iopoll_open: %s", strerror(-err));
 		return luaL_error(L, strerror(-err));
 	}
 
@@ -985,13 +1025,175 @@ static int l_yield(lua_State* L) {
 static int l_spawn(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 
-	assert(t->nres == 0);
-	t->nres = s_spawntask(t->s, L, t);
-	if UNLIKELY(t->nres == 0)
+	t->resume_nres = s_spawntask(t->s, L, t);
+	if UNLIKELY(t->resume_nres == 0)
 		return 0;
 
 	// suspend the calling task, switching control back to s_schedule loop
 	return t_yield(t, 0);
+}
+
+
+static int l_sleep(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+
+	DTimeDuration delay = luaL_checkinteger(L, 1);
+	if (delay < 0)
+		return luaL_error(L, "negative timeout");
+	DTime deadline = DTimeNow() + delay;
+
+	trace(T_ID_F " sleep (%llu ns)", t_id(t), delay);
+
+	// allocate iopoll descriptor
+	IOPollDesc* pd = s_iopolldesc_alloc(t->s);
+	if UNLIKELY(!pd)
+		return luaL_error(L, "out of memory");
+	pd->t = t;
+	t->polldesc = pd;
+
+	// add timer to iopoll
+	int err = iopoll_add_timer(&t->s->iopoll, pd, deadline);
+	if UNLIKELY(err) {
+		s_iopolldesc_free(t->s, pd);
+		return luaL_error(L, strerror(-err));
+	}
+
+	// once task is resumed (timer expired), we return no values
+	t->resume_nres = 0;
+
+	return lua_yieldk(L, 0, 0, l_yield_cont_iopoll);
+}
+
+
+static int l_net_connect(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	lua_pop(L, lua_gettop(L)); // discard arguments (until we handle them)
+
+	// create socket
+	#if defined(__linux__)
+		int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+	#else
+		int fd = socket(AF_INET, SOCK_STREAM, 0);
+		int flags = fcntl(fd, F_GETFL, 0);
+		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+	#endif
+
+	// construct network address
+	struct sockaddr_in addr;
+	addr.sin_family = AF_INET;
+	addr.sin_port = htons(12345);
+	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+	// connect
+	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+		// connect immediately succeeded, without blocking
+		lua_pushinteger(L, fd);
+		return 1;
+	}
+
+	// check if connect failed (likely because of invalid address)
+	if UNLIKELY(errno != EINPROGRESS) {
+		int err = errno;
+		close(fd);
+		return luaL_error(L, strerror(err));
+	}
+
+	// allocate iopoll descriptor
+	IOPollDesc* pd = s_iopolldesc_alloc(t->s);
+	if UNLIKELY(!pd)
+		return luaL_error(L, "out of memory");
+	t->polldesc = pd;
+	pd->t = t;
+	pd->use = IOPollDesc_USE_CONNECT;
+
+	// add to iopoll
+	int err = iopoll_add_fd(&t->s->iopoll, pd, fd, IOPollDesc_EV_READ);
+	if UNLIKELY(err) {
+		s_iopolldesc_free(t->s, pd);
+		return luaL_error(L, strerror(-err));
+	}
+
+	// once task is resumed, we return the file descriptor
+	lua_pushinteger(L, fd);
+	t->resume_nres = 1;
+
+	return lua_yieldk(L, 0, 0, l_yield_cont_iopoll);
+}
+
+
+typedef struct DBuf {
+	usize cap, len; // in bytes
+	u8 bytes[];
+} DBuf;
+
+
+#define L_CHECK_DARRAY(L, idx) ({ \
+	if UNLIKELY(!lua_islightuserdata(L, idx)) \
+		return luaL_error(L, "buf argument is not a byte array"); \
+	lua_touserdata(L, idx); \
+	/* TODO: verify a is in fact a DBuf? */ \
+})
+
+
+static int l_buf_alloc(lua_State* L) {
+	u64 size = luaL_checkinteger(L, 1);
+
+	if UNLIKELY(check_add_overflow(size, (u64)sizeof(DBuf), &size) ||
+	            (USIZE_MAX < U64_MAX && size > USIZE_MAX) )
+	{
+		return luaL_error(L, "array too large");
+	}
+
+	DBuf* a = malloc(size);
+	if UNLIKELY(!a)
+		return luaL_error(L, "out of memory");
+	a->cap = size - sizeof(DBuf);
+	a->len = 0;
+
+	lua_pushlightuserdata(L, a);
+	return 1;
+}
+
+
+static int l_buf_str(lua_State* L) {
+	DBuf* a = L_CHECK_DARRAY(L, 1);
+	// TODO: optional second argument for how to encode the data, e.g. hex, base64
+	lua_pushlstring(L, (char*)a->bytes, a->len);
+	return 1;
+}
+
+
+static int l_read(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+
+	int fd = luaL_checkinteger(L, 1);
+	DBuf* a = L_CHECK_DARRAY(L, 2);
+
+	ssize_t len = read(fd, &a->bytes[a->len], a->cap - a->len);
+	if (len >= 0) {
+		// there was data immediately available to read
+		assert((usize)len <= a->cap - a->len);
+		a->len += (usize)len;
+		lua_pushinteger(L, len);
+		return 1;
+	}
+
+	// check for error
+	if UNLIKELY(errno != EAGAIN)
+		return luaL_error(L, strerror(errno));
+
+	// need to poll this fd
+	if (t->polldesc == NULL) {
+		assert(!"TODO setup polldesc");
+	}
+
+	// tell l_yield_cont_iopoll that it should return polldesc->result
+	t->resume_nres = -1;
+
+	// TODO: need to update a->len after read completes.
+	// Find a way to run custom code in l_yield_cont_iopoll.
+
+	return lua_yieldk(L, 0, 0, l_yield_cont_iopoll);
 }
 
 
@@ -1016,16 +1218,25 @@ static const luaL_Reg dew_lib[] = {
 	{"intconv", l_intconv},
 	{"errstr", l_errstr},
 	{"time", l_time},
+
+	// "old" runtime API
 	{"runloop_run", l_runloop_run},
 	{"runloop_add_timeout", l_runloop_add_timeout},
 	{"runloop_add_interval", l_runloop_add_interval},
 
+	// "new" runtime API
 	{"main", l_main},
 	{"spawn", l_spawn},
 	{"yield", l_yield},
+	{"sleep", l_sleep},
+	{"net_connect", l_net_connect},
+	{"read", l_read},
+	{"buf_alloc", l_buf_alloc},
+	{"buf_str", l_buf_str},
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
 
+	// wasm experiments
 	#ifdef __wasm__
 	{"ipcrecv", l_ipcrecv},
 	{"ipcrecv_co", l_ipcrecv_co},

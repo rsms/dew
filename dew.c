@@ -160,6 +160,7 @@ static int pmain(lua_State* L) {
 	#endif
 	if (status != LUA_OK) {
 		check_status(L_co, status);
+		dlog("returning early from check_status");
 		return 0; // interrupt in case of error
 	}
 
@@ -201,6 +202,7 @@ static int pmain(lua_State* L) {
 	#endif
 	if (status != LUA_OK) {
 		check_status(L_co, status);
+		dlog("returning early from check_status");
 		return 0; // interrupt in case of error
 	}
 
