@@ -16,6 +16,7 @@ LUA_SRCS     := $(sort $(addprefix lua/src/,$(LUA_SRCS)))
 JSSRCS       := $(wildcard web/*.ts web/index.html)
 CFLAGS       := -std=c17 -g -fdebug-compilation-dir=/x/ \
                 -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
+                -Werror=incompatible-pointer-types \
                 -Ilua/src $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
 LDFLAGS      :=
 LIBEV_CFLAGS := -Wno-comment -Wno-sign-compare -Wno-extern-initializer -Wno-bitwise-op-parentheses

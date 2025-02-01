@@ -537,36 +537,44 @@ function main2()
 	-- end, function(error)
 	-- 	print("caught error:", error, debug.traceback(nil, 2))
 	-- end)
-	local fd = __rt.net_connect("127.0.0.1:12345")
-	print("net_connect =>", fd)
 
-	local buf = __rt.buf_alloc(32)
-	print("buf_alloc =>", buf)
-	print("read =>", __rt.read(fd, buf))
-	print("read =>", __rt.read(fd, buf))
+	local buf = __rt.buf_alloc(64) ; print("buf_alloc =>", buf)
+	local fd = __rt.socket(__rt.PF_INET, __rt.SOCK_STREAM)
+	print("socket =>", fd)
+	print("connect =>", __rt.connect(fd, "127.0.0.1:12345"))
+	while true do
+		local n = __rt.read(fd, buf)
+		print("read =>", n)
+		if n == 0 then break end
+	end
 	print("buf_str => \"" .. __rt.buf_str(buf) .. "\"")
 
-	print("main sleep 400ms")
-	print("sleep =>", __rt.sleep(400000000))
+	-- print("read =>", __rt.read(fd, buf))
+	-- print("buf_str => \"" .. __rt.buf_str(buf) .. "\"")
+
+	-- print("main sleep 400ms")
+	-- print("sleep =>", __rt.sleep(400000000))
 	-- print("main sleep 5000ms")
 	-- print("sleep =>", __rt.sleep(5000000000))
 	print("main exit")
-	os.exit(0)
+	-- os.exit(0)
+	return
 
-	local function spawnchild(name) return __rt.spawn(function()
-		print(name .. " enter")
-		__rt.yield()
-		print(name .. " yield")
-		__rt.yield()
-		print(name .. " exit")
-	end) end
+	-- local function spawnchild(name) return __rt.spawn(function()
+	-- 	print(name .. " enter")
+	-- 	__rt.yield()
+	-- 	print(name .. " yield")
+	-- 	__rt.yield()
+	-- 	print(name .. " exit")
+	-- end) end
 
-	do
-		__rt.taskblock_begin()
-		spawnchild("A")
-		spawnchild("B")
-		__rt.taskblock_end()
-	end
+	-- do
+	-- 	__rt.taskblock_begin()
+	-- 	spawnchild("A")
+	-- 	spawnchild("B")
+	-- 	__rt.taskblock_end()
+	-- end
+
 	-- Semantics should be that this ("main") task is waiting for the taskblock
 	-- to signal completion.
 	-- Can do something like this:
@@ -604,7 +612,7 @@ function main2()
 	-- __rt.yield()
 	-- __rt.yield()
 	-- print("all tasks finished")
-	print("main exit")
+	-- print("main exit")
 
 
 

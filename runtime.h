@@ -5,9 +5,16 @@ API_BEGIN
 typedef struct S S; // scheduler (M+P in Go lingo)
 typedef struct T T; // task
 
+// growable array usable via buf_* Lua functions
+typedef struct Buf {
+	usize cap, len;
+	u8* nullable bytes;
+} Buf;
+
 // platform specific I/O facility
 typedef struct IOPoll     IOPoll;     // facility
 typedef struct IOPollDesc IOPollDesc; // descriptor (state used for I/O requests)
+typedef struct IODesc     IODesc; // wraps a file descriptor, used by iopoll
 
 struct IOPoll {
 	S* s;
@@ -16,27 +23,14 @@ struct IOPoll {
 	#endif
 };
 
-enum : u8 {
-	IOPollDesc_EV_READ  = 1<<0,
-	IOPollDesc_EV_WRITE = 1<<1,
-	IOPollDesc_EV_TIMER = 1<<2,
-	IOPollDesc_EV_EOF   = 1<<3,
-};
-
-enum : u8 {
-	IOPollDesc_USE_GENERIC = 0,
-	IOPollDesc_USE_CONNECT,
-};
-
-struct IOPollDesc {
-	IOPollDesc* nullable link;
-
-	T*   t;
-	u32  seq;
-	u8   use;    // IOPollDesc_USE_* constant
-	u8   events; // IOPollDesc_EV_* bits
-	bool active;
-	i64  result; // -errno or positive value (meaning depends on use)
+struct IODesc {
+	T* nullable t;      // task to wake up on events
+	i32         fd;     // -1 if unused
+	u16         seq;    // sequence for detecting use after close
+	u8          events; // 'r', 'w' or 'r'+'w' (114, 119 or 233)
+	u8          _unused;
+	i64         nread;  // bytes available to read, or -errno on error
+	i64         nwrite; // bytes available to write, or -errno on error
 };
 
 typedef enum TStatus : u8 {
@@ -47,14 +41,14 @@ typedef enum TStatus : u8 {
 } TStatus;
 
 struct T {
-	S*                   s;            // owning S
-	T* nullable          parent;       // task that spawned this task (NULL = S's main task)
-	T* nullable          next_sibling; // next sibling in parent's list of children
-	T* nullable          first_child;  // list of children
-	IOPollDesc* nullable polldesc;     // non-NULL when task has pending I/O request
-	int                  resume_nres;  // number of results on stack, to be returned via resume
-	u8                   is_live;      // 1 when running or waiting, 0 when exited
-	u8                   _unused[3];
+	S*             s;            // owning S
+	T* nullable    parent;       // task that spawned this task (NULL = S's main task)
+	T* nullable    next_sibling; // next sibling in parent's list of children
+	T* nullable    first_child;  // list of children
+	void* nullable _unused1;
+	int            resume_nres;  // number of results on stack, to be returned via resume
+	u8             is_live;      // 1 when running or waiting, 0 when exited
+	u8             _unused[3];
 	// rest of struct is a lua_State struct
 	// Note: With Lua 5.4, the total size of T + lua_State is 248 B
 };
@@ -92,13 +86,13 @@ inline static lua_State* t_L(const T* t) { return (void*)t + sizeof(*t); }
 inline static T* L_t(lua_State* L) { return (void*)L - sizeof(T); }
 
 
-int  iopoll_open(IOPoll* iopoll, S* s);
-void iopoll_close(IOPoll* iopoll);
-int  iopoll_poll(IOPoll* iopoll, DTime deadline);
-int  iopoll_add_timer(IOPoll* iopoll, IOPollDesc* d, DTime deadline);
-int  iopoll_add_fd(IOPoll* iopoll, IOPollDesc* d, int fd, u8 events /*IOPollDesc_EV_* bits*/);
+int iopoll_init(IOPoll* iopoll, S* s);
+void iopoll_shutdown(IOPoll* iopoll);
+int iopoll_poll(IOPoll* iopoll, DTime deadline);
+int iopoll_open(IOPoll* iopoll, IODesc* d);
+int iopoll_close(IOPoll* iopoll, IODesc* d);
 
-int s_iopoll_wake(S* s, IOPollDesc* d);
+int s_iopoll_wake(S* s, IODesc** dv, u32 count);
 
 
 API_END

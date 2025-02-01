@@ -69,6 +69,12 @@ static bool x_luaL_optboolean(lua_State* L, int index, bool default_value) {
 }
 
 
+static int l_errno_error(lua_State* L, int err_no) {
+	lua_pushstring(L, strerror(err_no));
+	return lua_error(L);
+}
+
+
 static int err_from_errno(int errno_val) {
 	static const int tab[] = {
 		#define _(NAME, ERRNO, ...) [ERRNO == -1 ? NAME+0xff : ERRNO] = NAME,
@@ -238,12 +244,12 @@ done:
 //
 static int l_intscan(lua_State* L) {
 	size_t len;
-	const char *str = luaL_checklstring(L, 1, &len);
+	const char* str = luaL_checklstring(L, 1, &len);
 	lua_Integer base = luaL_optinteger(L, 2, 10);
 	u64 limit = luaL_optinteger(L, 3, 0xFFFFFFFFFFFFFFFF);
 	bool isneg = x_luaL_optboolean(L, 4, 0);
 
-	const u8 *src = (const u8 *)str;
+	const u8* src = (const u8*)str;
 	u64 result = 0;
 	int neg = -(int)isneg; // -1 or 0
 	int err = dew_intscan(&src, len, base, limit, neg, &result);
@@ -452,7 +458,7 @@ static int l_runloop_add_timeout(lua_State* L) {
 	u64 userdata = (uintptr)L;
 	int w = RunloopAddTimeout(g_main_runloop, timer_handler, userdata, deadline);
 	if (w < 0)
-		return luaL_error(L, strerror(-w));
+		return l_errno_error(L, -w);
 
 	lua_pushinteger(L, 1); // yield 1 to let runtime know we're still going
 	return lua_yield(L, 1);
@@ -465,7 +471,7 @@ static int l_runloop_add_interval(lua_State* L) {
 	u64 interval_nsec = luaL_checkinteger(L, 1);
 	int w = RunloopAddInterval(g_main_runloop, timer_handler, 0, interval_nsec);
 	if (w < 0)
-		return luaL_error(L, strerror(-w));
+		return l_errno_error(L, -w);
 	lua_pushinteger(L, w);
 	return 1;
 }
@@ -474,7 +480,7 @@ static int l_runloop_add_interval(lua_State* L) {
 static int l_runloop_run(lua_State* L) {
 	int n = RunloopRun(g_main_runloop, 0);
 	if (n < 0)
-		return luaL_error(L, strerror(-n));
+		return l_errno_error(L, -n);
 	lua_pushboolean(L, n);
 	return 1;
 }
@@ -490,8 +496,12 @@ static int l_runloop_run(lua_State* L) {
 // #define trace_runq(fmt, ...) dlog("\e[1;35m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
 #define trace_runq(fmt, ...) ((void)0)
 
+static u8 g_thread_table_key; // table where all live tasks are stored to avoid GC
+static u8 g_iodesc_luatabkey; // IODesc object prototype
+static u8 g_buf_luatabkey;    // Buf object prototype
 
-static u8 g_thread_table_key;
+// tls_s holds S for the current thread
+static _Thread_local S* tls_s = NULL;
 
 
 static const char* l_status_str(int status) {
@@ -504,6 +514,34 @@ static const char* l_status_str(int status) {
 		case LUA_ERRERR:    return "ERRERR";
 	}
 	return "?";
+}
+
+
+static void* nullable l_uobj_check(lua_State* L, int idx, const void* key, const char* tname) {
+	void* p = lua_touserdata(L, idx);
+	// get the metatable of the userdata
+	if UNLIKELY(!p || !lua_getmetatable(L, idx))
+		goto error;
+	// push the cached metatable from the registry
+	lua_rawgetp(L, LUA_REGISTRYINDEX, key);
+	// compare the two metatables using pointer equality
+	int match = lua_rawequal(L, -1, -2);
+	lua_pop(L, 2); // remove metatables from the stack
+	if (match)
+		return p;
+error:
+	luaL_typeerror(L, idx, tname);
+	return NULL;
+}
+
+
+static IODesc* nullable l_iodesc_check(lua_State* L, int idx) {
+	return l_uobj_check(L, idx, &g_iodesc_luatabkey, "FD");
+}
+
+
+static Buf* nullable l_buf_check(lua_State* L, int idx) {
+	return l_uobj_check(L, idx, &g_buf_luatabkey, "Buf");
 }
 
 
@@ -527,6 +565,165 @@ static TStatus s_tstatus(S* s, T* t) {
 		default:  /* some error occurred */
 			return TStatus_DEAD;
 	}
+}
+
+
+// l_iodesc_gc is called when an IODesc object is about to be garbage collected by Lua
+static int l_iodesc_gc(lua_State* L) {
+	IODesc* d = lua_touserdata(L, 1);
+	S* s = tls_s;
+	if (s) {
+		int err = iopoll_close(&s->iopoll, d);
+		if UNLIKELY(err)
+			logerr("iopoll_close: %s", strerror(-err));
+	} else {
+		logerr("IODesc GC'd after main exited");
+		close(d->fd);
+	}
+	return 0;
+}
+
+
+// l_iodesc_create allocates & pushes an IODesc object onto L's stack.
+// Throws LUA_ERRMEM if memory allocation fails.
+static IODesc* l_iodesc_create(lua_State* L) {
+	// lua_newuserdatauv creates and pushes on the stack a new full userdata,
+	// with nuvalue associated Lua values, called user values, plus an associated block of
+	// raw memory with size bytes. (The user values can be set and read with the functions
+	// lua_setiuservalue and lua_getiuservalue.)
+	//
+	// Lua ensures that the returned address is valid as long as the corresponding userdata
+	// is alive. Moreover, if the userdata is marked for finalization, its address is valid
+	// at least until the call to its finalizer.
+	//
+	// Throws LUA_ERRMEM if memory allocation fails
+	int nuvalue = 0;
+	IODesc* d = lua_newuserdatauv(L, sizeof(IODesc), nuvalue);
+	memset(d, 0, sizeof(*d));
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_iodesc_luatabkey);
+	lua_setmetatable(L, -2);
+	return d;
+}
+
+
+static int buf_free(Buf* buf) {
+	// if 'bytes' does not point into embedded memory, free it
+	if (buf->bytes != (void*)buf + sizeof(*buf))
+		free(buf->bytes);
+	return 0;
+}
+
+
+static int l_buf_gc(lua_State* L) {
+	Buf* buf = lua_touserdata(L, 1);
+	return buf_free(buf);
+}
+
+
+static int l_buf_alloc(lua_State* L) {
+	u64 cap = luaL_checkinteger(L, 1);
+	if UNLIKELY(cap > (u64)USIZE_MAX - sizeof(Buf))
+		luaL_error(L, "capacity too large");
+	if (cap == 0) {
+		cap = 64 - sizeof(Buf);
+	} else {
+		cap = ALIGN2(cap, sizeof(void*));
+	}
+	// dlog("allocating buffer with cap %llu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
+
+	// see comment in l_iodesc_create
+	int nuvalue = 0;
+	Buf* b = lua_newuserdatauv(L, sizeof(Buf) + (usize)cap, nuvalue);
+	b->cap = (usize)cap;
+	b->len = 0;
+	b->bytes = (void*)b + sizeof(Buf);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
+	lua_setmetatable(L, -2);
+
+	return 1;
+}
+
+
+static bool buf_resize(Buf* buf, usize newcap) {
+	if (newcap > 0 && newcap < USIZE_MAX - sizeof(void*))
+		newcap = ALIGN2(newcap, sizeof(void*));
+
+	if (newcap == buf->cap)
+		return true;
+
+	// try to double current capacity
+  	usize cap2x;
+	if (newcap > 0 && !check_mul_overflow(buf->cap, 2lu, &cap2x) && newcap <= cap2x)
+		newcap = cap2x;
+	// dlog("buf_resize %zu -> %zu", buf->cap, newcap);
+
+	void* newbytes;
+	if (buf->bytes == (void*)buf + sizeof(*buf)) {
+		// current buffer data is embedded
+		if (newcap < buf->cap) {
+			// can't shrink embedded buffer, however we update cap & len to uphold the promise
+			// that after "buf_resize(b,N)", "buf_cap(b)==N && buf_len(b)<=N"
+			buf->cap = newcap;
+			if (newcap < buf->len)
+				buf->len = newcap;
+			return true;
+		}
+		// note: We can't check for shrunk embedded buffer since we don't know the initial cap
+		if (( newbytes = malloc(newcap) ))
+			memcpy(newbytes, buf->bytes, buf->len);
+	} else if (newcap == 0) {
+		// allow 'buf_resize(buf, 0)' to be used as an explicit way to release a buffer,
+		// when relying on GC is not adequate
+		free(buf->bytes);
+		buf->bytes = NULL;
+		buf->cap = 0;
+		buf->len = 0;
+		return true;
+	} else {
+		newbytes = realloc(buf->bytes, newcap);
+	}
+	if (!newbytes)
+		return false;
+	buf->bytes = newbytes;
+	buf->cap = newcap;
+	if (newcap < buf->len)
+		buf->len = newcap;
+	return true;
+}
+
+
+// buf_reserve makes sure that there is at least minavail bytes available at bytes+len
+static bool buf_reserve(Buf* buf, usize minavail) {
+	usize avail = buf->cap - buf->len;
+	if LIKELY(avail >= minavail)
+		return true;
+	usize newcap = buf->cap + (minavail - avail);
+	return buf_resize(buf, newcap);
+}
+
+
+// fun buf_resize(buf Buf, newcap uint)
+static int l_buf_resize(lua_State* L) {
+	Buf* buf = l_buf_check(L, 1);
+	i64 newcap = luaL_checkinteger(L, 2);
+	if UNLIKELY((USIZE_MAX < U64_MAX && newcap > (u64)USIZE_MAX) ||
+	            newcap < 0 || (u64)newcap > 0x10000000000) // llvm asan has 1TiB limit
+	{
+		if (newcap < 0)
+			return luaL_error(L, "negative capacity");
+		return luaL_error(L, "capacity too large");
+	}
+	if (!buf_resize(buf, newcap))
+		return l_errno_error(L, ENOMEM);
+	return 0;
+}
+
+
+static int l_buf_str(lua_State* L) {
+	Buf* buf = l_buf_check(L, 1);
+	// TODO: optional second argument for how to encode the data, e.g. hex, base64
+	lua_pushlstring(L, (char*)buf->bytes, buf->len);
+	return 1;
 }
 
 
@@ -682,21 +879,6 @@ static void dlog_task_tree(const T* t, int level) {
 }
 
 
-static IOPollDesc* nullable s_iopolldesc_alloc(S* s) {
-	// TODO: pool
-	IOPollDesc* pd = calloc(1, sizeof(IOPollDesc));
-	// d->seq++; // TODO: when pooled
-	return pd;
-}
-
-
-static void s_iopolldesc_free(S* s, IOPollDesc* pd) {
-	// TODO: pool
-	pd->t->polldesc = NULL;
-	free(pd);
-}
-
-
 static void t_finalize(T* t, int status);
 
 
@@ -784,11 +966,7 @@ static void t_resume(T* t) {
 	// switch from l_main to task
 	// nargs: number of values on T's stack to be returned from 'yield' inside task.
 	// nres:  number of values passed to 'yield' by task.
-	int nargs = 0, nres;
-	if (t->polldesc == NULL) {
-		// not using l_yield_cont_iopoll, so return values now
-		nargs = t->resume_nres;
-	}
+	int nargs = t->resume_nres, nres;
 
 	trace("resume " T_ID_F " nargs=%d", t_id(t), nargs);
 	int status = lua_resume(L, t->s->L, nargs, &nres);
@@ -799,42 +977,6 @@ static void t_resume(T* t) {
 
 	// discard results
 	return lua_pop(L, nres);
-}
-
-
-// l_yield_cont_iopoll is a continuation used with all API functions which uses IOPollDesc.
-// This function is run after we resume a task with t_resume but before continuing execution
-// of the task.
-static int l_yield_cont_iopoll(lua_State* L, int status, lua_KContext ctx) {
-	T* t = L_t(L);
-	trace(T_ID_F " %s", t_id(t), l_status_str(status));
-	assert(t->is_live);
-	assert(t->polldesc != NULL || !"should not use l_yield_cont_iopoll without polldesc");
-
-	trace(T_ID_F " setup polldesc result", t_id(t));
-
-	if UNLIKELY(t->polldesc->result < 0) {
-		int err_no = (int)-t->polldesc->result;
-		if (!t->polldesc->active) {
-			s_iopolldesc_free(t->s, t->polldesc);
-			t->polldesc = NULL;
-		}
-		// TODO: Do we need to lua_pop(L, t->resume_nres) here?
-		return luaL_error(L, strerror(err_no));
-	}
-
-	// return result of polldesc unless t->resume_nres > -1
-	if (t->resume_nres < 0) {
-		lua_pushinteger(L, t->polldesc->result);
-		t->resume_nres = 1;
-	}
-
-	if (!t->polldesc->active) {
-		s_iopolldesc_free(t->s, t->polldesc);
-		t->polldesc = NULL;
-	}
-
-	return t->resume_nres;
 }
 
 
@@ -880,7 +1022,6 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	t->parent = parent;
 	t->next_sibling = NULL;
 	t->first_child = NULL;
-	t->polldesc = NULL;
 	t->resume_nres = 0;
 	t->is_live = 1;
 
@@ -906,18 +1047,44 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 }
 
 
-int s_iopoll_wake(S* s, IOPollDesc* pd) {
-	trace(T_ID_F " woken by iopoll" , t_id(pd->t));
+// s_iopoll_wake is called by iopoll_poll when waiting tasks should be woken up
+int s_iopoll_wake(S* s, IODesc** dv, u32 count) {
+	int err = 0;
+	for (u32 i = 0; i < count; i++) {
+		IODesc* d = dv[i];
 
-	// TODO: check if t is already on runq and don't add it if so.
-	// For now, use an assertion (note: this is likely to happen)
-	assert(s_runq_find(s, pd->t) == -1);
+		T* t = d->t;
 
-	if UNLIKELY(!s_runq_put(s, pd->t)) {
-		s_iopolldesc_free(s, pd);
-		return -ENOMEM;
+		// skip duplicates
+		if (t == NULL)
+			continue;
+
+		// "take" t from d, to make sure that we don't attempt to wake a task from an event
+		// that occurs when the task is running.
+		d->t = NULL;
+
+		trace(T_ID_F " woken by iopoll" , t_id(t));
+
+		// TODO: check if t is already on runq and don't add it if so.
+		// For now, use an assertion (note: this is likely to happen)
+		assert(t->is_live);
+		assert(s_runq_find(s, t) == -1);
+
+		if (!s_runq_put(s, t))
+			err = -ENOMEM;
 	}
-	return 0;
+	return err;
+}
+
+
+// l_iopoll_wait suspends a task that is waiting for file descriptor events.
+// Once 'd' is told that there are changes, t is woken up which causes the continuation 'cont'
+// to be invoked on the unchanged stack in t_resume before execution is handed back to the task.
+inline static int l_iopoll_wait(
+	lua_State* L, T* t, IODesc* d, int(*cont)(lua_State*,int,IODesc*))
+{
+	d->t = t;
+	return lua_yieldk(L, 0, (intptr_t)d, (int(*)(lua_State*,int,lua_KContext))cont);
 }
 
 
@@ -944,7 +1111,7 @@ static int s_schedule(S* s) {
 		int n = iopoll_poll(&s->iopoll, /*deadline*/-1);
 		if UNLIKELY(n < 0) {
 			logerr("internal I/O error: %s", strerror(-n));
-			luaL_error(s->L, strerror(-n));
+			l_errno_error(s->L, -n);
 			return 0;
 		}
 
@@ -955,29 +1122,37 @@ static int s_schedule(S* s) {
 			assert(!"XXX");
 		}
 	}
+
 	trace("shutdown " S_ID_F, s_id(s));
-	iopoll_close(&s->iopoll);
+	// run GC to ensure pending IODesc close before S goes away
+	lua_gc(s->L, LUA_GCCOLLECT);
+	iopoll_shutdown(&s->iopoll);
+	tls_s = NULL;
 	return 0;
 }
 
 
 static int l_main(lua_State* L) {
+	if UNLIKELY(tls_s != NULL)
+		return luaL_error(L, "S already active");
+
 	// create scheduler for this OS thread & Lua context
 	S* s = &(S){
 		.L = L,
 		.runq_cap = 8,
 	};
+	tls_s = s;
 
 	// allocate initial runq array
 	s->runq = malloc(sizeof(*s->runq) * s->runq_cap);
 	if (!s->runq)
-		return luaL_error(L, strerror(ENOMEM));
+		return l_errno_error(L, ENOMEM);
 
 	// open platform I/O facility
-	int err = iopoll_open(&s->iopoll, s);
+	int err = iopoll_init(&s->iopoll, s);
 	if (err) {
-		dlog("error: iopoll_open: %s", strerror(-err));
-		return luaL_error(L, strerror(-err));
+		dlog("error: iopoll_init: %s", strerror(-err));
+		return l_errno_error(L, -err);
 	}
 
 	// create threads table (for GC refs)
@@ -995,9 +1170,6 @@ static int l_main(lua_State* L) {
 	// enter scheduling loop
 	return s_schedule(s);
 }
-
-
-// Lua API functions exported as __rt.NAME
 
 
 #define REQUIRE_TASK(L) ({ \
@@ -1044,39 +1216,96 @@ static int l_sleep(lua_State* L) {
 
 	trace(T_ID_F " sleep (%llu ns)", t_id(t), delay);
 
-	// allocate iopoll descriptor
-	IOPollDesc* pd = s_iopolldesc_alloc(t->s);
-	if UNLIKELY(!pd)
-		return luaL_error(L, "out of memory");
-	pd->t = t;
-	t->polldesc = pd;
-
-	// add timer to iopoll
-	int err = iopoll_add_timer(&t->s->iopoll, pd, deadline);
-	if UNLIKELY(err) {
-		s_iopolldesc_free(t->s, pd);
-		return luaL_error(L, strerror(-err));
-	}
-
-	// once task is resumed (timer expired), we return no values
-	t->resume_nres = 0;
-
-	return lua_yieldk(L, 0, 0, l_yield_cont_iopoll);
+	return l_errno_error(L, ENOSYS);
 }
 
 
-static int l_net_connect(lua_State* L) {
+static int l_socket(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	lua_pop(L, lua_gettop(L)); // discard arguments (until we handle them)
+	int domain = luaL_checkinteger(L, 1); // PF_ constant
+	int type = luaL_checkinteger(L, 2);   // SOCK_ constants
+	int protocol = 0;
 
-	// create socket
 	#if defined(__linux__)
-		int fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-	#else
-		int fd = socket(AF_INET, SOCK_STREAM, 0);
-		int flags = fcntl(fd, F_GETFL, 0);
-		fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+		type |= SOCK_NONBLOCK | SOCK_CLOEXEC;
 	#endif
+
+	int fd = socket(domain, type, protocol);
+	if UNLIKELY(fd < 0)
+		return l_errno_error(L, errno);
+
+	// Ask the OS to check the connection once in a while (stream sockets only)
+	if (type == SOCK_STREAM) {
+		int optval = 1;
+		if UNLIKELY(setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &optval, sizeof(optval)) < 0)
+			dlog("warning: failed to set SO_KEEPALIVE on socket: %s", strerror(errno));
+	}
+
+	// Set file descriptor to non-blocking mode..
+	// Not needed on linux where we pass SOCK_NONBLOCK when creating the socket.
+	#if !defined(__linux__)
+		int flags = fcntl(fd, F_GETFL, 0);
+		if UNLIKELY(fcntl(fd, F_SETFL, flags | O_NONBLOCK)) {
+			int err = errno;
+			close(fd);
+			return luaL_error(L, "socket: failed to set O_NONBLOCK: %s", strerror(err));
+		}
+	#endif
+
+	IODesc* d = l_iodesc_create(L);
+	d->fd = fd;
+
+	int err = iopoll_open(&t->s->iopoll, d);
+	if UNLIKELY(err) {
+		close(fd);
+		d->fd = -1;
+		return l_errno_error(L, -err);
+	}
+
+	return 1;
+}
+
+
+static int l_connect_cont(lua_State* L, __attribute__((unused)) int ltstatus, IODesc* d) {
+	T* t = L_t(L);
+	trace(T_ID_F, t_id(t));
+
+	dlog("d events=%s nread=%lld nwrite=%lld",
+	     d->events == 'r'+'w' ? "rw" : d->events == 'r' ? "r" : d->events == 'w' ? "w" : "0",
+	     d->nread, d->nwrite);
+
+	// check for connection failure on darwin, which sets EOF, which we propagate as r+w
+	#if defined(__APPLE__)
+	if UNLIKELY(d->events == 'r'+'w' && d->nread >= 0 && d->nwrite >= 0) {
+		int error = 0;
+		socklen_t len = sizeof(error);
+		if (getsockopt(d->fd, SOL_SOCKET, SO_ERROR, &error, &len) == 0) {
+			if (error != 0)
+				return l_errno_error(L, error);
+		}
+	}
+	#endif
+
+	// check for error
+	if UNLIKELY(d->nread < 0 || d->nwrite < 0) {
+		int err;
+		if ((d->events & 'r') == 'r' && d->nread < 0) {
+			err = (int)-d->nread;
+		} else {
+			err = (int)-d->nwrite;
+		}
+		if (err > 0)
+			return l_errno_error(L, err);
+	}
+
+	return 0;
+}
+
+
+// connect(fd)
+static int l_connect(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	IODesc* d = l_iodesc_check(L, 1);
 
 	// construct network address
 	struct sockaddr_in addr;
@@ -1084,116 +1313,88 @@ static int l_net_connect(lua_State* L) {
 	addr.sin_port = htons(12345);
 	addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
 
-	// connect
-	if (connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-		// connect immediately succeeded, without blocking
-		lua_pushinteger(L, fd);
+	if (connect(d->fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+		// connect succeeded immediately, without blocking
+		return 0;
+	}
+
+	if (errno == EINPROGRESS) {
+		dlog("wait for connect");
+		return l_iopoll_wait(L, t, d, l_connect_cont);
+	}
+
+	// error
+	int err = errno;
+	close(d->fd);
+	d->fd = -1;
+	return l_errno_error(L, err);
+}
+
+
+static int l_read_cont(lua_State* L, __attribute__((unused)) int ltstatus, IODesc* d) {
+	// check for error
+	if UNLIKELY(d->nread < 0)
+		return l_errno_error(L, (int)-d->nread);
+
+	// check for EOF
+	if UNLIKELY(d->nread == 0) {
+		lua_pushinteger(L, 0);
 		return 1;
 	}
 
-	// check if connect failed (likely because of invalid address)
-	if UNLIKELY(errno != EINPROGRESS) {
-		int err = errno;
-		close(fd);
-		return luaL_error(L, strerror(err));
-	}
+	Buf* buf = l_buf_check(L, 2);
 
-	// allocate iopoll descriptor
-	IOPollDesc* pd = s_iopolldesc_alloc(t->s);
-	if UNLIKELY(!pd)
-		return luaL_error(L, "out of memory");
-	t->polldesc = pd;
-	pd->t = t;
-	pd->use = IOPollDesc_USE_CONNECT;
+	#if 1 // version of the code that resizes buffer if needed
+		// TODO: check to see if there's a 3rd argument with explicit read limit
+		usize readlim = d->nread;
+		if (!buf_reserve(buf, readlim))
+			return l_errno_error(L, ENOMEM);
+	#else // version of the code that only reads what can fit in buf
+		// If there's no available space in buf (i.e. buf->cap - buf->len == 0) then read() will
+		// return 0 which the caller should interpret as EOF. However, a caller that does not stop
+		// calling read when it returns 0 may end up in an infinite loop.
+		// For that reason we treat "read nothing" as an error.
+		if UNLIKELY(buf->cap - buf->len == 0)
+			return luaL_error(L, "no space in buffer to read into");
+		// usize readlim = MIN((usize)d->nread, buf->cap - buf->len);
+	#endif
 
-	// add to iopoll
-	int err = iopoll_add_fd(&t->s->iopoll, pd, fd, IOPollDesc_EV_READ);
-	if UNLIKELY(err) {
-		s_iopolldesc_free(t->s, pd);
-		return luaL_error(L, strerror(-err));
-	}
-
-	// once task is resumed, we return the file descriptor
-	lua_pushinteger(L, fd);
-	t->resume_nres = 1;
-
-	return lua_yieldk(L, 0, 0, l_yield_cont_iopoll);
-}
-
-
-typedef struct DBuf {
-	usize cap, len; // in bytes
-	u8 bytes[];
-} DBuf;
-
-
-#define L_CHECK_DARRAY(L, idx) ({ \
-	if UNLIKELY(!lua_islightuserdata(L, idx)) \
-		return luaL_error(L, "buf argument is not a byte array"); \
-	lua_touserdata(L, idx); \
-	/* TODO: verify a is in fact a DBuf? */ \
-})
-
-
-static int l_buf_alloc(lua_State* L) {
-	u64 size = luaL_checkinteger(L, 1);
-
-	if UNLIKELY(check_add_overflow(size, (u64)sizeof(DBuf), &size) ||
-	            (USIZE_MAX < U64_MAX && size > USIZE_MAX) )
-	{
-		return luaL_error(L, "array too large");
-	}
-
-	DBuf* a = malloc(size);
-	if UNLIKELY(!a)
-		return luaL_error(L, "out of memory");
-	a->cap = size - sizeof(DBuf);
-	a->len = 0;
-
-	lua_pushlightuserdata(L, a);
-	return 1;
-}
-
-
-static int l_buf_str(lua_State* L) {
-	DBuf* a = L_CHECK_DARRAY(L, 1);
-	// TODO: optional second argument for how to encode the data, e.g. hex, base64
-	lua_pushlstring(L, (char*)a->bytes, a->len);
-	return 1;
-}
-
-
-static int l_read(lua_State* L) {
-	T* t = REQUIRE_TASK(L);
-
-	int fd = luaL_checkinteger(L, 1);
-	DBuf* a = L_CHECK_DARRAY(L, 2);
-
-	ssize_t len = read(fd, &a->bytes[a->len], a->cap - a->len);
-	if (len >= 0) {
-		// there was data immediately available to read
-		assert((usize)len <= a->cap - a->len);
-		a->len += (usize)len;
-		lua_pushinteger(L, len);
-		return 1;
-	}
+	// read
+	//dlog("read bytes[%zu] (<= %zu B)", buf->len, readlim);
+	ssize_t len = read(d->fd, &buf->bytes[buf->len], readlim);
 
 	// check for error
-	if UNLIKELY(errno != EAGAIN)
-		return luaL_error(L, strerror(errno));
-
-	// need to poll this fd
-	if (t->polldesc == NULL) {
-		assert(!"TODO setup polldesc");
+	if UNLIKELY(len < 0) {
+		if (errno == EAGAIN)
+			return l_iopoll_wait(L, L_t(L), d, l_read_cont);
+		return l_errno_error(L, errno);
 	}
 
-	// tell l_yield_cont_iopoll that it should return polldesc->result
-	t->resume_nres = -1;
+	// update d & buf
+	if (len == 0) { // EOF
+		d->nread = 0;
+	} else {
+		d->nread -= MIN(d->nread, (i64)len);
+		buf->len += (usize)len;
+	}
 
-	// TODO: need to update a->len after read completes.
-	// Find a way to run custom code in l_yield_cont_iopoll.
+	// TODO: if there's a 3rd argument 'nread' that is >0, l_iopoll_wait again if
+	// d->nread < nread so that "read" only returns after reading 'nread' bytes.
 
-	return lua_yieldk(L, 0, 0, l_yield_cont_iopoll);
+	lua_pushinteger(L, len);
+	return 1;
+}
+
+
+// fun read(fd FD, buf Buf, nbytes uint = 0)
+static int l_read(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	IODesc* d = l_iodesc_check(L, 1);
+	// TODO: if there's a 3rd argument 'nread' that is >0, wait unless d->nread >= nread.
+	// if there's nothing available to read, we will have to wait for it
+	if (d->nread == 0)
+		return l_iopoll_wait(L, t, d, l_read_cont);
+	return l_read_cont(L, 0, d);
 }
 
 
@@ -1229,9 +1430,11 @@ static const luaL_Reg dew_lib[] = {
 	{"spawn", l_spawn},
 	{"yield", l_yield},
 	{"sleep", l_sleep},
-	{"net_connect", l_net_connect},
+	{"socket", l_socket},
+	{"connect", l_connect},
 	{"read", l_read},
 	{"buf_alloc", l_buf_alloc},
+	{"buf_resize", l_buf_resize},
 	{"buf_str", l_buf_str},
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
@@ -1253,6 +1456,36 @@ int luaopen_runtime(lua_State* L) {
 
 	luaL_newlib(L, dew_lib);
 
+	// IODesc
+	luaL_newmetatable(L, "FD");
+	lua_pushcfunction(L, l_iodesc_gc);
+	lua_setfield(L, -2, "__gc");
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_iodesc_luatabkey);
+
+	// Buf
+	luaL_newmetatable(L, "Buf");
+	lua_pushcfunction(L, l_buf_gc);
+	lua_setfield(L, -2, "__gc");
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
+
+	// export libc & syscall constants
+	#define _(NAME) \
+		lua_pushinteger(L, NAME); \
+		lua_setfield(L, -2, #NAME);
+	// protocol families
+	_(PF_LOCAL)  // Host-internal protocols, formerly called PF_UNIX
+	_(PF_INET)   // Internet version 4 protocols
+	_(PF_INET6)  // Internet version 6 protocols
+	_(PF_ROUTE)  // Internal Routing protocol
+	_(PF_VSOCK)  // VM Sockets protocols
+	// socket types
+	_(SOCK_STREAM)
+	_(SOCK_DGRAM)
+	_(SOCK_RAW)
+	// address families
+	#undef _
+
+	// export ERR_ constants
 	#define _(NAME, ERRNO, ...) \
 		lua_pushinteger(L, NAME); \
 		lua_setfield(L, -2, #NAME);
