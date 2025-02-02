@@ -499,6 +499,7 @@ static int l_runloop_run(lua_State* L) {
 static u8 g_thread_table_key; // table where all live tasks are stored to avoid GC
 static u8 g_iodesc_luatabkey; // IODesc object prototype
 static u8 g_buf_luatabkey;    // Buf object prototype
+static u8 g_timer_luatabkey;  // Timer object prototype
 
 // tls_s holds S for the current thread
 static _Thread_local S* tls_s = NULL;
@@ -535,13 +536,35 @@ error:
 }
 
 
+static int l_error_not_a_task(lua_State* L, T* t) {
+	// note: this can happen in two scenarios:
+	// 1. calling a task-specific API function from a non-task, or
+	// 2. calling a task-specific API function from a to-be-closed variable (__close)
+	//    during task shutdown.
+	const char* msg = t->s ? "task is shutting down" : "not called from a task";
+	trace("%s: invalid call by user: %s", __FUNCTION__, msg);
+	return luaL_error(L, msg);
+}
+
+
+#define REQUIRE_TASK(L) ({ \
+	T* __t = L_t(L); \
+	if UNLIKELY(!__t->is_live) \
+		return l_error_not_a_task(L, __t); \
+	__t; \
+})
+
+
 static IODesc* nullable l_iodesc_check(lua_State* L, int idx) {
 	return l_uobj_check(L, idx, &g_iodesc_luatabkey, "FD");
 }
 
-
 static Buf* nullable l_buf_check(lua_State* L, int idx) {
 	return l_uobj_check(L, idx, &g_buf_luatabkey, "Buf");
+}
+
+static Timer* nullable l_timer_check(lua_State* L, int idx) {
+	return l_uobj_check(L, idx, &g_timer_luatabkey, "Timer");
 }
 
 
@@ -614,36 +637,6 @@ static int buf_free(Buf* buf) {
 }
 
 
-static int l_buf_gc(lua_State* L) {
-	Buf* buf = lua_touserdata(L, 1);
-	return buf_free(buf);
-}
-
-
-static int l_buf_alloc(lua_State* L) {
-	u64 cap = luaL_checkinteger(L, 1);
-	if UNLIKELY(cap > (u64)USIZE_MAX - sizeof(Buf))
-		luaL_error(L, "capacity too large");
-	if (cap == 0) {
-		cap = 64 - sizeof(Buf);
-	} else {
-		cap = ALIGN2(cap, sizeof(void*));
-	}
-	// dlog("allocating buffer with cap %llu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
-
-	// see comment in l_iodesc_create
-	int nuvalue = 0;
-	Buf* b = lua_newuserdatauv(L, sizeof(Buf) + (usize)cap, nuvalue);
-	b->cap = (usize)cap;
-	b->len = 0;
-	b->bytes = (void*)b + sizeof(Buf);
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
-	lua_setmetatable(L, -2);
-
-	return 1;
-}
-
-
 static bool buf_resize(Buf* buf, usize newcap) {
 	if (newcap > 0 && newcap < USIZE_MAX - sizeof(void*))
 		newcap = ALIGN2(newcap, sizeof(void*));
@@ -693,12 +686,44 @@ static bool buf_resize(Buf* buf, usize newcap) {
 
 
 // buf_reserve makes sure that there is at least minavail bytes available at bytes+len
-static bool buf_reserve(Buf* buf, usize minavail) {
+static void* nullable buf_reserve(Buf* buf, usize minavail) {
 	usize avail = buf->cap - buf->len;
-	if LIKELY(avail >= minavail)
-		return true;
-	usize newcap = buf->cap + (minavail - avail);
-	return buf_resize(buf, newcap);
+	if UNLIKELY(avail < minavail) {
+		usize newcap = buf->cap + (minavail - avail);
+		if (!buf_resize(buf, newcap))
+			return NULL;
+	}
+	return buf->bytes + buf->len;
+}
+
+
+static int l_buf_gc(lua_State* L) {
+	Buf* buf = lua_touserdata(L, 1);
+	return buf_free(buf);
+}
+
+
+static int l_buf_alloc(lua_State* L) {
+	u64 cap = luaL_checkinteger(L, 1);
+	if UNLIKELY(cap > (u64)USIZE_MAX - sizeof(Buf))
+		luaL_error(L, "capacity too large");
+	if (cap == 0) {
+		cap = 64 - sizeof(Buf);
+	} else {
+		cap = ALIGN2(cap, sizeof(void*));
+	}
+	// dlog("allocating buffer with cap %llu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
+
+	// see comment in l_iodesc_create
+	int nuvalue = 0;
+	Buf* b = lua_newuserdatauv(L, sizeof(Buf) + (usize)cap, nuvalue);
+	b->cap = (usize)cap;
+	b->len = 0;
+	b->bytes = (void*)b + sizeof(Buf);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
+	lua_setmetatable(L, -2);
+
+	return 1;
 }
 
 
@@ -724,6 +749,230 @@ static int l_buf_str(lua_State* L) {
 	// TODO: optional second argument for how to encode the data, e.g. hex, base64
 	lua_pushlstring(L, (char*)buf->bytes, buf->len);
 	return 1;
+}
+
+
+static void timers_remove(TimerPQ* timers, Timer* timer);
+
+
+static int l_timer_gc(lua_State* L) {
+	Timer* timer = lua_touserdata(L, 1);
+	if (timer->when != (DTime)-1) {
+		S* s = tls_s;
+		if (s) {
+			timers_remove(&s->timers, timer);
+		} else {
+			dlog("warning: Timer %p GC'd outside of S lifetime", timer);
+		}
+	}
+	return 0;
+}
+
+
+static Timer* nullable timer_create(lua_State* L, DTime when, DTimeDuration period) {
+	// see comment in l_iodesc_create
+	int nuvalue = 0;
+	Timer* timer = lua_newuserdatauv(L, sizeof(Timer), nuvalue);
+	if (!timer)
+		return NULL;
+	memset(timer, 0, sizeof(*timer));
+	timer->when = when;
+	timer->period = period;
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_timer_luatabkey);
+	lua_setmetatable(L, -2);
+	return timer;
+}
+
+
+static u32 timers_sift_up(TimerPQ* timers, u32 i) {
+	TimerInfo last = timers->v[i];
+	while (i > 0) {
+		u32 parent = (i - 1) / 2;
+		if (last.when >= timers->v[parent].when)
+			break;
+		timers->v[i] = timers->v[parent];
+		i = parent;
+	}
+	timers->v[i] = last;
+	return i;
+}
+
+
+static void timers_sift_down(TimerPQ* timers, u32 i) {
+	u32 len = timers->len;
+	TimerInfo last = timers->v[len];
+	for (;;) {
+		u32 left = i*2 + 1;
+		if (left >= len) // no left child; this is a leaf
+			break;
+
+		u32 child = left;
+		u32 right = left + 1;
+
+		// if right hand-side timer has smaller 'when', use that instead of left child
+		if (right < len && timers->v[right].when < timers->v[left].when)
+			child = right;
+
+		if (timers->v[child].when >= last.when)
+			break;
+		// move the child up
+		timers->v[i] = timers->v[child];
+		i = child;
+	}
+	timers->v[i] = last;
+}
+
+
+// timers_remove_min removes the timer with the soonest 'when' time
+static Timer* timers_remove_min(TimerPQ* timers) {
+	assert(timers->len > 0);
+	Timer* timer = timers->v[0].timer;
+	u32 len = --timers->len;
+	if (len == 0) {
+		// Note: min 'when' changed to nothing (no more timers)
+	} else {
+		timers_sift_down(timers, 0);
+		// Note: min 'when' changed to timers->v[0].when
+	}
+	return timer;
+}
+
+
+// timers_dlog prints the state of a 'timers' priority queue via dlog
+#if !defined(DEBUG)
+	#define timers_dlog(timers) ((void)0)
+#else
+static void timers_dlog(const TimerPQ* timers_readonly) {
+	u32 n = timers_readonly->len;
+	dlog("s.timers: %u", n);
+	if (n == 0)
+		return;
+
+	// copy timers
+	usize nbyte = sizeof(*timers_readonly->v) * n;
+	void* v_copy = malloc(nbyte);
+	if (!v_copy) {
+		dlog("  (malloc failed)");
+		return;
+	}
+	memcpy(v_copy, timers_readonly->v, nbyte);
+	TimerPQ timers = { .cap = n, .len = n, .v = v_copy };
+
+	for (u32 i = 0; timers.len > 0; i++) {
+		Timer* timer = timers_remove_min(&timers);
+		dlog("  [%u] %10llu %p", i, timer->when, timer);
+	}
+
+	free(v_copy);
+}
+#endif
+
+
+static void timers_remove(TimerPQ* timers, Timer* timer) {
+	if (timers->len == 0 || timer->when == (DTime)-1)
+		return;
+	// linear search to find index of timer
+	u32 i;
+	if (timer->when > timers->v[timers->len / 2].when) {
+		for (i = timers->len; i--;) {
+			if (timers->v[i].timer == timer)
+				goto found;
+		}
+	} else {
+		for (i = 0; i < timers->len; i++) {
+			if (timers->v[i].timer == timer)
+				goto found;
+		}
+	}
+	dlog("warning: timer %p not found!", timer);
+	return;
+found:
+	dlog("remove timers[%u] %p (timers.len=%u)", i, timer, timers->len);
+	// timers_dlog(timers); // state before
+	timers->len--;
+	// if i is the last entry (i.e. latest 'when'), we don't need to do anything else
+	if (i == timers->len)
+		return;
+	if (i > 0 && timers->v[timers->len].when < timers->v[/*parent*/(i-1)/2].when) {
+		timers_sift_up(timers, i);
+	} else {
+		timers_sift_down(timers, i);
+	}
+	// timers_dlog(timers); // state after
+}
+
+
+static bool timers_add(TimerPQ* timers, Timer* timer) {
+	// append the timer to the priority queue (heap)
+	TimerInfo* ti = array_reserve((struct Array*)timers, sizeof(*timers->v), 1);
+	if (!ti) // could not grow array; out of memory
+		return false;
+	timers->len++;
+	if (timer->when == (DTime)-1) timer->when--; // uphold special meaning of -1
+	DTime when = timer->when;
+	ti->timer = timer;
+	ti->when = when;
+
+	// "sift up" heap sort
+	u32 i = timers->len - 1;
+	i = timers_sift_up(timers, i);
+	if (i == 0) {
+		// Note: min 'when' changed to 'when'
+	}
+	// timers_dlog(timers);
+	return true;
+}
+
+
+static T* nullable s_timers_check(S* s) {
+	if (s->timers.len == 0)
+		return NULL;
+	// const DTimeDuration leeway = 10 * D_TIME_MICROSECOND;
+	// DTime now = DTimeNow() - leeway;
+	DTime now = DTimeNow();
+	while (s->timers.len > 0 && s->timers.v[0].when <= now) {
+		Timer* timer = timers_remove_min(&s->timers);
+		T* t = timer->f(timer->arg, timer->seq);
+		now = DTimeNow();
+		if (timer->period > 0) {
+			// repeating timer
+			timer->when = now + timer->period;
+			bool ok = timers_add(&s->timers, timer);
+			assert(ok); // never need to grow memory
+		} else {
+			timer->when = -1; // signal to l_timer_gc that timer is dead
+		}
+		// note: timers are GC'd, so no need to free a timer here in an 'else' branch
+		if (t)
+			return t;
+	}
+	return NULL;
+}
+
+
+static T* nullable l_timer_ring(uintptr arg, uintptr seq) {
+	return (T*)arg;
+}
+
+
+// fun timer_start(when Time, period TimeDuration) Timer
+static int l_timer_start(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	DTime when = luaL_checkinteger(L, 1);
+	DTimeDuration period = luaL_checkinteger(L, 2);
+	Timer* timer = timer_create(L, when, period);
+	if (!timer)
+		return 0;
+
+	timer->f = l_timer_ring;
+	timer->arg = (uintptr)t;
+	timer->seq = 0; // unused
+
+	if UNLIKELY(!timers_add(&t->s->timers, timer))
+		return l_errno_error(L, ENOMEM);
+
+	return lua_yieldk(L, 0, 0, NULL);
+	// return 0; // XXX
 }
 
 
@@ -1088,6 +1337,22 @@ inline static int l_iopoll_wait(
 }
 
 
+static int s_shutdown(S* s) {
+	trace("shutdown " S_ID_F, s_id(s));
+
+	// clear timers before GC to avoid costly (and useless) timers_remove
+	s->timers.len = 0;
+
+	// run GC to ensure pending IODesc close before S goes away
+	lua_gc(s->L, LUA_GCCOLLECT);
+
+	iopoll_shutdown(&s->iopoll);
+	array_free((struct Array*)&s->timers);
+	tls_s = NULL;
+	return 0;
+}
+
+
 static int s_schedule(S* s) {
 	// Scheduler loop: find a runnable task and execute it.
 	// Stops when all tasks have finished or an error occurred.
@@ -1098,17 +1363,22 @@ static int s_schedule(S* s) {
 
 	static int debug_nwait = 0;
 	while (s->nlive > 0) {
-		// find a task to run
-		T* t = s_runq_get(s);
+		// Look for a ready task in timers and runq.
+		// s_timers_check may run non-task timers, like IODesc deadlines.
+		T* t = s_timers_check(s);
+		if (!t)
+			t = s_runq_get(s);
 		if (t) {
 			trace(T_ID_F " taken from runq", t_id(t));
 			debug_nwait = 0; // XXX
 			t_resume(t);
 			continue;
 		}
-		// wait for an event to wake a T up
-		trace("iopoll_poll");
-		int n = iopoll_poll(&s->iopoll, /*deadline*/-1);
+
+		// wait for events
+		DTime deadline = s->timers.len > 0 ? s->timers.v[0].when : (DTime)-1;
+		trace("iopoll_poll until deadline %llu", deadline);
+		int n = iopoll_poll(&s->iopoll, deadline);
 		if UNLIKELY(n < 0) {
 			logerr("internal I/O error: %s", strerror(-n));
 			l_errno_error(s->L, -n);
@@ -1122,13 +1392,7 @@ static int s_schedule(S* s) {
 			assert(!"XXX");
 		}
 	}
-
-	trace("shutdown " S_ID_F, s_id(s));
-	// run GC to ensure pending IODesc close before S goes away
-	lua_gc(s->L, LUA_GCCOLLECT);
-	iopoll_shutdown(&s->iopoll);
-	tls_s = NULL;
-	return 0;
+	return s_shutdown(s);
 }
 
 
@@ -1141,6 +1405,8 @@ static int l_main(lua_State* L) {
 		.L = L,
 		.runq_cap = 8,
 	};
+	s->timers.v = s->timers_storage;
+	s->timers.cap = countof(s->timers_storage);
 	tls_s = s;
 
 	// allocate initial runq array
@@ -1170,21 +1436,6 @@ static int l_main(lua_State* L) {
 	// enter scheduling loop
 	return s_schedule(s);
 }
-
-
-#define REQUIRE_TASK(L) ({ \
-	T* __t = L_t(L); \
-	if UNLIKELY(!__t->is_live) { \
-		/* note: this can happen in two scenarios: \
-		 * 1. calling a task-specific API function from a non-task, or \
-		 * 2. calling a task-specific API function from a to-be-closed variable (__close) \
-		 *    during task shutdown. */ \
-		const char* msg = __t->s ? "task is shutting down" : "not called from a task"; \
-		trace("%s: invalid call by user: %s", __FUNCTION__, msg); \
-		return luaL_error(L, msg); \
-	} \
-	__t; \
-})
 
 
 static int l_yield(lua_State* L) {
@@ -1347,7 +1598,7 @@ static int l_read_cont(lua_State* L, __attribute__((unused)) int ltstatus, IODes
 	#if 1 // version of the code that resizes buffer if needed
 		// TODO: check to see if there's a 3rd argument with explicit read limit
 		usize readlim = d->nread;
-		if (!buf_reserve(buf, readlim))
+		if (buf_reserve(buf, readlim) == NULL)
 			return l_errno_error(L, ENOMEM);
 	#else // version of the code that only reads what can fit in buf
 		// If there's no available space in buf (i.e. buf->cap - buf->len == 0) then read() will
@@ -1436,6 +1687,7 @@ static const luaL_Reg dew_lib[] = {
 	{"buf_alloc", l_buf_alloc},
 	{"buf_resize", l_buf_resize},
 	{"buf_str", l_buf_str},
+	{"timer_start", l_timer_start},
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
 
@@ -1467,6 +1719,12 @@ int luaopen_runtime(lua_State* L) {
 	lua_pushcfunction(L, l_buf_gc);
 	lua_setfield(L, -2, "__gc");
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
+
+	// Timer
+	luaL_newmetatable(L, "Timer");
+	lua_pushcfunction(L, l_timer_gc);
+	lua_setfield(L, -2, "__gc");
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_timer_luatabkey);
 
 	// export libc & syscall constants
 	#define _(NAME) \

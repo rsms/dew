@@ -77,9 +77,9 @@ typedef double    float64;
 #define NORET void __attribute__((noreturn))
 
 #if __has_attribute(warn_unused_result)
-  #define WARN_UNUSED_RESULT __attribute__((warn_unused_result))
+	#define WARN_UNUSED_RESULT __attribute__((warn_unused_result))
 #else
-  #define WARN_UNUSED_RESULT
+	#define WARN_UNUSED_RESULT
 #endif
 
 // __attribute__((noreturn)) void unreachable()
@@ -106,17 +106,20 @@ typedef double    float64;
 #endif
 
 #define MAX(a,b) ( \
-  __builtin_constant_p(a) && __builtin_constant_p(b) ? ((a) > (b) ? (a) : (b)) : \
-  ({__typeof__ (a) _a = (a); \
-    __typeof__ (b) _b = (b); \
-    _a > _b ? _a : _b; }) \
+	__builtin_constant_p(a) && __builtin_constant_p(b) ? ((a) > (b) ? (a) : (b)) : \
+	({__typeof__ (a) _a = (a); \
+	  __typeof__ (b) _b = (b); \
+	  _a > _b ? _a : _b; }) \
 )
 #define MIN(a,b) ( \
-  __builtin_constant_p(a) && __builtin_constant_p(b) ? ((a) < (b) ? (a) : (b)) : \
-  ({__typeof__ (a) _a = (a); \
-    __typeof__ (b) _b = (b); \
-    _a < _b ? _a : _b; }) \
+	__builtin_constant_p(a) && __builtin_constant_p(b) ? ((a) < (b) ? (a) : (b)) : \
+	({__typeof__ (a) _a = (a); \
+	  __typeof__ (b) _b = (b); \
+	  _a < _b ? _a : _b; }) \
 )
+
+#define MAX_X(a,b)  ( (a) > (b) ? (a) : (b) )
+#define MIN_X(a,b)  ( (a) < (b) ? (a) : (b) )
 
 // bool IS_POW2(T x) returns true if x is a power-of-two value
 #define IS_POW2(x)    ({ __typeof__(x) xtmp__ = (x); IS_POW2_X(xtmp__); })
@@ -124,11 +127,11 @@ typedef double    float64;
 
 // T ALIGN2<T>(T x, anyuint a) rounds up x to nearest a (a must be a power of two)
 #define ALIGN2(x,a) ({ \
-  __typeof__(x) atmp__ = (__typeof__(x))(a) - 1; \
-  ( (x) + atmp__ ) & ~atmp__; \
+	__typeof__(x) atmp__ = (__typeof__(x))(a) - 1; \
+	( (x) + atmp__ ) & ~atmp__; \
 })
 #define ALIGN2_X(x,a) ( \
-  ( (x) + ((__typeof__(x))(a) - 1) ) & ~((__typeof__(x))(a) - 1) \
+	( (x) + ((__typeof__(x))(a) - 1) ) & ~((__typeof__(x))(a) - 1) \
 )
 
 // T IDIV_CEIL(T x, ANY divisor) divides x by divisor, rounding up.
@@ -139,6 +142,51 @@ typedef double    float64;
 })
 #define IDIV_CEIL_X(x, divisor) \
 	( ( (x) + (__typeof__(x))(divisor) - 1 ) / (__typeof__(x))(divisor) )
+
+// int dew_clz(ANYUINT x) counts leading zeroes in x,
+// starting at the most significant bit position.
+// If x is 0, the result is undefined.
+#define dew_clz(x) ( \
+	_Generic((x), \
+		i8:   __builtin_clz,   u8:    __builtin_clz, \
+		i16:  __builtin_clz,   u16:   __builtin_clz, \
+		i32:  __builtin_clz,   u32:   __builtin_clz, \
+		long: __builtin_clzl,  unsigned long: __builtin_clzl, \
+		long long:  __builtin_clzll, unsigned long long:   __builtin_clzll \
+	)(x) - ( 32 - MIN_X(4, (int)sizeof(__typeof__(x)))*8 ) \
+)
+
+// int dew_fls(ANYINT n) finds the Find Last Set bit
+// (last = most-significant)
+// e.g. dew_fls(0b1111111111111111) = 15
+// e.g. dew_fls(0b1000000000000000) = 15
+// e.g. dew_fls(0b1000000000000000) = 15
+// e.g. dew_fls(0b1000) = 3
+#define dew_fls(x) \
+	( (x) ? (int)(sizeof(__typeof__(x)) * 8) - dew_clz(x) : 0 )
+
+// int dew_ilog2(ANYINT n) calculates the log of base 2, rounding down.
+// e.g. dew_ilog2(15) = 3, dew_ilog2(16) = 4.
+// Result is undefined if n is 0.
+#define dew_ilog2(n) (dew_fls(n) - 1)
+
+// ANYINT CEIL_POW2(ANYINT x) rounds up x to nearest power of two.
+// Returns 1 when x is 0.
+// Returns 0 when x is larger than the max pow2 for x's type
+// (e.g. >0x80000000 for u32)
+#define CEIL_POW2(x) ({ \
+	__typeof__(x) xtmp__ = (x); \
+	CEIL_POW2_X(xtmp__); \
+})
+// CEIL_POW2_X is a constant-expression implementation of CEIL_POW2
+#define CEIL_POW2_X(x) ( \
+	((x) <= (__typeof__(x))1) ? (__typeof__(x))1 : \
+	( ( ((__typeof__(x))1 << \
+					dew_ilog2( ((x) - ((x) == (__typeof__(x))1) ) - (__typeof__(x))1) \
+			) - (__typeof__(x))1 ) << 1 ) \
+	+ (__typeof__(x))2 \
+)
+
 
 // logging (0=error, 1=warning, 2=info, 3=debug)
 #define logerr(fmt, args...)  \
@@ -233,6 +281,18 @@ float64 DTimeDurationSeconds(DTimeDuration d);
 i64 DTimeDurationMilliseconds(DTimeDuration d);
 i64 DTimeDurationMicroseconds(DTimeDuration d);
 i64 DTimeDurationNanoseconds(DTimeDuration d);
+
+
+
+struct Array { u32 cap, len; void* nullable v; };
+#define Array(T) struct { u32 cap, len; T* nullable v; }
+void* nullable _array_reserve(struct Array* a, u32 elemsize, u32 minavail);
+inline static void* nullable array_reserve(struct Array* a, u32 elemsize, u32 minavail) {
+	return LIKELY(minavail <= a->cap - a->len) ? a->v + (usize)a->len*(usize)elemsize :
+	       _array_reserve(a, elemsize, minavail);
+}
+bool array_append(struct Array* a, u32 elemsize, const void* elemv, u32 elemc);
+void array_free(struct Array* a); // respects embedded a->v
 
 
 

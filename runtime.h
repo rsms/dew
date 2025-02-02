@@ -15,6 +15,8 @@ typedef struct Buf {
 typedef struct IOPoll     IOPoll;     // facility
 typedef struct IOPollDesc IOPollDesc; // descriptor (state used for I/O requests)
 typedef struct IODesc     IODesc; // wraps a file descriptor, used by iopoll
+typedef struct Timer      Timer;
+typedef struct TimerInfo  TimerInfo; // cache friendly 'timers' array entry
 
 struct IOPoll {
 	S* s;
@@ -32,6 +34,20 @@ struct IODesc {
 	i64         nread;  // bytes available to read, or -errno on error
 	i64         nwrite; // bytes available to write, or -errno on error
 };
+
+struct Timer {
+	DTime         when;     // a specific point in time. -1 if dead (not in s.timers)
+	DTimeDuration period;   // if >0, repeat every when+period
+	uintptr       arg, seq; // passed along to f
+	T* nullable (*f)(uintptr arg, uintptr seq);
+};
+
+struct TimerInfo {
+	Timer* timer;
+	DTime  when;
+};
+
+typedef Array(TimerInfo) TimerPQ;
 
 typedef enum TStatus : u8 {
 	TStatus_RUN,   // running
@@ -68,6 +84,10 @@ struct S {
 
 	// runnext is a TID (>0) if a task is to be run immediately, skipping runq
 	T* nullable runnext;
+
+	// timers
+	TimerPQ   timers; // priority queue (heap) of TimerInfo entries
+	TimerInfo timers_storage[8];
 };
 
 

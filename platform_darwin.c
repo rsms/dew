@@ -61,14 +61,17 @@ int iopoll_poll(IOPoll* iopoll, DTime deadline) {
 	u32 wakec = 0;
 
 	for (;;) {
-		// configure syscall ts, which is relative to "now"
+		// configure ts, which is relative to "now"
 		if (deadline == (DTime)-1) {
+			// no deadline
 			tp = NULL;
 		} else if (deadline == 0) {
+			// immediate deadline
 			tp = &ts;
 			ts.tv_sec = 0;
 			ts.tv_nsec = 0;
 		} else {
+			// specific deadline
 			DTimeDuration duration = DTimeUntil(deadline);
 			if (duration < 0)
 				duration = 0;
