@@ -1,10 +1,16 @@
+-- Dew tries to detect deadlock situations; when a task would be suspended but never resumed.
+-- For example, a task calling recv() without anyone send()ing to it.
+-- It's impossible to detect all cases of deadlock; detection is best effort.
 return function()
-	-- TODO: detect deadlock, e.g. main task recv() with no timers or io work pending
-
 	__rt.timer_start(1*1000*1000, 0, 0)
-	-- this recv should not deadlock since there's a timer
+	-- the following call to recv will not deadlock since there's a timer
 	__rt.recv()
 
-	-- this recv should deadlock
-	__rt.recv()
+	-- this recv would deadlock and should cause an error
+	local ok, err = pcall(function()
+		__rt.recv()
+	end)
+	print("expecting error:", err)
+	assert(not ok)
+	assert(string.find(err, "deadlock", 1, true) ~= nil)
 end

@@ -741,7 +741,9 @@ end
 -- __rt.main(require("tests/rt/timer"))
 -- __rt.main(require("tests/rt/repeating-timer"))
 -- __rt.main(require("tests/rt/stop-children-on-parent-exit"))
-__rt.main(require("tests/rt/deadlock"))
+-- __rt.main(require("tests/rt/deadlock"))
+__rt.main(require("tests/rt/socket-read"))
+
 -- __rt.main(function()
 -- 	local buf = __rt.buf_alloc(64) ; print("buf_alloc =>", buf)
 -- 	local fd = __rt.socket(__rt.PF_INET, __rt.SOCK_STREAM)
