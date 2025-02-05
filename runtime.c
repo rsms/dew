@@ -851,21 +851,15 @@ static InboxMsg* nullable inbox_add(Inbox** inboxp) {
 	const u32 message_limit = 64;
 	const u32 initcap = 8;
 
-	Inbox* inbox;
-
 	// if the inbox is aready setup, push a message into it
-	if (*inboxp)
-		return fifo_push((FIFO**)inboxp, sizeof(*inbox->entries), message_limit);
+	// setup inbox if needed
+	if UNLIKELY(*inboxp == NULL) {
+		*inboxp = (Inbox*)fifo_alloc(initcap, sizeof(*(*inboxp)->entries));
+		if UNLIKELY(!*inboxp)
+			return NULL;
+	}
 
-	// setup inbox
-	inbox = (Inbox*)fifo_alloc(initcap, sizeof(*inbox->entries));
-	if UNLIKELY(!inbox)
-		return NULL;
-	*inboxp = inbox;
-
-	// inline minimal version of fifo_push
-	inbox->fifo.tail = 1;
-	return &inbox->entries[0];
+	return fifo_push((FIFO**)inboxp, sizeof(*(*inboxp)->entries), message_limit);
 }
 
 
