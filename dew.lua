@@ -528,41 +528,41 @@ end
 ------------------------------------------------------------------------------------------------
 
 function main2()
-	-- print("main2 coroutine.running() =>", coroutine.running())
-	-- print("main2 coroutine.status()  =>", coroutine.status(select(1, coroutine.running())))
-	-- __rt.yield(123, 456)
+	-- TODO: detect deadlock, e.g. main task recv() with no timers or io work pending
+	__rt.recv()
 
-	-- -- local now = __rt.time() + 200000
-	-- __rt.timer_start(10, 0)
-	-- __rt.timer_start(30, 0)
-	-- __rt.timer_start(20, 0)
-	-- __rt.timer_start(15, 0)
-	-- -- __rt.timer_start(40, 0)
-	-- -- __rt.timer_start(100, 0)
-	-- -- __rt.timer_start(6, 0)
-	-- __rt.timer_start(5, 0)
-	-- -- __rt.timer_start(90, 0)
-	-- -- __rt.timer_start(80, 0)
-	-- __rt.timer_start(3, 0)
+
+	-- -- -- local now = __rt.time() + 200000
+	-- -- __rt.timer_start(10, 0)
+	-- -- __rt.timer_start(30, 0)
+	-- -- __rt.timer_start(20, 0)
+	-- -- __rt.timer_start(15, 0)
+	-- -- -- __rt.timer_start(40, 0)
+	-- -- -- __rt.timer_start(100, 0)
+	-- -- -- __rt.timer_start(6, 0)
+	-- -- __rt.timer_start(5, 0)
+	-- -- -- __rt.timer_start(90, 0)
+	-- -- -- __rt.timer_start(80, 0)
+	-- -- __rt.timer_start(3, 0)
+	-- -- os.exit(0)
+	-- __rt.timer_start(__rt.time() + 400000000, 0, 0)
+	-- -- __rt.timer_start(800, 0)
+	-- -- __rt.timer_start(700, 0)
+	-- -- print("start timer with deadline in 400ms")
+	-- -- print("timer expired")
+	-- collectgarbage("collect")
 	-- os.exit(0)
-	__rt.timer_start(__rt.time() + 400000000, 0)
-	-- __rt.timer_start(800, 0)
-	-- __rt.timer_start(700, 0)
-	-- print("start timer with deadline in 400ms")
-	-- print("timer expired")
-	collectgarbage("collect")
-	os.exit(0)
 
-	local buf = __rt.buf_alloc(64) ; print("buf_alloc =>", buf)
-	local fd = __rt.socket(__rt.PF_INET, __rt.SOCK_STREAM)
-	print("socket =>", fd)
-	print("connect =>", __rt.connect(fd, "127.0.0.1:12345"))
-	while true do
-		local n = __rt.read(fd, buf)
-		print("read =>", n)
-		if n == 0 then break end
-	end
-	print("buf_str => \"" .. __rt.buf_str(buf) .. "\"")
+	-- local buf = __rt.buf_alloc(64) ; print("buf_alloc =>", buf)
+	-- local fd = __rt.socket(__rt.PF_INET, __rt.SOCK_STREAM)
+	-- print("socket =>", fd)
+	-- print("connect =>", __rt.connect(fd, "127.0.0.1:12345"))
+	-- while true do
+	-- 	local n = __rt.read(fd, buf)
+	-- 	print("read =>", n)
+	-- 	if n == 0 then break end
+	-- end
+	-- print("buf_str => \"" .. __rt.buf_str(buf) .. "\"")
 
 	-- print("read =>", __rt.read(fd, buf))
 	-- print("buf_str => \"" .. __rt.buf_str(buf) .. "\"")
@@ -583,6 +583,8 @@ function main2()
 	-- 	print(name .. " exit")
 	-- end) end
 
+	-- TODO: "task block" structured concurrency primitive, where we suspend at taskblock_end
+	--       until all children spawned "inside" the block have exited:
 	-- do
 	-- 	__rt.taskblock_begin()
 	-- 	spawnchild("A")
@@ -732,5 +734,31 @@ function main2()
 	-- error("Meow")
 end
 
-__rt.main(main2)
-collectgarbage("collect")
+-- __rt.main(main2)
+
+-- __rt.main(require("tests/rt/yield"))
+-- __rt.main(require("tests/rt/sleep"))
+-- __rt.main(require("tests/rt/timer"))
+-- __rt.main(require("tests/rt/repeating-timer"))
+-- __rt.main(require("tests/rt/stop-children-on-parent-exit"))
+__rt.main(require("tests/rt/deadlock"))
+-- __rt.main(function()
+-- 	local buf = __rt.buf_alloc(64) ; print("buf_alloc =>", buf)
+-- 	local fd = __rt.socket(__rt.PF_INET, __rt.SOCK_STREAM)
+-- 	print("socket =>", fd)
+-- 	print("connect =>", __rt.connect(fd, "127.0.0.1:12345"))
+-- 	while true do
+-- 		local n = __rt.read(fd, buf)
+-- 		print("read =>", n)
+-- 		if n == 0 then break end
+-- 	end
+-- 	print("buf_str => \"" .. __rt.buf_str(buf) .. "\"")
+
+-- 	print("read =>", __rt.read(fd, buf))
+-- 	print("buf_str => \"" .. __rt.buf_str(buf) .. "\"")
+
+-- 	print("main sleep 400ms")
+-- 	print("sleep =>", __rt.sleep(400000000))
+-- 	print("main sleep 5000ms")
+-- 	print("sleep =>", __rt.sleep(5000000000))
+-- end)

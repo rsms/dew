@@ -17,6 +17,10 @@ typedef struct IOPollDesc IOPollDesc; // descriptor (state used for I/O requests
 typedef struct IODesc     IODesc; // wraps a file descriptor, used by iopoll
 typedef struct Timer      Timer;
 typedef struct TimerInfo  TimerInfo; // cache friendly 'timers' array entry
+typedef struct FIFO       FIFO;
+typedef struct RunQ       RunQ;
+typedef struct Inbox      Inbox;
+typedef struct InboxMsg   InboxMsg;
 
 struct IOPoll {
 	S* s;
@@ -35,11 +39,15 @@ struct IODesc {
 	i64         nwrite; // bytes available to write, or -errno on error
 };
 
+typedef T* nullable (*TimerF)(Timer* timer, void* nullable arg);
+
 struct Timer {
-	DTime         when;     // a specific point in time. -1 if dead (not in s.timers)
-	DTimeDuration period;   // if >0, repeat every when+period
-	uintptr       arg, seq; // passed along to f
-	T* nullable (*f)(uintptr arg, uintptr seq);
+	DTime          when;   // a specific point in time. -1 if dead (not in s.timers)
+	DTimeDuration  period; // if >0, repeat every when+period
+	DTimeDuration  leeway; // precision request; how much this timer is willing to fluctuate
+	u8             nrefs;  // reference count (internal + lua, so really just 2 bits needed)
+	void* nullable arg;    // passed to f
+	TimerF         f;      // f can return non-NULL to have a T woken up
 };
 
 struct TimerInfo {
@@ -49,22 +57,48 @@ struct TimerInfo {
 
 typedef Array(TimerInfo) TimerPQ;
 
+struct FIFO {
+	u32 cap;
+	u32 head;
+	u32 tail;
+	//TYPE entries[];
+};
+
+struct InboxMsg {
+	InboxMsg* nullable next;
+	u8                 what;
+	T*    nullable     sender;
+	void* nullable     data;
+};
+
+struct Inbox {
+	FIFO     fifo;
+	InboxMsg entries[];
+};
+
+struct RunQ {
+	FIFO fifo;
+	T*   entries[];
+};
+
 typedef enum TStatus : u8 {
-	TStatus_RUN,   // running
-	TStatus_DEAD,  // dead
-	TStatus_YIELD, // suspended
-	TStatus_NORM,  // normal
+	TStatus_READY,     // on runq
+	TStatus_RUNNING,   // currently running
+	TStatus_WAIT_IO,   // suspended, waiting for I/O or sleep timer
+	TStatus_WAIT_RECV, // suspended, waiting for inbox message
+	TStatus_DEAD,      // dead
 } TStatus;
 
 struct T {
-	S*             s;            // owning S
-	T* nullable    parent;       // task that spawned this task (NULL = S's main task)
-	T* nullable    next_sibling; // next sibling in parent's list of children
-	T* nullable    first_child;  // list of children
-	void* nullable _unused1;
-	int            resume_nres;  // number of results on stack, to be returned via resume
-	u8             is_live;      // 1 when running or waiting, 0 when exited
-	u8             _unused[3];
+	S*              s;            // owning S
+	T* nullable     parent;       // task that spawned this task (NULL = S's main task)
+	T* nullable     next_sibling; // next sibling in parent's list of children
+	T* nullable     first_child;  // list of children
+	Inbox* nullable inbox;        // list of inbox messages
+	int             resume_nres;  // number of results on stack, to be returned via resume
+	TStatus         status;       // TStatus_ constant
+	u8              _unused;
+	u16             ntimers;      // number of live timers
 	// rest of struct is a lua_State struct
 	// Note: With Lua 5.4, the total size of T + lua_State is 248 B
 };
@@ -77,12 +111,8 @@ struct S {
 
 	// runq is a queue of tasks (TIDs) ready to run; a circular buffer.
 	// (We could get fancy with a red-black tree a la Linux kernel. Let's keep it simple for now.)
-	u32 runq_head;
-	u32 runq_tail;
-	u32 runq_cap;
-	T** runq;
-
-	// runnext is a TID (>0) if a task is to be run immediately, skipping runq
+	// runnext is a TID (>0) if a task is to be run immediately, skipping runq.
+	RunQ*       runq;
 	T* nullable runnext;
 
 	// timers
@@ -108,7 +138,7 @@ inline static T* L_t(lua_State* L) { return (void*)L - sizeof(T); }
 
 int iopoll_init(IOPoll* iopoll, S* s);
 void iopoll_shutdown(IOPoll* iopoll);
-int iopoll_poll(IOPoll* iopoll, DTime deadline);
+int iopoll_poll(IOPoll* iopoll, DTime deadline, DTimeDuration deadline_leeway);
 int iopoll_open(IOPoll* iopoll, IODesc* d);
 int iopoll_close(IOPoll* iopoll, IODesc* d);
 

@@ -91,6 +91,16 @@ typedef double    float64;
 	#define unreachable() (assert(!"unreachable"),abort())
 #endif
 
+#if __has_attribute(musttail) && !defined(__wasm__)
+	// Note on "!defined(__wasm__)": clang 13 claims to have this attribute for wasm
+	// targets but it's actually not implemented and causes an error.
+	// Tail calls in wasm is a post-v1 feature that can must be explicitly enabled.
+	#define MUSTTAIL __attribute__((musttail))
+#else
+	#define MUSTTAIL
+#endif
+#define TAIL_CALL MUSTTAIL return
+
 #define API_BEGIN \
 	_Pragma("clang diagnostic push") \
 	_Pragma("clang diagnostic ignored \"-Wnullability-completeness\"") \
@@ -294,25 +304,5 @@ inline static void* nullable array_reserve(struct Array* a, u32 elemsize, u32 mi
 bool array_append(struct Array* a, u32 elemsize, const void* elemv, u32 elemc);
 void array_free(struct Array* a); // respects embedded a->v
 
-
-
-typedef struct Runloop Runloop;
-
-int RunloopCreate(Runloop** result);
-void RunloopFree(Runloop* rl);
-int RunloopRun(Runloop* rl, u32 flags); // -> -errno on error, 1 if more events, 0 if empty
-int RunloopRemove(Runloop* rl, int w); // -errno on error, 0 on success
-
-typedef void(*TimerCallback)(Runloop* rl, int w, u64 ud);
-
-// RunloopAddTimeout schedules a timer for a specific time in the future.
-// If deadline is in the past, the timer completes immediately, in the current runloop frame.
-// Returns watcher id 'w' (>=0) on success, or -errno on error.
-int RunloopAddTimeout(Runloop*, TimerCallback, u64 ud, DTime deadline);
-
-// RunloopAddInterval schedules an interval timer, triggered every 'interval' time.
-// 'interval' must be >=0 (returns -EINVAL if negative).
-// Returns watcher id 'w' (>=0) on success, or -errno on error.
-int RunloopAddInterval(Runloop*, TimerCallback, u64 ud, DTimeDuration interval);
 
 API_END

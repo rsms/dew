@@ -69,7 +69,7 @@ static bool x_luaL_optboolean(lua_State* L, int index, bool default_value) {
 }
 
 
-static int l_errno_error(lua_State* L, int err_no) {
+static int l_errno_error(lua_State* L, int err_no) { // note: always returns 0
 	lua_pushstring(L, strerror(err_no));
 	return lua_error(L);
 }
@@ -110,6 +110,146 @@ static int l_errstr(lua_State* L) {
 	lua_pushstring(L, description);
 	return 2;
 }
+
+
+// FIFO functions
+static bool fifo_allocsize(u32 cap, usize elemsize, usize* nbyte_out);
+static FIFO* nullable fifo_alloc(u32 cap, usize elemsize);
+static void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap);
+static void* nullable fifo_pop(FIFO* q, usize elemsize);
+
+
+static bool fifo_allocsize(u32 cap, usize elemsize, usize* nbyte_out) {
+	assert(IS_POW2_X(elemsize));
+	return !check_mul_overflow((usize)cap, elemsize, nbyte_out) &&
+	       !check_add_overflow(*nbyte_out, ALIGN2(sizeof(FIFO), elemsize), nbyte_out);
+}
+
+
+static FIFO* nullable fifo_alloc(u32 cap, usize elemsize) {
+	FIFO* q;
+	usize newsize;
+	if (!fifo_allocsize(cap, elemsize, &newsize))
+		return NULL;
+	if (( q = malloc(newsize) )) {
+		q->cap = cap;
+		q->head = 0;
+		q->tail = 0;
+	}
+	return q;
+}
+
+
+static int _fifo_grow(FIFO** qp, usize elemsize, u32 maxcap) {
+	FIFO* q = *qp;
+	if (q->cap >= maxcap)
+		return -1;
+
+	// try to double capacity, fall back to incrementing it by 1
+	u32 newcap;
+	if (check_mul_overflow(q->cap, 2u, &newcap)) {
+		if (q->cap == U32_MAX)
+			return -1;
+		newcap = q->cap + 1;
+	} else if (newcap > maxcap) {
+		newcap = maxcap;
+	}
+
+	// calculate new memory allocation size
+	usize newsize;
+	if (!fifo_allocsize(newcap, elemsize, &newsize))
+		return -1;
+
+	// realloc
+	FIFO* newq = realloc(q, newsize);
+	if (!newq)
+		return -1;
+	q = newq;
+
+	// check for wrapping head & tail pointers
+	if (q->head > q->tail) {
+		u32 tailcount = q->cap - q->head;
+		u32 new_head = q->head + (newcap - q->cap);
+		void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
+		void* dst = entries + (usize)new_head*elemsize;
+		void* src = entries + (usize)q->head*elemsize;
+		memmove(dst, src, tailcount*elemsize);
+		q->head = new_head;
+	}
+
+	q->cap = newcap;
+	*qp = q;
+
+	return 0;
+}
+
+
+static void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap) {
+	FIFO* q = *qp;
+	u32 newtail = (q->tail + 1) % q->cap;
+	if UNLIKELY(newtail == q->head) {
+		if UNLIKELY(_fifo_grow(qp, elemsize, maxcap))
+			return NULL;
+		q = *qp;
+		newtail = (q->tail + 1) % q->cap;
+	}
+	void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
+	void* entry = entries + (usize)q->tail*elemsize;
+	q->tail = newtail;
+	return entry;
+}
+
+
+static void* nullable fifo_pop(FIFO* q, usize elemsize) {
+	if (q->head == q->tail) // empty
+		return NULL;
+	void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
+	void* entry = entries + (usize)q->head*elemsize;
+	q->head = (q->head + 1) % q->cap;
+	return entry;
+}
+
+
+// little unit test for FIFO
+#ifdef DEBUG
+__attribute__((constructor)) static void fifo_test() {
+	struct { FIFO fifo; u32 entries[]; }* q;
+	q = (__typeof__(q))fifo_alloc(4, sizeof(*q->entries));
+	assert(q != NULL);
+	assert(q->fifo.cap == 4);
+
+	// note: actual capacity is cap-1; set maxcap to 2x to ensure _fifo_grow is tested
+	u32 maxcap = q->fifo.cap*2;
+	u32* entry;
+	for (u32 i = 0; i < maxcap-1; i++) {
+		entry = fifo_push((FIFO**)&q, sizeof(*q->entries), maxcap);
+		assert(entry != NULL);
+		*entry = i;
+		// dlog("entry #%u %p", i+1, entry);
+	}
+	// this should fail as we are at maxcap
+	entry = fifo_push((FIFO**)&q, sizeof(*q->entries), maxcap);
+	assert(entry == NULL);
+
+	// should dequeue in order
+	for (u32 i = 0; i < maxcap-1; i++) {
+		entry = fifo_pop(&q->fifo, sizeof(*q->entries));
+		assert(entry != NULL);
+		assert(*entry == i);
+	}
+	// should be empty now
+	entry = fifo_pop(&q->fifo, sizeof(*q->entries));
+	assert(entry == NULL);
+
+	// should have room for maxap-1 more entries now without needing to grow in size
+	assert(q->fifo.cap == maxcap);
+	for (u32 i = 0; i < maxcap-1; i++)
+		fifo_push((FIFO**)&q, sizeof(*q->entries), maxcap);
+	assert(q->fifo.cap == maxcap); // ensure it did not grow
+
+	dlog("OK: fifo_test");
+}
+#endif
 
 
 // dew_intscan parses a byte string as an unsigned integer, up to 0xffffffffffffffff
@@ -366,8 +506,14 @@ static int l_intconv(lua_State* L) {
 }
 
 
+
+// ———————————————————————————————————————————————————————————————————————————————————————————
+// BEGIN wasm ipc experiment
+
 #ifdef __wasm__
-#include "dew.h"
+
+extern lua_State* g_L; // dew.c
+
 static int l_ipcrecv(lua_State* L) {
 	// TODO: this could be generalized into a io_uring like API.
 	// Could then use async reading of stdin instead of a dedicated "ipc" syscall.
@@ -381,7 +527,6 @@ static int l_ipcrecv(lua_State* L) {
 	return 1;
 }
 
-static lua_State* g_L = NULL;
 static lua_State* g_ipcrecv_co = NULL;
 
 extern int ipcrecv(int arg);
@@ -418,88 +563,30 @@ static int l_iowait(lua_State* L) {
 
 #endif // __wasm__
 
+// END wasm ipc experiment
+// ———————————————————————————————————————————————————————————————————————————————————————————
 
 
-// Note: can check if called on a coroutine with this:
-// if (!lua_isyieldable(L))
-// 	return luaL_error(L, "not a coroutine");
-// lua_pushthread(L);
+#define TRACE_SCHED
+// #define TRACE_SCHED_RUNQ
+
+#ifdef TRACE_SCHED
+	#define trace_sched(fmt, ...) dlog("\e[1;34m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
+#else
+	#define trace_sched(fmt, ...) ((void)0)
+#endif
+
+#ifdef TRACE_SCHED_RUNQ
+	#define trace_runq(fmt, ...) dlog("\e[1;35m%-18s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
+#else
+	#define trace_runq(fmt, ...) ((void)0)
+#endif
 
 
-extern lua_State* g_L; // dew.c
-static Runloop* g_main_runloop = NULL;
-
-
-static int l_time(lua_State* L) {
-	lua_pushinteger(L, DTimeNow());
-	return 1;
-}
-
-
-static void timer_handler(Runloop* rl, int w, u64 ud) {
-	dlog("timer_handler w=%d", w);
-	if (ud) {
-		lua_State* L = g_L;
-		int ref = (int)ud;
-		lua_rawgeti(L, LUA_REGISTRYINDEX, ref);
-		// Call the function (assume no arguments and 1 return value for simplicity)
-		if (lua_pcall(L, 0, 1, 0) != LUA_OK) {
-			// Handle Lua error
-			lua_error(L);
-		}
-	}
-}
-
-
-static int l_runloop_add_timeout(lua_State* L) {
-	if (!lua_isyieldable(L))
-		return luaL_error(L, "not a coroutine");
-	DTime deadline = luaL_checkinteger(L, 1);
-	u64 userdata = (uintptr)L;
-	int w = RunloopAddTimeout(g_main_runloop, timer_handler, userdata, deadline);
-	if (w < 0)
-		return l_errno_error(L, -w);
-
-	lua_pushinteger(L, 1); // yield 1 to let runtime know we're still going
-	return lua_yield(L, 1);
-	// lua_pushinteger(L, w);
-	// return 1;
-}
-
-
-static int l_runloop_add_interval(lua_State* L) {
-	u64 interval_nsec = luaL_checkinteger(L, 1);
-	int w = RunloopAddInterval(g_main_runloop, timer_handler, 0, interval_nsec);
-	if (w < 0)
-		return l_errno_error(L, -w);
-	lua_pushinteger(L, w);
-	return 1;
-}
-
-
-static int l_runloop_run(lua_State* L) {
-	int n = RunloopRun(g_main_runloop, 0);
-	if (n < 0)
-		return l_errno_error(L, -n);
-	lua_pushboolean(L, n);
-	return 1;
-}
-
-
-// old runtime stuff above
-//——————————————————————————————————————————————————————————————————————————————————————————————
-// new runtime below
-
-
-#define trace(fmt, ...) dlog("\e[1;34m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
-
-// #define trace_runq(fmt, ...) dlog("\e[1;35m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
-#define trace_runq(fmt, ...) ((void)0)
-
-static u8 g_thread_table_key; // table where all live tasks are stored to avoid GC
-static u8 g_iodesc_luatabkey; // IODesc object prototype
-static u8 g_buf_luatabkey;    // Buf object prototype
-static u8 g_timer_luatabkey;  // Timer object prototype
+static u8 g_reftabkey;          // table where objects with compex lifetime are stored, to avoid GC
+static u8 g_iodesc_luatabkey;   // IODesc object prototype
+static u8 g_buf_luatabkey;      // Buf object prototype
+static u8 g_timerobj_luatabkey; // Timer object prototype
 
 // tls_s holds S for the current thread
 static _Thread_local S* tls_s = NULL;
@@ -542,14 +629,14 @@ static int l_error_not_a_task(lua_State* L, T* t) {
 	// 2. calling a task-specific API function from a to-be-closed variable (__close)
 	//    during task shutdown.
 	const char* msg = t->s ? "task is shutting down" : "not called from a task";
-	trace("%s: invalid call by user: %s", __FUNCTION__, msg);
+	dlog("%s: invalid call by user: %s", __FUNCTION__, msg);
 	return luaL_error(L, msg);
 }
 
 
 #define REQUIRE_TASK(L) ({ \
 	T* __t = L_t(L); \
-	if UNLIKELY(!__t->is_live) \
+	if UNLIKELY(__t->s == NULL) \
 		return l_error_not_a_task(L, __t); \
 	__t; \
 })
@@ -563,32 +650,35 @@ static Buf* nullable l_buf_check(lua_State* L, int idx) {
 	return l_uobj_check(L, idx, &g_buf_luatabkey, "Buf");
 }
 
-static Timer* nullable l_timer_check(lua_State* L, int idx) {
-	return l_uobj_check(L, idx, &g_timer_luatabkey, "Timer");
-}
 
 
-// s_tstatus returns the status of a task.
-// Based on auxstatus from lcorolib.c
-static TStatus s_tstatus(S* s, T* t) {
-	if (s->L == t_L(t))
-		return TStatus_RUN;
-	switch (lua_status(t_L(t))) {
-		case LUA_YIELD:
-			return TStatus_YIELD;
-		case LUA_OK: {
-			lua_Debug ar;
-			if (lua_getstack(t_L(t), 0, &ar))  /* does it have frames? */
-				return TStatus_NORM;  /* it is running */
-			else if (lua_gettop(t_L(t)) == 0)
-				return TStatus_DEAD;
-			else
-				return TStatus_YIELD;  /* initial state */
-		}
-		default:  /* some error occurred */
-			return TStatus_DEAD;
-	}
-}
+// typedef enum LuaThreadStatus : u8 {
+// 	LuaThreadStatus_RUN,   // running
+// 	LuaThreadStatus_DEAD,  // dead
+// 	LuaThreadStatus_YIELD, // suspended
+// 	LuaThreadStatus_NORM,  // normal
+// } LuaThreadStatus;
+// // s_lua_thread_status returns the status of a task.
+// // Based on auxstatus from lcorolib.c
+// static LuaThreadStatus s_lua_thread_status(S* s, T* t) {
+// 	if (s->L == t_L(t))
+// 		return LuaThreadStatus_RUN;
+// 	switch (lua_status(t_L(t))) {
+// 		case LUA_YIELD:
+// 			return LuaThreadStatus_YIELD;
+// 		case LUA_OK: {
+// 			lua_Debug ar;
+// 			if (lua_getstack(t_L(t), 0, &ar))  /* does it have frames? */
+// 				return LuaThreadStatus_NORM;  /* it is running */
+// 			else if (lua_gettop(t_L(t)) == 0)
+// 				return LuaThreadStatus_DEAD;
+// 			else
+// 				return LuaThreadStatus_YIELD;  /* initial state */
+// 		}
+// 		default:  /* some error occurred */
+// 			return LuaThreadStatus_DEAD;
+// 	}
+// }
 
 
 // l_iodesc_gc is called when an IODesc object is about to be garbage collected by Lua
@@ -752,35 +842,128 @@ static int l_buf_str(lua_State* L) {
 }
 
 
-static void timers_remove(TimerPQ* timers, Timer* timer);
-
-
-static int l_timer_gc(lua_State* L) {
-	Timer* timer = lua_touserdata(L, 1);
-	if (timer->when != (DTime)-1) {
-		S* s = tls_s;
-		if (s) {
-			timers_remove(&s->timers, timer);
-		} else {
-			dlog("warning: Timer %p GC'd outside of S lifetime", timer);
-		}
-	}
-	return 0;
+static InboxMsg* nullable inbox_pop(Inbox* inbox) {
+	return fifo_pop(&inbox->fifo, sizeof(*inbox->entries));
 }
 
 
-static Timer* nullable timer_create(lua_State* L, DTime when, DTimeDuration period) {
-	// see comment in l_iodesc_create
-	int nuvalue = 0;
-	Timer* timer = lua_newuserdatauv(L, sizeof(Timer), nuvalue);
-	if (!timer)
+static InboxMsg* nullable inbox_add(Inbox** inboxp) {
+	const u32 message_limit = 64;
+	const u32 initcap = 8;
+
+	Inbox* inbox;
+
+	// if the inbox is aready setup, push a message into it
+	if (*inboxp)
+		return fifo_push((FIFO**)inboxp, sizeof(*inbox->entries), message_limit);
+
+	// setup inbox
+	inbox = (Inbox*)fifo_alloc(initcap, sizeof(*inbox->entries));
+	if UNLIKELY(!inbox)
 		return NULL;
-	memset(timer, 0, sizeof(*timer));
-	timer->when = when;
-	timer->period = period;
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_timer_luatabkey);
-	lua_setmetatable(L, -2);
-	return timer;
+	*inboxp = inbox;
+
+	// inline minimal version of fifo_push
+	inbox->fifo.tail = 1;
+	return &inbox->entries[0];
+}
+
+
+static bool send_to_t(T* t, InboxMsg msg) {
+	trace_sched(T_ID_F, t_id(t));
+	InboxMsg* msgp = inbox_add(&t->inbox);
+	if (msgp == NULL)
+		return false;
+	*msgp = msg;
+	return true;
+}
+
+
+typedef int(*TaskContinuation)(lua_State* L, int l_thrd_status, void* arg);
+
+
+inline static int t_suspend(
+	T* t, TStatus tstatus, void* nullable arg, TaskContinuation nullable cont)
+{
+	assert(tstatus != TStatus_READY ||
+	       tstatus != TStatus_RUNNING ||
+	       tstatus != TStatus_DEAD);
+	t->status = tstatus;
+	return lua_yieldk(t_L(t), 0, (intptr_t)arg, (int(*)(lua_State*,int,lua_KContext))cont);
+}
+
+
+// t_iopoll_wait suspends a task that is waiting for file descriptor events.
+// Once 'd' is told that there are changes, t is woken up which causes the continuation 'cont'
+// to be invoked on the unchanged stack in t_resume before execution is handed back to the task.
+inline static int t_iopoll_wait(T* t, IODesc* d, int(*cont)(lua_State*,int,IODesc*)) {
+	d->t = t;
+	return t_suspend(t, TStatus_WAIT_IO, d, (TaskContinuation)cont);
+	// return lua_yieldk(L, 0, (intptr_t)d, (int(*)(lua_State*,int,lua_KContext))cont);
+}
+
+
+static int l_recv_cont(lua_State* L, int ltstatus, void* arg) {
+	T* t = arg;
+	assert(t->inbox != NULL);
+	InboxMsg* msg = inbox_pop(t->inbox);
+	assert(msg != NULL);
+	trace_sched(T_ID_F " deliver msg what=%u", t_id(t), msg->what);
+	lua_pushinteger(L, msg->what);
+	lua_pushinteger(L, (uintptr)msg->sender); // FIXME
+	lua_pushinteger(L, (uintptr)msg->data); // FIXME
+	return 3;
+}
+
+
+// fun recv() (what, sender int, data any)
+static int l_recv(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	if (t->inbox) {
+		InboxMsg* msg = inbox_pop(t->inbox);
+		if (msg) {
+			lua_pushinteger(L, msg->what);
+			lua_pushinteger(L, (uintptr)msg->sender); // FIXME
+			lua_pushinteger(L, (uintptr)msg->data); // FIXME
+			return 1;
+		}
+	}
+	trace_sched(T_ID_F " wait", t_id(t));
+
+	// check for deadlock
+	S* s = t->s;
+	if UNLIKELY(s->runnext == NULL && s->runq->fifo.head == s->runq->fifo.tail) {
+		// empty runq
+		if (s->nlive == 1 && t->ntimers == 0) {
+			// T is the only live task and no timers are active
+			return luaL_error(t_L(t), "deadlock detected: recv would never return");
+		}
+	}
+
+	return t_suspend(t, TStatus_WAIT_RECV, t, l_recv_cont);
+	// return lua_yieldk(L, 0, (intptr_t)t, l_recv_cont);
+}
+
+
+// s_userdata_acquire prevents Lua's GC from collecting an object
+static void s_userdata_acquire(S* s, void* ud) {
+	lua_State* L = s->L;
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_reftabkey); // put ref table on stack
+	lua_pushlightuserdata(L, ud); // key = ud
+	lua_pushboolean(L, 1);        // value = true
+	lua_rawset(L, -3);            // reftab[key] = value
+	lua_pop(L, 1);                // remove the reftab from stack
+}
+
+
+// s_userdata_release releases our internal reference to an object tracked by Lua's GC
+static void s_userdata_release(S* s, void* ud) {
+	lua_State* L = s->L;
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_reftabkey); // put ref table on stack
+	lua_pushlightuserdata(L, ud); // key = ud
+	lua_pushnil(L);               // value = nil
+	lua_rawset(L, -3);            // reftab[key] = value
+	lua_pop(L, 1);                // remove the reftab from stack
 }
 
 
@@ -868,26 +1051,8 @@ static void timers_dlog(const TimerPQ* timers_readonly) {
 #endif
 
 
-static void timers_remove(TimerPQ* timers, Timer* timer) {
-	if (timers->len == 0 || timer->when == (DTime)-1)
-		return;
-	// linear search to find index of timer
-	u32 i;
-	if (timer->when > timers->v[timers->len / 2].when) {
-		for (i = timers->len; i--;) {
-			if (timers->v[i].timer == timer)
-				goto found;
-		}
-	} else {
-		for (i = 0; i < timers->len; i++) {
-			if (timers->v[i].timer == timer)
-				goto found;
-		}
-	}
-	dlog("warning: timer %p not found!", timer);
-	return;
-found:
-	dlog("remove timers[%u] %p (timers.len=%u)", i, timer, timers->len);
+static void timers_remove_at(TimerPQ* timers, u32 i) {
+	// dlog("remove timers[%u] %p (timers.len=%u)", i, timers->v[i].timer, timers->len);
 	// timers_dlog(timers); // state before
 	timers->len--;
 	// if i is the last entry (i.e. latest 'when'), we don't need to do anything else
@@ -899,6 +1064,26 @@ found:
 		timers_sift_down(timers, i);
 	}
 	// timers_dlog(timers); // state after
+}
+
+
+static void timers_remove(TimerPQ* timers, Timer* timer) {
+	if (timers->len == 0 || timer->when == (DTime)-1)
+		return;
+	// linear search to find index of timer
+	u32 i;
+	if (timer->when > timers->v[timers->len / 2].when) {
+		for (i = timers->len; i--;) {
+			if (timers->v[i].timer == timer)
+				return timers_remove_at(timers, i);
+		}
+	} else {
+		for (i = 0; i < timers->len; i++) {
+			if (timers->v[i].timer == timer)
+				return timers_remove_at(timers, i);
+		}
+	}
+	dlog("warning: timer %p not found!", timer);
 }
 
 
@@ -917,10 +1102,47 @@ static bool timers_add(TimerPQ* timers, Timer* timer) {
 	u32 i = timers->len - 1;
 	i = timers_sift_up(timers, i);
 	if (i == 0) {
-		// Note: min 'when' changed to 'when'
+		// Note: 'min when' changed to 'when'
 	}
 	// timers_dlog(timers);
 	return true;
+}
+
+
+inline static void timer_release(Timer* timer) {
+	assert(timer->nrefs > 0);
+	if (--timer->nrefs == 0) {
+		// dlog("*** free timer %p ***", timer);
+		free(timer);
+	}
+}
+
+
+// t_cancel_timers finds and cancels all pending timers started by t.
+static void t_cancel_timers(T* t) {
+	trace_sched("canceling %u timers started by " T_ID_F, t->ntimers, t_id(t));
+	// Linear search to find matching timers.
+	//
+	// Note: Tasks are not expected to exit with timers still running,
+	// so it's okay that this is slow.
+	//
+	// TODO: this could be made much more efficient.
+	// Currently we are removing a timer one by one, sifting through the heap
+	// and resetting scanning everytime we find one.
+	//
+	TimerPQ* timers = &t->s->timers;
+	u32 i;
+	for (i = timers->len; i-- && t->ntimers > 0;) {
+		if (timers->v[i].timer->arg == t) {
+			Timer* timer = timers->v[i].timer;
+			timers_remove_at(timers, i);
+			timer->when = -1; // signals that the timer is dead
+			timer_release(timer); // release internal reference
+			t->ntimers--;
+			i = timers->len; // reset loop index
+		}
+	}
+	assert(t->ntimers == 0 || !"ntimers larger than matching timers");
 }
 
 
@@ -932,61 +1154,268 @@ static T* nullable s_timers_check(S* s) {
 	DTime now = DTimeNow();
 	while (s->timers.len > 0 && s->timers.v[0].when <= now) {
 		Timer* timer = timers_remove_min(&s->timers);
-		T* t = timer->f(timer->arg, timer->seq);
-		now = DTimeNow();
-		if (timer->period > 0) {
+		T* t = timer->f(timer, timer->arg);
+		if (t == NULL) {
+			now = DTimeNow();
+		} else if (timer->period > 0) {
 			// repeating timer
-			timer->when = now + timer->period;
+			//
+			// Two different approaches to updating 'when':
+			// 1. steady rythm, variable delay between wakeups,
+			//    i.e. timer rings every when+period time.
+			// 2. variable rythm, steady delay between wakeups,
+			//    i.e. timer rings with period delay.
+			// It's not clear to me which is better.
+			// In tests, the two approaches yield identical results.
+			// I also benchmarked with a go program (identical results across the board.)
+			// Approach 1 seems the correct one from first principles and does not require a new
+			// timestamp, so let's go with that one for now.
+			timer->when += timer->period; // 1
+			// timer->when = now + timer->period; // 2
+
 			bool ok = timers_add(&s->timers, timer);
 			assert(ok); // never need to grow memory
-		} else {
-			timer->when = -1; // signal to l_timer_gc that timer is dead
-		}
-		// note: timers are GC'd, so no need to free a timer here in an 'else' branch
-		if (t)
 			return t;
+		} else {
+			// one-shot timer
+			// Since timers are accessible in userland, they are reference counted.
+			// We dereference the timer here rather than in timer->f since we need to access
+			// the timer after f returns.
+			timer->when = -1; // signals that timer is dead
+			timer_release(timer);
+			assert(t->ntimers > 0);
+			t->ntimers--;
+			return t;
+		}
 	}
 	return NULL;
 }
 
 
-static T* nullable l_timer_ring(uintptr arg, uintptr seq) {
-	return (T*)arg;
+// TimerObj is a Lua-managed (GC'd) wrapper around a internally managed Timer.
+// This allows a timer to be referenced by userland independently of its state.
+typedef struct TimerObj {
+	Timer* timer;
+} TimerObj;
+
+
+static TimerObj* nullable l_timerobj_check(lua_State* L, int idx) {
+	return l_uobj_check(L, idx, &g_timerobj_luatabkey, "Timer");
 }
 
 
-// fun timer_start(when Time, period TimeDuration) Timer
+static int l_timerobj_gc(lua_State* L) {
+	TimerObj* obj = lua_touserdata(L, 1);
+	// dlog("*** l_timerobj_gc %p ***", obj->timer);
+	timer_release(obj->timer);
+	return 0;
+}
+
+
+static T* l_timer_done(Timer* timer, void* arg) {
+	// dlog("*** l_timer_done %p ***", timer);
+	T* t = arg;
+	// deliver timer message to task's inbox
+	if UNLIKELY(!send_to_t(t, (InboxMsg){ .what = 123 })) {
+		// Inbox is full.
+		//
+		// In the case of a task calling send(), it should block until there's space in the
+		// receiver's inbox.
+		//
+		// But in the case of a timer delivering a message ... how do we handle this safely?
+		// We can't really block since that would block the entire scheduler...
+		// Maybe when the timer starts we can somehow pre-allocate an inbox message.
+		// For example, the Inbox could have a field 'npending' which is checked by
+		// inbox_add when considering if the inbox is full or not.
+	}
+	return t; // wake t
+}
+
+
+static Timer* nullable s_timer_start(
+	S*             s,
+	DTime          when,
+	DTimeDuration  period,
+	DTimeDuration  leeway,
+	void* nullable f_arg,
+	TimerF         f)
+{
+	// create timer
+	Timer* timer = calloc(1, sizeof(Timer));
+	if UNLIKELY(!timer)
+		return NULL;
+	timer->when = when;
+	timer->period = period;
+	timer->leeway = leeway;
+	timer->nrefs = 1;
+	timer->arg = f_arg;
+	timer->f = f;
+
+	// schedule timer
+	if UNLIKELY(!timers_add(&s->timers, timer)) {
+		free(timer);
+		return NULL;
+	}
+
+	return timer;
+}
+
+
+// fun timer_start(when Time, period, leeway TimeDuration) Timer
 static int l_timer_start(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 	DTime when = luaL_checkinteger(L, 1);
 	DTimeDuration period = luaL_checkinteger(L, 2);
-	Timer* timer = timer_create(L, when, period);
-	if (!timer)
-		return 0;
+	DTimeDuration leeway = luaL_checkinteger(L, 3);
 
-	timer->f = l_timer_ring;
-	timer->arg = (uintptr)t;
-	timer->seq = 0; // unused
+	// increment task's "live timers" counter
+	if UNLIKELY(++t->ntimers == 0) {
+		t->ntimers--;
+		return luaL_error(L, "too many concurrent timers (%u)", t->ntimers);
+	}
 
-	if UNLIKELY(!timers_add(&t->s->timers, timer))
+	// create & schedule a timer
+	Timer* timer = s_timer_start(t->s, when, period, leeway, t, l_timer_done);
+	if UNLIKELY(!timer) {
+		t->ntimers--;
 		return l_errno_error(L, ENOMEM);
+	}
 
-	return lua_yieldk(L, 0, 0, NULL);
-	// return 0; // XXX
+	// create ref
+	TimerObj* obj = lua_newuserdatauv(L, sizeof(TimerObj), 0);
+	if UNLIKELY(!obj) {
+		timers_remove(&t->s->timers, timer);
+		free(timer);
+		t->ntimers--;
+		return 0;
+	}
+	timer->nrefs++;
+	obj->timer = timer;
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_timerobj_luatabkey);
+	lua_setmetatable(L, -2);
+
+	// return timer object
+	return 1;
+}
+
+
+// fun timer_update(timer Timer, when Time, period, leeway TimeDuration)
+static int l_timer_update(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	TimerObj* obj = l_timerobj_check(L, 1);
+	DTime when = luaL_checkinteger(L, 2);
+	DTimeDuration period = luaL_checkinteger(L, 3);
+	DTimeDuration leeway = luaL_checkinteger(L, 4);
+
+	Timer* timer = obj->timer;
+
+	if UNLIKELY(timer->when != (DTime)-1) {
+		// Timer is still active.
+		// Remove it and re-add it to uphold correct position in timers priority queue.
+		timers_remove(&t->s->timers, timer);
+		timer->when = when;
+		timer->period = period;
+		timer->leeway = leeway;
+		if UNLIKELY(!timers_add(&t->s->timers, timer)) {
+			timer_release(timer); // release our internal reference
+			assert(t->ntimers > 0);
+			t->ntimers--;
+			return l_errno_error(L, ENOMEM);
+		}
+	} else {
+		// Timer already expired.
+		// This is basically the same as starting a new timer with timer_start.
+		timer->when = when;
+		timer->period = period;
+		timer->leeway = leeway;
+		// First, increment task's "live timers" counter
+		if UNLIKELY(++t->ntimers == 0) {
+			t->ntimers--;
+			return luaL_error(L, "too many concurrent timers (%u)", t->ntimers);
+		}
+		if UNLIKELY(!timers_add(&t->s->timers, timer))
+			return l_errno_error(L, ENOMEM);
+		assert(timer->nrefs == 1); // should have exactly on ref (Lua GC)
+		timer->nrefs++;
+	}
+	return 0;
+}
+
+
+// fun timer_stop(timer Timer)
+static int l_timer_stop(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	TimerObj* obj = l_timerobj_check(L, 1);
+
+	if (obj->timer->when == (DTime)-1)
+		return 0; // already expired
+
+	timers_remove(&t->s->timers, obj->timer);
+	timer_release(obj->timer); // release our internal reference
+	assert(t->ntimers > 0);
+	t->ntimers--;
+	return 0;
+}
+
+
+static T* l_sleep_done(Timer* timer, void* arg) {
+	T* t = arg;
+	return t; // wake t
+}
+
+
+// fun sleep(delay TimeDuration, leeway TimeDuration = -1)
+// Sleep is a simplified case of timer_start.
+// "sleep(123, 456)" is semantically equivalent to "timer_start(time()+123, 0, 456); recv()"
+static int l_sleep(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	DTimeDuration delay = luaL_checkinteger(L, 1);
+	if (delay < 0)
+		return luaL_error(L, "negative timeout");
+	DTime when = (DTimeNow() + delay) - D_TIME_MICROSECOND;
+	int has_leeway;
+	DTimeDuration leeway = lua_tointegerx(L, 2, &has_leeway);
+	if (!has_leeway)
+		leeway = -1;
+
+	// trace
+	if (leeway < 0) {
+		trace_sched(T_ID_F " sleep %.3f ms", t_id(t), (double)delay / D_TIME_MILLISECOND);
+	} else {
+		trace_sched(T_ID_F " sleep %.3f ms (%.3f ms leeway)", t_id(t),
+		            (double)delay / D_TIME_MILLISECOND,
+		            (double)leeway / D_TIME_MILLISECOND);
+	}
+
+	// increment task's "live timers" counter
+	if UNLIKELY(++t->ntimers == 0) {
+		t->ntimers--;
+		return luaL_error(L, "too many concurrent timers (%u)", t->ntimers);
+	}
+
+	// create & schedule a timer
+	DTimeDuration period = 0;
+	Timer* timer = s_timer_start(t->s, when, period, leeway, t, l_sleep_done);
+	if UNLIKELY(!timer) {
+		t->ntimers--;
+		return l_errno_error(L, ENOMEM);
+	}
+
+	// return one result
+	t->resume_nres = 1;
+
+	return t_suspend(t, TStatus_WAIT_IO, NULL, NULL);
+	// return lua_yieldk(L, 0, 0, NULL);
 }
 
 
 static bool s_runq_put(S* s, T* t) {
-	u32 next_tail = s->runq_tail + 1;
-	if (next_tail == s->runq_cap)
-		next_tail = 0;
-	if UNLIKELY(next_tail == s->runq_head) {
-		dlog("TODO: grow runq");
+	const u32 runq_cap_limit = U32_MAX;
+	T** tp = (T**)fifo_push((FIFO**)&s->runq, sizeof(*s->runq->entries), runq_cap_limit);
+	if (tp == NULL)
 		return false;
-	}
-	trace_runq("runq put [%u] = " T_ID_F, s->runq_tail, t_id(t));
-	s->runq[s->runq_tail] = t;
-	s->runq_tail = next_tail;
+	*tp = t;
+	trace_runq("runq put " T_ID_F, t_id(t));
 	return true;
 }
 
@@ -1011,13 +1440,11 @@ static T* nullable s_runq_get(S* s) {
 		s->runnext = NULL;
 		trace_runq("runq get runnext = " T_ID_F, t_id(t));
 	} else {
-		if (s->runq_head == s->runq_tail) // empty
+		T** tp = (T**)fifo_pop(&s->runq->fifo, sizeof(*s->runq->entries));
+		if (tp == NULL) // empty
 			return NULL;
-		t = s->runq[s->runq_head];
-		trace_runq("runq get [%u] = " T_ID_F, s->runq_head, t_id(t));
-		s->runq_head++;
-		if (s->runq_head == s->runq_cap)
-			s->runq_head = 0;
+		t = *tp;
+		trace_runq("runq get " T_ID_F, t_id(t));
 	}
 	return t;
 }
@@ -1027,22 +1454,25 @@ static void s_runq_remove(S* s, T* t) {
 	if (s->runnext == t) {
 		trace_runq("runq remove runnext " T_ID_F, t_id(t));
 		s->runnext = NULL;
-	} else if (s->runq_head != s->runq_tail) { // not empty
-		u32 i = s->runq_head;
-		u32 count = (s->runq_tail >= s->runq_head) ?
-					(s->runq_tail - s->runq_head) :
-					(s->runq_cap - s->runq_head + s->runq_tail);
+	} else if (s->runq->fifo.head != s->runq->fifo.tail) { // not empty
+		RunQ* runq = s->runq;
+		FIFO* fifo = &runq->fifo;
+		u32 i = fifo->head;
+		u32 count = (fifo->tail >= fifo->head) ?
+					(fifo->tail - fifo->head) :
+					(fifo->cap - fifo->head + fifo->tail);
 		for (u32 j = 0; j < count; j++) {
-			if (s->runq[i] == t) {
+			if (runq->entries[i] == t) {
 				trace_runq("runq remove [%u] " T_ID_F, i, t_id(t));
-				u32 next = (i + 1 == s->runq_cap) ? 0 : i + 1;
-				memmove(&s->runq[i], &s->runq[next], (s->runq_tail - next) * sizeof(*s->runq));
-				s->runq_tail = (s->runq_tail == 0) ? s->runq_cap - 1 : s->runq_tail - 1;
+				u32 next = (i + 1 == fifo->cap) ? 0 : i + 1;
+				usize nbyte = (fifo->tail - next) * sizeof(*runq->entries);
+				memmove(&runq->entries[i], &runq->entries[next], nbyte);
+				fifo->tail = (fifo->tail == 0) ? fifo->cap - 1 : fifo->tail - 1;
 				return;
 			}
-			i = (i + 1 == s->runq_cap) ? 0 : i + 1;
+			i = (i + 1 == fifo->cap) ? 0 : i + 1;
 		}
-		trace("warning: s_runq_remove(" T_ID_F ") called but task not found", t_id(t));
+		trace_sched("warning: s_runq_remove(" T_ID_F ") called but task not found", t_id(t));
 	}
 }
 
@@ -1050,17 +1480,21 @@ static void s_runq_remove(S* s, T* t) {
 static i32 s_runq_find(const S* s, const T* t) {
 	if (s->runnext == t)
 		return I32_MAX;
-	if (s->runq_head != s->runq_tail) { // not empty
-		u32 i = s->runq_head;
-		u32 count = (s->runq_tail >= s->runq_head) ?
-					(s->runq_tail - s->runq_head) :
-					(s->runq_cap - s->runq_head + s->runq_tail);
+
+	if (s->runq->fifo.head != s->runq->fifo.tail) { // not empty
+		RunQ* runq = s->runq;
+		FIFO* fifo = &runq->fifo;
+		u32 i = fifo->head;
+		u32 count = (fifo->tail >= fifo->head) ?
+					(fifo->tail - fifo->head) :
+					(fifo->cap - fifo->head + fifo->tail);
 		for (u32 j = 0; j < count; j++) {
-			if (s->runq[i] == t)
+			if (runq->entries[i] == t)
 				return (i32)i;
-			i = (i + 1 == s->runq_cap) ? 0 : i + 1;
+			i = (i + 1 == fifo->cap) ? 0 : i + 1;
 		}
 	}
+
 	return -1;
 }
 
@@ -1086,7 +1520,7 @@ static void t_remove_child_r(T* prev_sibling, T* child) {
 
 
 static void t_remove_child(T* parent, T* child) {
-	trace("remove child " T_ID_F " from " T_ID_F, t_id(child), t_id(parent));
+	trace_sched("remove child " T_ID_F " from " T_ID_F, t_id(child), t_id(parent));
 	assert(child->parent == parent);
 	child->parent = NULL;
 	if (parent->first_child == child) {
@@ -1132,11 +1566,11 @@ static void t_finalize(T* t, int status);
 
 
 static void t_stop(T* parent, T* child) {
-	trace("stop " T_ID_F " by parent " T_ID_F, t_id(child), t_id(parent));
+	trace_sched("stop " T_ID_F " by parent " T_ID_F, t_id(child), t_id(parent));
 
-	// set is_live to 0 _before_ calling lua_closethread to ensure that any to-be-closed variables
-	// with __close metamethods that call into our API are properly handled.
-	child->is_live = 0;
+	// set status to DEAD _before_ calling lua_closethread to ensure that any to-be-closed
+	// variables with __close metamethods that call into our API are properly handled.
+	child->status = TStatus_DEAD;
 
 	// Shut down Lua "thread"
 	//
@@ -1151,7 +1585,7 @@ static void t_stop(T* parent, T* child) {
 	//
 	int status = lua_closethread(t_L(child), t_L(parent));
 	if (status != LUA_OK) {
-		trace("warning: lua_closethread => %s", l_status_str(status));
+		dlog("warning: lua_closethread => %s", l_status_str(status));
 		t_report_error(child, "Error in defer handler");
 	}
 
@@ -1178,13 +1612,17 @@ static void t_stop_r(T* parent, T* child) {
 
 static void t_finalize(T* t, int status) {
 	// task is dead, either from clean exit or error (LUA_OK or LUA_ERR* status)
-	trace(T_ID_F " exited (%s)", t_id(t), l_status_str(status));
+	trace_sched(T_ID_F " exited (%s)", t_id(t), l_status_str(status));
 	if UNLIKELY(status != LUA_OK)
 		t_report_error(t, "Uncaught error");
 	t->s->nlive--;
-	t->is_live = 0;
+	t->status = TStatus_DEAD;
 
 	// dlog("task tree for " T_ID_F ":", t_id(t)); dlog_task_tree(t, 1);
+
+	// stop any still-running timers
+	if UNLIKELY(t->ntimers)
+		t_cancel_timers(t);
 
 	// stop child tasks
 	if (t->first_child)
@@ -1197,11 +1635,11 @@ static void t_finalize(T* t, int status) {
 	// remove GC ref to allow task (Lua thread) to be garbage collected
 	lua_State* TL = t_L(t);
 	lua_State* SL = t->s->L;
-	lua_rawgetp(SL, LUA_REGISTRYINDEX, &g_thread_table_key);  // Get the thread table
+	lua_rawgetp(SL, LUA_REGISTRYINDEX, &g_reftabkey); // put ref table on stack
 	lua_pushthread(TL);   // Push the thread onto its own stack
 	lua_xmove(TL, SL, 1); // Move the thread object to the `SL` state
 	lua_pushnil(SL);      // Use `nil` to remove the key
-	lua_rawset(SL, -3);   // thread_table[thread] = nil in `SL`
+	lua_rawset(SL, -3);   // reftab[thread] = nil in `SL`
 	lua_pop(SL, 1);       // Remove the thread table from the stack
 }
 
@@ -1216,8 +1654,10 @@ static void t_resume(T* t) {
 	// nargs: number of values on T's stack to be returned from 'yield' inside task.
 	// nres:  number of values passed to 'yield' by task.
 	int nargs = t->resume_nres, nres;
+	t->resume_nres = 0;
+	t->status = TStatus_RUNNING;
 
-	trace("resume " T_ID_F " nargs=%d", t_id(t), nargs);
+	trace_sched("resume " T_ID_F " nargs=%d", t_id(t), nargs);
 	int status = lua_resume(L, t->s->L, nargs, &nres);
 
 	// check if task exited
@@ -1230,13 +1670,14 @@ static void t_resume(T* t) {
 
 
 // t_yield schedules t for immediate resumption,
-// suspends t and switches control back to s_schedule loop.
+// suspends t and switches control back to scheduler loop.
 // (Must only be called from a task, never l_main.)
 static int t_yield(T* t, int nresults) {
-	trace(T_ID_F " yield", t_id(t));
+	trace_sched(T_ID_F " yield", t_id(t));
+	t->status = TStatus_READY;
 	if UNLIKELY(!s_runq_put(t->s, t))
 		return luaL_error(t_L(t), "out of memory");
-	return lua_yield(t_L(t), nresults);
+	return lua_yieldk(t_L(t), nresults, 0, NULL);
 }
 
 
@@ -1253,16 +1694,16 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	lua_pushvalue(L, 1); // move function to top of caller stack
 	lua_xmove(L, NL, 1); // move function from L to NL
 
-	// Hold on to a GC reference to thread, e.g. "S.L.thread_table[thread] = true"
+	// Hold on to a GC reference to thread, e.g. "S.L.reftab[thread] = true"
 	// Note: this is quite complex of a Lua stack operation. In particular lua_pushthread is
 	// gnarly as it pushes the thread onto its own stack, which we then move over to S's stack.
 	// If we get things wrong we (at best) get a memory bus error in asan with no stack trace,
 	// making this tricky to debug.
-	lua_rawgetp(s->L, LUA_REGISTRYINDEX, &g_thread_table_key);
+	lua_rawgetp(s->L, LUA_REGISTRYINDEX, &g_reftabkey);
 	lua_pushthread(NL);     // Push thread as key onto its own stack
 	lua_xmove(NL, s->L, 1); // Move the thread object to the `L` state
 	lua_pushboolean(s->L, 1);  // "true"
-	lua_rawset(s->L, -3);  // thread_table[thread] = true
+	lua_rawset(s->L, -3);  // reftab[thread] = true
 	lua_pop(s->L, 1);  // Remove table from stack
 
 	// initialize T struct (which lives in the LUA_EXTRASPACE header of lua_State)
@@ -1271,8 +1712,10 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	t->parent = parent;
 	t->next_sibling = NULL;
 	t->first_child = NULL;
+	t->inbox = NULL;
 	t->resume_nres = 0;
-	t->is_live = 1;
+	t->status = TStatus_READY;
+	t->ntimers = 0;
 
 	// setup t to be run next by schedule
 	if UNLIKELY(!s_runq_put_runnext(s, t)) {
@@ -1287,9 +1730,9 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	s->nlive++;
 
 	if (parent) {
-		trace(T_ID_F " spawns " T_ID_F, t_id(parent), t_id(t));
+		trace_sched(T_ID_F " spawns " T_ID_F, t_id(parent), t_id(t));
 	} else {
-		trace("spawn main task " T_ID_F, t_id(t));
+		trace_sched("spawn main task " T_ID_F, t_id(t));
 	}
 
 	return 1;
@@ -1312,11 +1755,11 @@ int s_iopoll_wake(S* s, IODesc** dv, u32 count) {
 		// that occurs when the task is running.
 		d->t = NULL;
 
-		trace(T_ID_F " woken by iopoll" , t_id(t));
+		trace_sched(T_ID_F " woken by iopoll" , t_id(t));
 
 		// TODO: check if t is already on runq and don't add it if so.
 		// For now, use an assertion (note: this is likely to happen)
-		assert(t->is_live);
+		assert(t->status == TStatus_WAIT_IO);
 		assert(s_runq_find(s, t) == -1);
 
 		if (!s_runq_put(s, t))
@@ -1326,19 +1769,8 @@ int s_iopoll_wake(S* s, IODesc** dv, u32 count) {
 }
 
 
-// l_iopoll_wait suspends a task that is waiting for file descriptor events.
-// Once 'd' is told that there are changes, t is woken up which causes the continuation 'cont'
-// to be invoked on the unchanged stack in t_resume before execution is handed back to the task.
-inline static int l_iopoll_wait(
-	lua_State* L, T* t, IODesc* d, int(*cont)(lua_State*,int,IODesc*))
-{
-	d->t = t;
-	return lua_yieldk(L, 0, (intptr_t)d, (int(*)(lua_State*,int,lua_KContext))cont);
-}
-
-
 static int s_shutdown(S* s) {
-	trace("shutdown " S_ID_F, s_id(s));
+	trace_sched("shutdown " S_ID_F, s_id(s));
 
 	// clear timers before GC to avoid costly (and useless) timers_remove
 	s->timers.len = 0;
@@ -1353,46 +1785,55 @@ static int s_shutdown(S* s) {
 }
 
 
-static int s_schedule(S* s) {
-	// Scheduler loop: find a runnable task and execute it.
-	// Stops when all tasks have finished or an error occurred.
-
-	// TODO: track min timer deadline in this loop and make sure to iopoll when reaching that
-	// deadline, else we might never get to timers if tasks are spawned at the same rate as we
-	// are running them.
-
-	static int debug_nwait = 0;
-	while (s->nlive > 0) {
-		// Look for a ready task in timers and runq.
-		// s_timers_check may run non-task timers, like IODesc deadlines.
-		T* t = s_timers_check(s);
-		if (!t)
-			t = s_runq_get(s);
-		if (t) {
-			trace(T_ID_F " taken from runq", t_id(t));
-			debug_nwait = 0; // XXX
-			t_resume(t);
-			continue;
-		}
-
-		// wait for events
-		DTime deadline = s->timers.len > 0 ? s->timers.v[0].when : (DTime)-1;
-		trace("iopoll_poll until deadline %llu", deadline);
-		int n = iopoll_poll(&s->iopoll, deadline);
-		if UNLIKELY(n < 0) {
-			logerr("internal I/O error: %s", strerror(-n));
-			l_errno_error(s->L, -n);
-			return 0;
-		}
-
-		// check runq & allt again
-		// debug check for logic errors (TODO: remove this when I know scheduler works)
-		if (n == 0 && ++debug_nwait == 4) {
-			dlog("s->nlive %u", s->nlive);
-			assert(!"XXX");
-		}
+static int s_find_runnable(S* s, T** tp) {
+	// check for expired timers
+	if (( *tp = s_timers_check(s) )) {
+		trace_sched(T_ID_F " taken from timers", t_id(*tp));
+		return 1;
 	}
-	return s_shutdown(s);
+
+	// try to grab a task from the run queue
+	if (( *tp = s_runq_get(s) )) {
+		trace_sched(T_ID_F " taken from runq", t_id(*tp));
+		return 1;
+	}
+
+	// check if we ran out tasks (all tasks have exited)
+	if (s->nlive == 0) {
+		trace_sched("no more tasks; exiting scheduler loop");
+		return 0;
+	}
+
+	// There are no tasks which are ready to run.
+	// Poll for I/O events (with timeout if there are any active timers.)
+
+	// determine iopoll deadline
+	DTime deadline = (DTime)-1;
+	DTimeDuration deadline_leeway = 0;
+	if (s->timers.len > 0) {
+		deadline = s->timers.v[0].timer->when;
+		deadline_leeway = s->timers.v[0].timer->leeway;
+	}
+
+	// trace
+	#ifdef TRACE_SCHED
+		if (deadline == (DTime)-1) {
+			trace_sched("iopoll (no timeout)");
+		} else {
+			char buf[30];
+			trace_sched("iopoll with %s timeout", DTimeDurationFormat(DTimeUntil(deadline), buf));
+		}
+	#endif
+
+	// wait for events
+	int n = iopoll_poll(&s->iopoll, deadline, deadline_leeway);
+	if UNLIKELY(n < 0) {
+		logerr("internal I/O error: %s", strerror(-n));
+		return l_errno_error(s->L, -n);
+	}
+
+	// check timers & runq again
+	TAIL_CALL s_find_runnable(s, tp);
 }
 
 
@@ -1403,38 +1844,40 @@ static int l_main(lua_State* L) {
 	// create scheduler for this OS thread & Lua context
 	S* s = &(S){
 		.L = L,
-		.runq_cap = 8,
 	};
 	s->timers.v = s->timers_storage;
 	s->timers.cap = countof(s->timers_storage);
 	tls_s = s;
 
-	// allocate initial runq array
-	s->runq = malloc(sizeof(*s->runq) * s->runq_cap);
-	if (!s->runq)
+	// allocate runq with inital space for (8 - 1) entries
+	if (!( s->runq = (RunQ*)fifo_alloc(8, sizeof(*s->runq)) ))
 		return l_errno_error(L, ENOMEM);
 
-	// open platform I/O facility
+	// initialize platform I/O facility
 	int err = iopoll_init(&s->iopoll, s);
 	if (err) {
 		dlog("error: iopoll_init: %s", strerror(-err));
 		return l_errno_error(L, -err);
 	}
 
-	// create threads table (for GC refs)
-	lua_createtable(L, 0, /*estimated common-case lowball Lua-thread count*/8);
-	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_thread_table_key);
+	// create refs table (for GC management)
+	lua_createtable(L, 0, /*estimated common-case lowball count*/8);
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_reftabkey);
 
 	// create main task
 	int nres = s_spawntask(s, L, NULL);
 	if UNLIKELY(nres == 0) // error
 		return 0;
 
-	// discard thread on result stack
+	// discard thread from L's stack
 	lua_pop(L, 1);
 
-	// enter scheduling loop
-	return s_schedule(s);
+	// scheduler loop: finds a runnable task and executes it.
+	// Stops when all tasks have finished (or an error occurred.)
+	T* t;
+	while (s_find_runnable(s, &t))
+		t_resume(t);
+	return s_shutdown(s);
 }
 
 
@@ -1452,22 +1895,8 @@ static int l_spawn(lua_State* L) {
 	if UNLIKELY(t->resume_nres == 0)
 		return 0;
 
-	// suspend the calling task, switching control back to s_schedule loop
+	// suspend the calling task, switching control back to scheduler loop
 	return t_yield(t, 0);
-}
-
-
-static int l_sleep(lua_State* L) {
-	T* t = REQUIRE_TASK(L);
-
-	DTimeDuration delay = luaL_checkinteger(L, 1);
-	if (delay < 0)
-		return luaL_error(L, "negative timeout");
-	DTime deadline = DTimeNow() + delay;
-
-	trace(T_ID_F " sleep (%llu ns)", t_id(t), delay);
-
-	return l_errno_error(L, ENOSYS);
 }
 
 
@@ -1519,7 +1948,7 @@ static int l_socket(lua_State* L) {
 
 static int l_connect_cont(lua_State* L, __attribute__((unused)) int ltstatus, IODesc* d) {
 	T* t = L_t(L);
-	trace(T_ID_F, t_id(t));
+	trace_sched(T_ID_F, t_id(t));
 
 	dlog("d events=%s nread=%lld nwrite=%lld",
 	     d->events == 'r'+'w' ? "rw" : d->events == 'r' ? "r" : d->events == 'w' ? "w" : "0",
@@ -1571,7 +2000,7 @@ static int l_connect(lua_State* L) {
 
 	if (errno == EINPROGRESS) {
 		dlog("wait for connect");
-		return l_iopoll_wait(L, t, d, l_connect_cont);
+		return t_iopoll_wait(t, d, l_connect_cont);
 	}
 
 	// error
@@ -1617,7 +2046,7 @@ static int l_read_cont(lua_State* L, __attribute__((unused)) int ltstatus, IODes
 	// check for error
 	if UNLIKELY(len < 0) {
 		if (errno == EAGAIN)
-			return l_iopoll_wait(L, L_t(L), d, l_read_cont);
+			return t_iopoll_wait(L_t(L), d, l_read_cont);
 		return l_errno_error(L, errno);
 	}
 
@@ -1629,7 +2058,7 @@ static int l_read_cont(lua_State* L, __attribute__((unused)) int ltstatus, IODes
 		buf->len += (usize)len;
 	}
 
-	// TODO: if there's a 3rd argument 'nread' that is >0, l_iopoll_wait again if
+	// TODO: if there's a 3rd argument 'nread' that is >0, t_iopoll_wait again if
 	// d->nread < nread so that "read" only returns after reading 'nread' bytes.
 
 	lua_pushinteger(L, len);
@@ -1644,14 +2073,14 @@ static int l_read(lua_State* L) {
 	// TODO: if there's a 3rd argument 'nread' that is >0, wait unless d->nread >= nread.
 	// if there's nothing available to read, we will have to wait for it
 	if (d->nread == 0)
-		return l_iopoll_wait(L, t, d, l_read_cont);
+		return t_iopoll_wait(t, d, l_read_cont);
 	return l_read_cont(L, 0, d);
 }
 
 
 static int l_taskblock_begin(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	trace("taskblock_begin");
+	trace_sched("taskblock_begin");
 	// TODO
 	return t_yield(t, 0);
 }
@@ -1659,8 +2088,14 @@ static int l_taskblock_begin(lua_State* L) {
 
 static int l_taskblock_end(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	trace("taskblock_end");
+	trace_sched("taskblock_end");
 	return t_yield(t, 0);
+}
+
+
+static int l_time(lua_State* L) {
+	lua_pushinteger(L, DTimeNow());
+	return 1;
 }
 
 
@@ -1670,11 +2105,6 @@ static const luaL_Reg dew_lib[] = {
 	{"intconv", l_intconv},
 	{"errstr", l_errstr},
 	{"time", l_time},
-
-	// "old" runtime API
-	{"runloop_run", l_runloop_run},
-	{"runloop_add_timeout", l_runloop_add_timeout},
-	{"runloop_add_interval", l_runloop_add_interval},
 
 	// "new" runtime API
 	{"main", l_main},
@@ -1688,10 +2118,13 @@ static const luaL_Reg dew_lib[] = {
 	{"buf_resize", l_buf_resize},
 	{"buf_str", l_buf_str},
 	{"timer_start", l_timer_start},
+	{"timer_update", l_timer_update},
+	{"timer_stop", l_timer_stop},
+	{"recv", l_recv},
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
 
-	// wasm experiments
+	// wasm experiment
 	#ifdef __wasm__
 	{"ipcrecv", l_ipcrecv},
 	{"ipcrecv_co", l_ipcrecv_co},
@@ -1703,7 +2136,7 @@ static const luaL_Reg dew_lib[] = {
 
 int luaopen_runtime(lua_State* L) {
 	#ifdef __wasm__
-	g_L = L; // FIXME!
+	g_L = L; // wasm experiment
 	#endif
 
 	luaL_newlib(L, dew_lib);
@@ -1720,11 +2153,11 @@ int luaopen_runtime(lua_State* L) {
 	lua_setfield(L, -2, "__gc");
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
 
-	// Timer
+	// Timer (ref to an internally managed Timer struct)
 	luaL_newmetatable(L, "Timer");
-	lua_pushcfunction(L, l_timer_gc);
+	lua_pushcfunction(L, l_timerobj_gc);
 	lua_setfield(L, -2, "__gc");
-	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_timer_luatabkey);
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_timerobj_luatabkey);
 
 	// export libc & syscall constants
 	#define _(NAME) \
@@ -1750,10 +2183,6 @@ int luaopen_runtime(lua_State* L) {
 	FOREACH_ERR(_)
 	// note: not including ERR_ERROR on purpose as it's "unknown error"
 	#undef _
-
-	int err = RunloopCreate(&g_main_runloop);
-	if (err)
-		logerr("RunloopCreate failed: %s", strerror(-err));
 
 	return 1;
 }

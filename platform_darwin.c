@@ -6,7 +6,8 @@
 #include <fcntl.h>
 
 
-#define TRACE_KQUEUE
+// #define TRACE_KQUEUE
+// #define TRACE_KQUEUE_TIMEOUT
 
 
 typedef struct kevent64_s KEv;
@@ -37,6 +38,13 @@ typedef struct kevent64_s KEv;
 #endif
 
 
+#ifdef TRACE_KQUEUE_TIMEOUT
+	#define trace_timeout(fmt, ...) trace("timeout: " fmt, ##__VA_ARGS__)
+#else
+	#define trace_timeout(...) ((void)0)
+#endif
+
+
 int iopoll_init(IOPoll* iopoll, S* s) {
 	iopoll->kq = kqueue();
 	if UNLIKELY(iopoll->kq == -1)
@@ -51,39 +59,97 @@ void iopoll_shutdown(IOPoll* iopoll) {
 }
 
 
-int iopoll_poll(IOPoll* iopoll, DTime deadline) {
+int iopoll_poll(IOPoll* iopoll, DTime deadline, DTimeDuration deadline_leeway) {
 	u32 flags = 0;
 	struct timespec ts = {};
 	struct timespec* tp;
 	u64 event_count = 0;
 	KEv events[64];
+	KEv req;
 	IODesc* wakev[64];
 	u32 wakec = 0;
 
 	for (;;) {
-		// configure ts, which is relative to "now"
+		// setup deadline by configuring ts (which is relative to "now")
+		#ifdef TRACE_KQUEUE_TIMEOUT
+			DTime now = 0;
+		#endif
+		int reqc = 0;
 		if (deadline == (DTime)-1) {
 			// no deadline
+			trace_timeout("none");
 			tp = NULL;
 		} else if (deadline == 0) {
-			// immediate deadline
+			// immediate deadline (zero ts is treated same as flag KEVENT_FLAG_IMMEDIATE)
+			trace_timeout("immediate");
 			tp = &ts;
 			ts.tv_sec = 0;
 			ts.tv_nsec = 0;
 		} else {
 			// specific deadline
+			//
+			// Note: kevent64 with a timeout is consistently 1ms late (Observed on macOS 12.5).
+			// If we use an absolute timer with NOTE_CRITICAL timeout becomes more accurate.
+			#ifdef TRACE_KQUEUE_TIMEOUT
+				now = DTimeNow();
+				trace_timeout("%.3fms (%.3fms leeway)\n",
+				              (double)DTimeBetween(deadline,now)/1000000.0,
+				              deadline_leeway == 0 ? 0.0 : (double)deadline_leeway/1000000.0);
+			#endif
 			DTimeDuration duration = DTimeUntil(deadline);
 			if (duration < 0)
 				duration = 0;
-			DTimeDurationTimespec(duration, &ts);
-			// Darwin returns EINVAL if the sleep time is too long
-			if (ts.tv_sec > 1000000)
-				ts.tv_sec = 1000000;
-			tp = &ts;
+			if (duration < 1*D_TIME_MICROSECOND) {
+				// Deadline is sooner than the practical precision (+ overhead of wakeup.)
+				// Immediate deadline.
+				trace_timeout("  deadline too soon; use to immediate timeout");
+				tp = &ts;
+				ts.tv_sec = 0;
+				ts.tv_nsec = 0;
+			} else if (deadline_leeway < 0 || deadline_leeway >= D_TIME_MILLISECOND) {
+				// leeway is unspecified (-1) or too large*;
+				// no need for a timer, just kevent timeout.
+				//
+				// * "too large": More work is needed in the runtime 'timers' implementation
+				// to support "true" (large) leeway. As it currently stands, the priority queue
+				// of timers is ordered by deadline ('when') without regard to leeway.
+				// If we have two timers (1000,1000) and (1001,1) the second timer with a 1 leeway
+				// may actually be late because of the first timer with leeway 1000.
+				// So for now, only communicate leeway when it's really small.
+				DTimeDurationTimespec(duration, &ts);
+				// Darwin returns EINVAL if the sleep time is too long
+				if (ts.tv_sec > 1000000)
+					ts.tv_sec = 1000000;
+				tp = &ts;
+			} else {
+				// use a timer to communicate leeway
+				tp = NULL;
+				struct timeval tv;
+				gettimeofday(&tv, NULL);
+				u64 deadline2 = (u64)tv.tv_sec*1000000000 + (u64)tv.tv_usec*1000;
+				deadline2 += (u64)duration;
+				req = (KEv){
+					.ident = (uintptr)&req,
+					.filter = EVFILT_TIMER,
+					.flags = EV_ADD | EV_ONESHOT,
+					.fflags = NOTE_ABSOLUTE | NOTE_NSECONDS
+					        | NOTE_MACH_CONTINUOUS_TIME | NOTE_LEEWAY,
+					.data = (i64)deadline2,
+					.ext = { 0, deadline_leeway },
+				};
+				if (deadline_leeway <= D_TIME_MILLISECOND)
+					req.fflags |= NOTE_CRITICAL;
+				reqc = 1;
+			}
 		}
 
 		// poll
-		int n = kevent64(iopoll->kq, NULL, 0, events, countof(events), flags, tp);
+		int n = kevent64(iopoll->kq, &req, reqc, events, countof(events), flags, tp);
+
+		#ifdef TRACE_KQUEUE_TIMEOUT
+			DTime now2 = DTimeNow();
+			trace("kevent64 returned after %.3fms\n", (double)(now2 - now) / 1000000.0);
+		#endif
 
 		// check for error
 		if UNLIKELY(n < 0) {
@@ -129,6 +195,9 @@ int iopoll_poll(IOPoll* iopoll, DTime deadline) {
 				      ev->fflags,
 				      ev->data);
 			#endif
+
+			if (ev->filter == EVFILT_TIMER)
+				continue;
 
 			// get IODesc passed along event in udata
 			IODesc* d = (IODesc*)(uintptr)ev->udata;
