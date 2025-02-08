@@ -113,9 +113,6 @@ static int do_call(lua_State* L, int narg, int nres) {
 #endif
 
 
-// #define ENABLE_SCHED
-
-
 static int pmain(lua_State* L) {
 	int argc = (int)lua_tointeger(L, 1);
 	char** argv = (char**)lua_touserdata(L, 2);
@@ -145,11 +142,7 @@ static int pmain(lua_State* L) {
 	lua_gc(L, LUA_GCRESTART);
 	lua_gc(L, LUA_GCGEN, 0, 0);  // ....
 
-	#ifdef ENABLE_SCHED
-		lua_State* L_co = lua_newthread(L);
-	#else
-		lua_State* L_co = L;
-	#endif
+	lua_State* L_co = L;
 
 	// load dew Lua script
 	#ifdef DEW_EMBED_SRC
@@ -174,32 +167,7 @@ static int pmain(lua_State* L) {
 	lua_remove(L_co, -nargs); /* remove table from the stack */
 
 	// run script
-
-	#ifdef ENABLE_SCHED
-	{
-		// adapted from do_pcall
-		int status;
-		int base = lua_gettop(L) - nargs;  /* function index */
-		lua_pushcfunction(L, msghandler); /* push message handler */
-		lua_insert(L, base);  /* put it under function and args */
-		g_L = L; /* for 'signal_handler' */
-		dew_setsignal(SIGINT, signal_handler); /* set C-signal handler */
-
-		int nresults;
-		for (;;) {
-			status = lua_resume(L_co, L, nargs, &nresults);
-			dlog("lua_resume => status=%d nresults=%d", status, nresults);
-			if (status != LUA_YIELD)
-				break;
-			nargs = 0;
-		}
-
-		dew_setsignal(SIGINT, SIG_DFL); /* reset C-signal handler */
-		lua_remove(L, base); /* remove message handler from the stack */
-	}
-	#else
-		status = do_pcall(L_co, nargs, LUA_MULTRET);
-	#endif
+	status = do_pcall(L_co, nargs, LUA_MULTRET);
 	if (status != LUA_OK) {
 		check_status(L_co, status);
 		dlog("returning early from check_status");

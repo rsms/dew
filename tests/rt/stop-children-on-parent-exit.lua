@@ -1,14 +1,14 @@
 -- Topic: Structured Concurrency.
 -- When a parent task exits, child tasks are stopped
 return function()
-	__rt.spawn(function()
+	__rt.spawn_task(function()
 		print("task A started; spawning task B & C")
-		__rt.spawn(function()
+		__rt.spawn_task(function()
 			print("task B started")
 			__rt.sleep(10*1000*1000)
 			print("task B exiting") -- will not get here
 		end)
-		__rt.spawn(function()
+		__rt.spawn_task(function()
 			print("task C started")
 			__rt.sleep(10*1000*1000)
 			print("task C exiting") -- will not get here

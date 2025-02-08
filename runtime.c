@@ -5,9 +5,63 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 
+#include <pthread.h> // TODO: move into platform_SYS.c
+#include <stdatomic.h> // TODO: move into platform_SYS.c
+
+
+#define TRACE_SCHED
+// #define TRACE_SCHED_RUNQ
+#define TRACE_SCHED_WORKER
+
+#ifdef TRACE_SCHED
+	#define trace_sched(fmt, ...) \
+		dlog("\e[1;34m%-15.15s S%-2u│\e[0m " fmt, __FUNCTION__, tls_s_id, ##__VA_ARGS__)
+#else
+	#define trace_sched(fmt, ...) ((void)0)
+#endif
+
+#ifdef TRACE_SCHED_RUNQ
+	#define trace_runq(fmt, ...) \
+		dlog("\e[1;35m%-15.15s S%-2u│\e[0m " fmt, __FUNCTION__, tls_s_id, ##__VA_ARGS__)
+#else
+	#define trace_runq(fmt, ...) ((void)0)
+#endif
+
+#ifdef TRACE_SCHED_WORKER
+	#define trace_worker(fmt, ...) ( \
+		tls_s_id && tls_w_id ? dlog("\e[1;32m%-15.15s W%-2u│\e[0m S%-2u " fmt, \
+		                            __FUNCTION__, tls_w_id, tls_s_id, ##__VA_ARGS__) : \
+		tls_w_id ?             dlog("\e[1;32m%-15.15s W%-2u│\e[0m " fmt, \
+		                            __FUNCTION__, tls_w_id, ##__VA_ARGS__) : \
+		                       dlog("\e[1;32m%-15.15s S%-2u│\e[0m " fmt, \
+		                            __FUNCTION__, tls_s_id, ##__VA_ARGS__) \
+	)
+#else
+	#define trace_worker(fmt, ...) ((void)0)
+#endif
+
+
 static_assert(sizeof(T) == LUA_EXTRASPACE, "");
 
 
+static u8 g_reftabkey;           // table where objects with compex lifetime are stored, to avoid GC
+static u8 g_iodesc_luatabkey;    // IODesc object prototype
+static u8 g_buf_luatabkey;       // Buf object prototype
+static u8 g_timerobj_luatabkey;  // Timer object prototype
+static u8 g_workerobj_luatabkey; // Worker object prototype
+
+// tls_s holds S for the current thread
+static _Thread_local S* tls_s = NULL;
+
+#if defined(TRACE_SCHED) || defined(TRACE_SCHED_RUNQ) || defined(TRACE_SCHED_WORKER)
+	static _Atomic(u32)      tls_s_idgen = 1;
+	static _Thread_local u32 tls_s_id = 0;
+#endif
+
+#if defined(TRACE_SCHED_WORKER)
+	static _Atomic(u32)      tls_w_idgen = 1;
+	static _Thread_local u32 tls_w_id = 0;
+#endif
 
 
 static const u8 g_intdectab[256] = { // decoding table, base 2-36
@@ -567,31 +621,6 @@ static int l_iowait(lua_State* L) {
 // ———————————————————————————————————————————————————————————————————————————————————————————
 
 
-#define TRACE_SCHED
-// #define TRACE_SCHED_RUNQ
-
-#ifdef TRACE_SCHED
-	#define trace_sched(fmt, ...) dlog("\e[1;34m%-15s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
-#else
-	#define trace_sched(fmt, ...) ((void)0)
-#endif
-
-#ifdef TRACE_SCHED_RUNQ
-	#define trace_runq(fmt, ...) dlog("\e[1;35m%-18s│\e[0m " fmt, __FUNCTION__, ##__VA_ARGS__)
-#else
-	#define trace_runq(fmt, ...) ((void)0)
-#endif
-
-
-static u8 g_reftabkey;          // table where objects with compex lifetime are stored, to avoid GC
-static u8 g_iodesc_luatabkey;   // IODesc object prototype
-static u8 g_buf_luatabkey;      // Buf object prototype
-static u8 g_timerobj_luatabkey; // Timer object prototype
-
-// tls_s holds S for the current thread
-static _Thread_local S* tls_s = NULL;
-
-
 static const char* l_status_str(int status) {
 	switch (status) {
 		case LUA_OK:        return "OK";
@@ -787,6 +816,37 @@ static void* nullable buf_reserve(Buf* buf, usize minavail) {
 }
 
 
+static bool buf_append(Buf* buf, const void* data, usize len) {
+	usize avail = buf->cap - buf->len;
+	if UNLIKELY(avail < len) {
+		usize newcap = buf->cap + (len - avail);
+		if (!buf_resize(buf, newcap))
+			return false;
+	}
+	memcpy(buf->bytes + buf->len, data, len);
+	buf->len += len;
+	return true;
+}
+
+
+static int buf_append_luafun_writer(lua_State* L, const void* data, usize len, void* ud) {
+	Buf* buf = ud;
+	bool ok = buf_append(buf, data, len);
+	if UNLIKELY(!ok)
+		dlog("buf_append(len=%zu) failed (OOM)", len);
+	return !ok;
+}
+
+
+static int buf_append_luafun(Buf* buf, lua_State* L, bool strip_debuginfo) {
+	if (!buf_reserve(buf, 512))
+		return -ENOMEM;
+	if (lua_dump(L, buf_append_luafun_writer, buf, strip_debuginfo))
+		return -EINVAL;
+	return 0;
+}
+
+
 static int l_buf_gc(lua_State* L) {
 	Buf* buf = lua_touserdata(L, 1);
 	return buf_free(buf);
@@ -821,7 +881,7 @@ static int l_buf_alloc(lua_State* L) {
 static int l_buf_resize(lua_State* L) {
 	Buf* buf = l_buf_check(L, 1);
 	i64 newcap = luaL_checkinteger(L, 2);
-	if UNLIKELY((USIZE_MAX < U64_MAX && newcap > (u64)USIZE_MAX) ||
+	if UNLIKELY((USIZE_MAX < U64_MAX && (u64)newcap > (u64)USIZE_MAX) ||
 	            newcap < 0 || (u64)newcap > 0x10000000000) // llvm asan has 1TiB limit
 	{
 		if (newcap < 0)
@@ -1556,14 +1616,67 @@ static void dlog_task_tree(const T* t, int level) {
 }
 
 
+// // t_gc is called by Lua's luaE_freethread when a task is GC'd, thus it must not be 'static'
+// __attribute__((visibility("hidden")))
+// void t_gc(lua_State* L, T* t) {
+// 	trace_sched(T_ID_F " GC", t_id(t));
+// }
+
+
+enum : u32 { TID_SMALL_MAX = (__typeof__(((T*)NULL)->tid_small))-1 };
+
+
+static bool s_tasks_add(S* s, T* t) {
+	u32 tid;
+	T** tp = (T**)pool_entry_alloc(&s->tasks, &tid, sizeof(T*));
+	if (tp != NULL) {
+		trace_sched("register task " T_ID_F " tid=%u pool.entry=%p", t_id(t), tid, tp);
+		if (tid > TID_SMALL_MAX)
+			tid = 0;
+		t->tid_small = tid;
+		*tp = t;
+	}
+	return tp != NULL;
+}
+
+
+static void s_tasks_remove(S* s, T* t) {
+	u32 tid = t->tid_small;
+	if UNLIKELY(tid == 0) {
+		// tid is larger than what fits in tid_small; scan for t in tasks.
+		// Skip the first TID_SMALL_MAX entries since we know that's not where t is.
+		assert(s->tasks->maxidx > TID_SMALL_MAX);
+		T** task_start = (T**)pool_entries(s->tasks);
+		T** task_end = task_start + s->tasks->maxidx;
+		for (T** taskp = task_start + TID_SMALL_MAX; taskp != task_end; taskp++) {
+			if (*taskp == t) {
+				tid = (u32)(uintptr)(taskp - task_start) + 1;
+				break;
+			}
+		}
+		if (tid == 0) {
+			dlog("warning: task " T_ID_F " not found in s.tasks", t_id(t));
+			return;
+		}
+	}
+	trace_sched("unregister task " T_ID_F " tid=%u", t_id(t), tid);
+	pool_entry_free(s->tasks, tid);
+}
+
+
 static void t_finalize(T* t, int status);
 
 
-static void t_stop(T* parent, T* child) {
-	trace_sched("stop " T_ID_F " by parent " T_ID_F, t_id(child), t_id(parent));
+static void t_stop(T* nullable parent, T* child) {
+	if (parent) {
+		trace_sched("stop " T_ID_F " by parent " T_ID_F, t_id(child), t_id(parent));
+	} else {
+		trace_sched("stop " T_ID_F, t_id(child));
+	}
 
 	// set status to DEAD _before_ calling lua_closethread to ensure that any to-be-closed
 	// variables with __close metamethods that call into our API are properly handled.
+	bool is_on_runq = child->status == TStatus_READY;
 	child->status = TStatus_DEAD;
 
 	// Shut down Lua "thread"
@@ -1577,14 +1690,21 @@ static void t_stop(T* parent, T* child) {
 	// Note: status will be OK in the common case and ERRRUN if an error occurred inside a
 	// to-be-closed variable with __close metamethods.
 	//
-	int status = lua_closethread(t_L(child), t_L(parent));
+	lua_State* parent_L;
+	if (parent) {
+		parent_L = t_L(parent);
+	} else {
+		parent_L = child->s->L;
+	}
+	int status = lua_closethread(t_L(child), parent_L);
 	if (status != LUA_OK) {
 		dlog("warning: lua_closethread => %s", l_status_str(status));
 		t_report_error(child, "Error in defer handler");
 	}
 
 	// remove from runq
-	s_runq_remove(child->s, child);
+	if (is_on_runq && !child->s->isclosed)
+		s_runq_remove(child->s, child);
 
 	// // finalize as "runtime error"
 	// lua_pushstring(t_L(child), "parent task exited");
@@ -1609,22 +1729,29 @@ static void t_finalize(T* t, int status) {
 	trace_sched(T_ID_F " exited (%s)", t_id(t), l_status_str(status));
 	if UNLIKELY(status != LUA_OK)
 		t_report_error(t, "Uncaught error");
-	t->s->nlive--;
 	t->status = TStatus_DEAD;
+	t->s->nlive--;
 
 	// dlog("task tree for " T_ID_F ":", t_id(t)); dlog_task_tree(t, 1);
-
-	// stop any still-running timers
-	if UNLIKELY(t->ntimers)
-		t_cancel_timers(t);
 
 	// stop child tasks
 	if (t->first_child)
 		t_stop_r(t, t->first_child);
 
-	// remove task from parent's list of children
-	if (t->parent)
-		t_remove_child(t->parent, t);
+	// clean up unless S is closing
+	if (!t->s->isclosed) {
+		// stop any still-running timers
+		if UNLIKELY(t->ntimers)
+			t_cancel_timers(t);
+
+		// remove task from parent's list of children
+		if (t->parent)
+			t_remove_child(t->parent, t);
+
+		// unregister T if S is tracking tasks
+		if (t->s->tasks)
+			s_tasks_remove(t->s, t);
+	}
 
 	// remove GC ref to allow task (Lua thread) to be garbage collected
 	lua_State* TL = t_L(t);
@@ -1711,10 +1838,16 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	t->status = TStatus_READY;
 	t->ntimers = 0;
 
+	// register task
+	if (s->tasks && UNLIKELY(!s_tasks_add(s, t))) {
+		lua_closethread(NL, L);
+		return l_errno_error(L, ENOMEM);
+	}
+
 	// setup t to be run next by schedule
 	if UNLIKELY(!s_runq_put_runnext(s, t)) {
 		lua_closethread(NL, L);
-		return luaL_error(L, "out of runq space (TODO: grow)");
+		return l_errno_error(L, ENOMEM);
 	}
 
 	// add t as a child of parent
@@ -1763,8 +1896,52 @@ int s_iopoll_wake(S* s, IODesc** dv, u32 count) {
 }
 
 
-static int s_shutdown(S* s) {
-	trace_sched("shutdown " S_ID_F, s_id(s));
+static void worker_release(Worker* w);
+static bool worker_close(Worker* w);
+
+
+static void s_shutdown(S* s) {
+	// note: this function is only called by other threads, never from "inside" S
+	if (atomic_exchange_explicit(&s->isclosed, true, memory_order_acq_rel) == false) {
+		trace_sched("interrupting iopoll");
+		iopoll_interrupt(&s->iopoll);
+	}
+}
+
+
+static void s_free(S* s) {
+	iopoll_dispose(&s->iopoll);
+	free(s->runq);
+	pool_free_pool(s->tasks);
+	array_free((struct Array*)&s->timers);
+}
+
+
+static void s_stop_tasks(S* s) {
+	for (u32 tid = s->tasks->maxidx; tid > 0 && s->nlive > 0; tid--) {
+		if (pool_entry_islive(s->tasks, tid)) {
+			T* t = *(T**)pool_entry(s->tasks, tid, sizeof(T*));
+			// dlog("stop " T_ID_F " status=%s", t_id(t),
+			//      t->status == TStatus_READY     ? "READY" :
+			//      t->status == TStatus_RUNNING   ? "RUNNING" :
+			//      t->status == TStatus_WAIT_IO   ? "WAIT_IO" :
+			//      t->status == TStatus_WAIT_RECV ? "WAIT_RECV" :
+			//      t->status == TStatus_DEAD      ? "DEAD" :
+			//      "?");
+			if (t->status != TStatus_DEAD)
+				t_stop(NULL, t);
+		}
+	}
+}
+
+
+static int s_finalize(S* s) {
+	trace_sched("finalize " S_ID_F, s_id(s));
+	atomic_store_explicit(&s->isclosed, true, memory_order_release);
+
+	// stop tasks
+	if (s->nlive && s->tasks)
+		s_stop_tasks(s);
 
 	// clear timers before GC to avoid costly (and useless) timers_remove
 	s->timers.len = 0;
@@ -1772,9 +1949,29 @@ static int s_shutdown(S* s) {
 	// run GC to ensure pending IODesc close before S goes away
 	lua_gc(s->L, LUA_GCCOLLECT);
 
-	iopoll_shutdown(&s->iopoll);
-	array_free((struct Array*)&s->timers);
+	// stop & wait for workers
+	if UNLIKELY(s->workers) {
+		trace_worker("shutting down workers");
+		for (Worker* w = s->workers; w;) {
+			Worker* next_w = w->next;
+			worker_close(w);
+			int err = pthread_join(w->thread, NULL);
+			if (err)
+				logwarn("failed to wait for worker thread=%p: %s", w->thread, strerror(err));
+			worker_release(w);
+			w = next_w;
+		}
+	}
+
+	trace_sched("finalized " S_ID_F, s_id(s));
+
+	// clear TLS entry to catch bugs
 	tls_s = NULL;
+	#if defined(TRACE_SCHED) || defined(TRACE_SCHED_RUNQ) || defined(TRACE_SCHED_WORKER)
+		tls_s_id = 0;
+	#endif
+
+	s_free(s);
 	return 0;
 }
 
@@ -1792,9 +1989,13 @@ static int s_find_runnable(S* s, T** tp) {
 		return 1;
 	}
 
-	// check if we ran out tasks (all tasks have exited)
-	if (s->nlive == 0) {
-		trace_sched("no more tasks; exiting scheduler loop");
+	// check if we ran out tasks (all have exited) or if S is closing down
+	if (s->nlive == 0 || atomic_load_explicit(&s->isclosed, memory_order_acquire)) {
+		if (atomic_load_explicit(&s->isclosed, memory_order_acquire)) {
+			trace_sched("scheduler shutting down; exiting scheduler loop");
+		} else {
+			trace_sched("no more tasks; exiting scheduler loop");
+		}
 		return 0;
 	}
 
@@ -1831,17 +2032,18 @@ static int s_find_runnable(S* s, T** tp) {
 }
 
 
-static int l_main(lua_State* L) {
-	if UNLIKELY(tls_s != NULL)
-		return luaL_error(L, "S already active");
-
-	// create scheduler for this OS thread & Lua context
-	S* s = &(S){
-		.L = L,
-	};
+__attribute__((always_inline))
+static int s_main(S* s) {
 	s->timers.v = s->timers_storage;
 	s->timers.cap = countof(s->timers_storage);
+
+	lua_State* L = s->L;
+	if UNLIKELY(tls_s != NULL)
+		return luaL_error(L, "S already active");
 	tls_s = s;
+	#if defined(TRACE_SCHED) || defined(TRACE_SCHED_RUNQ) || defined(TRACE_SCHED_WORKER)
+		tls_s_id = atomic_fetch_add(&tls_s_idgen, 1);
+	#endif
 
 	// allocate runq with inital space for (8 - 1) entries
 	if (!( s->runq = (RunQ*)fifo_alloc(8, sizeof(*s->runq)) ))
@@ -1851,6 +2053,7 @@ static int l_main(lua_State* L) {
 	int err = iopoll_init(&s->iopoll, s);
 	if (err) {
 		dlog("error: iopoll_init: %s", strerror(-err));
+		s_free(s);
 		return l_errno_error(L, -err);
 	}
 
@@ -1860,8 +2063,10 @@ static int l_main(lua_State* L) {
 
 	// create main task
 	int nres = s_spawntask(s, L, NULL);
-	if UNLIKELY(nres == 0) // error
+	if UNLIKELY(nres == 0) { // error
+		s_free(s);
 		return 0;
+	}
 
 	// discard thread from L's stack
 	lua_pop(L, 1);
@@ -1869,9 +2074,258 @@ static int l_main(lua_State* L) {
 	// scheduler loop: finds a runnable task and executes it.
 	// Stops when all tasks have finished (or an error occurred.)
 	T* t;
-	while (s_find_runnable(s, &t))
+	while (!s->isclosed && s_find_runnable(s, &t))
 		t_resume(t);
-	return s_shutdown(s);
+	return s_finalize(s);
+}
+
+
+static int l_main(lua_State* L) {
+	// create scheduler for this OS thread & Lua context
+	S* s = &(S){ .L = L };
+	return s_main(s);
+}
+
+
+// WorkerObj is a Lua-managed (GC'd) wrapper around a internally managed Worker.
+// This allows a timer to be referenced by userland independently of its state.
+typedef struct WorkerObj { Worker* w; } WorkerObj;
+
+// static WorkerObj* nullable l_workerobj_check(lua_State* L, int idx) {
+// 	return l_uobj_check(L, idx, &g_workerobj_luatabkey, "Worker");
+// }
+
+
+int luaopen_runtime(lua_State* L);
+
+
+static void worker_free(Worker* w) {
+	trace_worker("free");
+	free(w->mainfun_lcode);
+	free(w);
+}
+
+
+static void worker_retain(Worker* w) {
+	__attribute__((unused)) u8 nrefs =
+		atomic_fetch_add_explicit(&w->nrefs, 1, memory_order_acq_rel);
+	assert(nrefs < 0xff && "overflow");
+}
+
+
+static void worker_release(Worker* w) {
+	u8 nrefs = atomic_fetch_sub_explicit(&w->nrefs, 1, memory_order_acq_rel);
+	if (nrefs == 1)
+		worker_free(w);
+}
+
+
+static void s_workers_add(S* s, Worker* w) {
+	assert(w->next == NULL);
+	w->next = s->workers;
+	s->workers = w;
+	worker_retain(w);
+}
+
+
+static void s_workers_remove_r(Worker* find_w, Worker* prev_w, Worker* curr_w) {
+	if (curr_w == find_w) {
+		prev_w->next = curr_w->next;
+		curr_w->next = NULL;
+		worker_release(find_w);
+	} else {
+		s_workers_remove_r(find_w, curr_w, curr_w->next);
+	}
+}
+
+
+static void s_workers_remove(S* s, Worker* w) {
+	if (s->workers == w) {
+		// remove from head of list
+		s->workers = w->next;
+		w->next = NULL;
+		worker_release(w);
+	} else {
+		// remove from middle of list
+		s_workers_remove_r(w, s->workers, s->workers->next);
+	}
+}
+
+
+static int l_workerobj_gc(lua_State* L) {
+	WorkerObj* obj = lua_touserdata(L, 1);
+	trace_worker("GC");
+	worker_close(obj->w);
+	worker_release(obj->w);
+	return 0;
+}
+
+
+static const char* worker_load_reader(lua_State* L, void* ud, usize* lenp) {
+	Worker* w = ud;
+	*lenp = w->mainfun_lcode_len;
+	return w->mainfun_lcode;
+}
+
+
+// worker_cas_status attempts to set w->status to next_status.
+// Returns false if another thread set CLOSED "already" (it's a race.)
+static bool worker_cas_status(Worker* w, WorkerStatus next_status) {
+	WorkerStatus status = atomic_load_explicit(&w->status, memory_order_acquire);
+	for (;;) {
+		if (status == WorkerStatus_CLOSED)
+			return false;
+		if (atomic_compare_exchange_strong_explicit(
+				&w->status, &status, next_status,
+				memory_order_acq_rel, memory_order_relaxed))
+		{
+			return true;
+		}
+	}
+}
+
+
+static void worker_thread_exit(Worker** wp) {
+	Worker* w = *wp;
+	trace_worker("exit");
+	if (w->s.L)
+		lua_close(w->s.L);
+	atomic_store_explicit(&w->status, WorkerStatus_CLOSED, memory_order_release);
+	worker_release(w);
+}
+
+
+static void worker_thread(Worker* w) {
+	// setup thread cancelation handler and enable thread cancelation
+	static int cleanup_pop_arg = 0;
+	pthread_cleanup_push((void(*)(void*))worker_thread_exit, &w);
+
+	#if defined(TRACE_SCHED_WORKER)
+		tls_w_id = atomic_fetch_add(&tls_w_idgen, 1);
+		trace_worker("start worker thread=%p", w->thread);
+	#endif
+
+	// create a Lua environment for this thread
+	lua_State* L = luaL_newstate();
+	// enable task tracking (for graceful shutdown)
+	if UNLIKELY(!L || !pool_init(&w->s.tasks, /*cap*/3, sizeof(T*)))
+		return logerr("failed to allocate memory");
+	w->s.L = L;
+
+	// open libraries
+	luaL_openlibs(L);
+	luaL_requiref(L, "__rt", luaopen_runtime, 1);
+	lua_setglobal(L, "__rt");
+
+	// switch status to READY while checking if worker has been closed
+	if UNLIKELY(!worker_cas_status(w, WorkerStatus_READY))
+		return trace_worker("CLOSED before getting READY");
+
+	// actual work happens now
+	if (w->mainfun_lcode_len > 0) {
+		// disable thread cancelation to ensure graceful shutdown
+		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
+		// load Lua function from mainfun_lcode
+		int status = lua_load(L, worker_load_reader, (void*)w, "<worker>", "bt");
+
+		// free memory back to malloc so we don't hold on to it "forever"
+		free(w->mainfun_lcode);
+		w->mainfun_lcode = NULL;
+		w->mainfun_lcode_len = 0;
+
+		// check if load succeeded
+		if UNLIKELY(status != LUA_OK) {
+			trace_worker("failed to load worker function: %s", l_status_str(status));
+			dlog("failed to load worker function: %s", l_status_str(status));
+			return;
+		}
+		// Enter scheduler which will use the function on top of the stack as the main coroutine.
+		// We ignore the return value from s_main since we exit on return regardless.
+		s_main(&w->s);
+	} else {
+		// allow passing a w->f to be run here
+		dlog("TODO: worker function");
+	}
+
+	pthread_cleanup_pop(&cleanup_pop_arg);
+}
+
+
+static int worker_open(Worker** wp, void* nullable mainfun_lcode, u32 mainfun_lcode_len) {
+	Worker* w = calloc(1, sizeof(Worker));
+	if (!w)
+		return -ENOMEM;
+	w->status = WorkerStatus_OPEN;
+	w->nrefs = 2; // thread + caller
+	w->mainfun_lcode_len = mainfun_lcode_len;
+	w->mainfun_lcode = mainfun_lcode;
+	pthread_attr_t* thr_attr = NULL;
+	int err = pthread_create(&w->thread, thr_attr, (void*(*)(void*))worker_thread, w);
+	trace_sched("spawn worker thread=%p", w->thread);
+	if UNLIKELY(err) {
+		free(w);
+		return -err;
+	}
+	*wp = w;
+	return 0;
+}
+
+
+static bool worker_close(Worker* w) {
+	assert(pthread_self() != w->thread); // must not call from worker's own thread
+
+	if (!worker_cas_status(w, WorkerStatus_CLOSED)) {
+		// already closed
+		return false;
+	}
+
+	trace_worker("closing worker thread=%p", w->thread);
+
+	// signal to worker's scheduler that it's time to shut down
+	s_shutdown(&w->s);
+	pthread_cancel(w->thread);
+	return true;
+}
+
+
+static int l_spawn_worker(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	luaL_checktype(L, 1, LUA_TFUNCTION);
+
+	// serialize thread main function as Lua code, to be transferred to the thread
+	lua_settop(L, 1); // ensure function is on the top of the stack
+	Buf buf = {};
+	int err = buf_append_luafun(&buf, L, /*strip_debuginfo*/false);
+	if UNLIKELY(err) {
+		buf_free(&buf);
+		if (err == -EINVAL)
+			return luaL_error(L, "unable to serialize worker function");
+		return l_errno_error(L, -err);
+	}
+
+	// start a worker
+	Worker* w;
+	if UNLIKELY(( err = worker_open(&w, buf.bytes, buf.len) )) {
+		buf_free(&buf);
+		return l_errno_error(L, -err);
+	}
+
+	// add worker to S's list of live workers
+	s_workers_add(t->s, w);
+
+	// allocate & return Worker object so that we know when the user is done with it (GC)
+	WorkerObj* obj = lua_newuserdatauv(L, sizeof(Worker), 0);
+	if UNLIKELY(!obj) {
+		worker_close(w);
+		worker_release(w);
+		return 0;
+	}
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_workerobj_luatabkey);
+	lua_setmetatable(L, -2);
+	obj->w = w;
+
+	return 1;
 }
 
 
@@ -1882,7 +2336,7 @@ static int l_yield(lua_State* L) {
 }
 
 
-static int l_spawn(lua_State* L) {
+static int l_spawn_task(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 
 	t->resume_nres = s_spawntask(t->s, L, t);
@@ -2102,7 +2556,8 @@ static const luaL_Reg dew_lib[] = {
 
 	// "new" runtime API
 	{"main", l_main},
-	{"spawn", l_spawn},
+	{"spawn_task", l_spawn_task},
+	{"spawn_worker", l_spawn_worker},
 	{"yield", l_yield},
 	{"sleep", l_sleep},
 	{"socket", l_socket},
@@ -2152,6 +2607,12 @@ int luaopen_runtime(lua_State* L) {
 	lua_pushcfunction(L, l_timerobj_gc);
 	lua_setfield(L, -2, "__gc");
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_timerobj_luatabkey);
+
+	// Worker
+	luaL_newmetatable(L, "Worker");
+	lua_pushcfunction(L, l_workerobj_gc);
+	lua_setfield(L, -2, "__gc");
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_workerobj_luatabkey);
 
 	// export libc & syscall constants
 	#define _(NAME) \

@@ -1,26 +1,32 @@
 #pragma once
 #include "dew.h"
+
+#if defined(__linux__) || defined(__APPLE__)
+	#include <pthread.h>
+	typedef pthread_t OSThread;
+#endif
+
 API_BEGIN
 
-typedef struct S S; // scheduler (M+P in Go lingo)
-typedef struct T T; // task
-
-// growable array usable via buf_* Lua functions
-typedef struct Buf {
-	usize cap, len;
-	u8* nullable bytes;
-} Buf;
-
-// platform specific I/O facility
-typedef struct IOPoll     IOPoll;     // facility
+typedef struct S          S;          // scheduler (M+P in Go lingo)
+typedef struct T          T;          // task
+typedef struct Worker     Worker;     // CPU-specific instance of S
+typedef struct IOPoll     IOPoll;     // platform specific I/O facility
 typedef struct IOPollDesc IOPollDesc; // descriptor (state used for I/O requests)
-typedef struct IODesc     IODesc; // wraps a file descriptor, used by iopoll
+typedef struct IODesc     IODesc;     // wraps a file descriptor, used by iopoll
+typedef struct Buf        Buf;        // growable array usable via buf_* Lua functions
 typedef struct Timer      Timer;
-typedef struct TimerInfo  TimerInfo; // cache friendly 'timers' array entry
+typedef struct TimerInfo  TimerInfo;  // cache friendly 'timers' array entry
 typedef struct FIFO       FIFO;
 typedef struct RunQ       RunQ;
 typedef struct Inbox      Inbox;
 typedef struct InboxMsg   InboxMsg;
+
+
+struct Buf {
+	usize cap, len;
+	u8* nullable bytes;
+};
 
 struct IOPoll {
 	S* s;
@@ -97,27 +103,51 @@ struct T {
 	Inbox* nullable inbox;        // list of inbox messages
 	int             resume_nres;  // number of results on stack, to be returned via resume
 	TStatus         status;       // TStatus_ constant
-	u8              _unused;
+	u8              tid_small;    // low-numbered idx in s->tasks (if tracked) 0=scan
 	u16             ntimers;      // number of live timers
 	// rest of struct is a lua_State struct
-	// Note: With Lua 5.4, the total size of T + lua_State is 248 B
+	// Note: With Lua 5.4, the total size of T + lua_State is 248 B on 64-bit arch
 };
 
 struct S {
 	lua_State* L;      // base Lua environment
 	IOPoll     iopoll; // platform-specific I/O facility
 
-	u32 nlive; // number of live tasks
+	_Atomic(bool) isclosed; // true when the parent worker is shutting down
 
-	// runq is a queue of tasks (TIDs) ready to run; a circular buffer.
-	// (We could get fancy with a red-black tree a la Linux kernel. Let's keep it simple for now.)
-	// runnext is a TID (>0) if a task is to be run immediately, skipping runq.
-	RunQ*       runq;
-	T* nullable runnext;
+	Pool* nullable tasks; // all currently live tasks (tracked if non-NULL)
+	u32            nlive; // number of live tasks (always tracked)
 
-	// timers
-	TimerPQ   timers; // priority queue (heap) of TimerInfo entries
-	TimerInfo timers_storage[8];
+	RunQ*       runq;    // queue of tasks ready to run; a circular buffer
+	T* nullable runnext; // task to be run immediately, skipping runq
+
+	TimerPQ   timers;            // priority queue (heap) of TimerInfo entries
+	TimerInfo timers_storage[8]; // initial storage for 'timers' array
+
+	// workers spawned by this S
+	Worker* nullable workers; // list
+};
+
+typedef enum WorkerStatus : u8 {
+	WorkerStatus_CLOSED,
+	WorkerStatus_OPEN,
+	WorkerStatus_READY,
+} WorkerStatus;
+
+struct Worker {
+	// state accessed only by parent thread
+	Worker* nullable next; // list link in S.workers
+
+	// state accessed by both parent thread and worker thread
+	OSThread    thread;
+	_Atomic(u8) status;
+	_Atomic(u8) nrefs;
+
+	// mainfun_lcode contains Lua bytecode for the main function
+	u32            mainfun_lcode_len; // number of bytes at mainfun_lcode
+	void* nullable mainfun_lcode;     // Worker owns this memory, free'd by worker_free
+
+	S s;
 };
 
 
@@ -137,7 +167,8 @@ inline static T* L_t(lua_State* L) { return (void*)L - sizeof(T); }
 
 
 int iopoll_init(IOPoll* iopoll, S* s);
-void iopoll_shutdown(IOPoll* iopoll);
+void iopoll_dispose(IOPoll* iopoll);
+int iopoll_interrupt(IOPoll* iopoll); // -errno on error
 int iopoll_poll(IOPoll* iopoll, DTime deadline, DTimeDuration deadline_leeway);
 int iopoll_open(IOPoll* iopoll, IODesc* d);
 int iopoll_close(IOPoll* iopoll, IODesc* d);

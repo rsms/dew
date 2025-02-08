@@ -46,17 +46,81 @@ typedef struct kevent64_s KEv;
 
 
 int iopoll_init(IOPoll* iopoll, S* s) {
+	iopoll->s = s;
 	iopoll->kq = kqueue();
 	if UNLIKELY(iopoll->kq == -1)
 		return -errno;
-	iopoll->s = s;
+
+	// setup event used by iopoll_interrupt
+	// TODO: consider doing this in the first kevent64 syscall in iopoll_poll instead.
+	// On my 2021 M1 MacBook kevent64 takes a total of 750ns, so no biggie.
+	KEv req = {
+		.ident = (uintptr)iopoll,
+  		.filter = EVFILT_USER,
+  		.flags = EV_ADD | EV_CLEAR,
+	};
+	int err = kevent64(iopoll->kq, &req, 1, NULL, 0, 0, NULL);
+	if UNLIKELY(err < 0) {
+		dlog("kevent64 failed to setup EVFILT_USER");
+		close(iopoll->kq);
+		return err;
+	}
+
 	return 0;
 }
 
 
-void iopoll_shutdown(IOPoll* iopoll) {
+void iopoll_dispose(IOPoll* iopoll) {
 	close(iopoll->kq);
 }
+
+
+int iopoll_interrupt(IOPoll* iopoll) {
+	// Note: S guarantees that this function is only called exactly once
+	KEv req = {
+		.ident = (uintptr)iopoll,
+  		.filter = EVFILT_USER,
+  		.fflags = NOTE_TRIGGER,
+	};
+	int err = kevent64(iopoll->kq, &req, 1, NULL, 0, 0, NULL);
+	if UNLIKELY(err < 0) {
+		dlog("kevent64 failed to setup EVFILT_USER");
+		close(iopoll->kq);
+		return err;
+	}
+	return 0;
+}
+
+
+#ifdef TRACE_KQUEUE
+	static void trace_kevent(const KEv* ev) {
+		char flagstr[128] = {0};
+		if (ev->flags&EV_ADD) strcat(flagstr, "|ADD");
+		if (ev->flags&EV_DELETE) strcat(flagstr, "|DELETE");
+		if (ev->flags&EV_ENABLE) strcat(flagstr, "|ENABLE");
+		if (ev->flags&EV_DISABLE) strcat(flagstr, "|DISABLE");
+		if (ev->flags&EV_ONESHOT) strcat(flagstr, "|ONESHOT");
+		if (ev->flags&EV_CLEAR) strcat(flagstr, "|CLEAR");
+		if (ev->flags&EV_RECEIPT) strcat(flagstr, "|RECEIPT");
+		if (ev->flags&EV_DISPATCH) strcat(flagstr, "|DISPATCH");
+		if (ev->flags&EV_UDATA_SPECIFIC) strcat(flagstr, "|UDATA_SPECIFIC");
+		if (ev->flags&EV_VANISHED) strcat(flagstr, "|VANISHED");
+		if (ev->flags&EV_SYSFLAGS) strcat(flagstr, "|SYSFLAGS");
+		if (ev->flags&EV_FLAG0) strcat(flagstr, "|FLAG0");
+		if (ev->flags&EV_FLAG1) strcat(flagstr, "|FLAG1");
+		if (ev->flags&EV_EOF) strcat(flagstr, "|EOF");
+		if (ev->flags&EV_ERROR) strcat(flagstr, "|ERROR");
+		if (*flagstr) *flagstr = ' ';
+		trace("kev> %llu %s (flags 0x%04x%s) (fflags 0x%08x) (data 0x%llx)",
+		      ev->ident,
+		      kev_filter_str(ev->filter),
+		      ev->flags, flagstr,
+		      ev->fflags,
+		      ev->data);
+	}
+#else
+	#define trace_kevent(ev) ((void)0)
+#endif
 
 
 int iopoll_poll(IOPoll* iopoll, DTime deadline, DTimeDuration deadline_leeway) {
@@ -170,32 +234,15 @@ int iopoll_poll(IOPoll* iopoll, DTime deadline, DTimeDuration deadline_leeway) {
 			KEv* ev = &events[i];
 
 			// trace event information
-			#ifdef TRACE_KQUEUE
-				char flagstr[128] = {0};
-				if (ev->flags&EV_ADD) strcat(flagstr, "|ADD");
-				if (ev->flags&EV_DELETE) strcat(flagstr, "|DELETE");
-				if (ev->flags&EV_ENABLE) strcat(flagstr, "|ENABLE");
-				if (ev->flags&EV_DISABLE) strcat(flagstr, "|DISABLE");
-				if (ev->flags&EV_ONESHOT) strcat(flagstr, "|ONESHOT");
-				if (ev->flags&EV_CLEAR) strcat(flagstr, "|CLEAR");
-				if (ev->flags&EV_RECEIPT) strcat(flagstr, "|RECEIPT");
-				if (ev->flags&EV_DISPATCH) strcat(flagstr, "|DISPATCH");
-				if (ev->flags&EV_UDATA_SPECIFIC) strcat(flagstr, "|UDATA_SPECIFIC");
-				if (ev->flags&EV_VANISHED) strcat(flagstr, "|VANISHED");
-				if (ev->flags&EV_SYSFLAGS) strcat(flagstr, "|SYSFLAGS");
-				if (ev->flags&EV_FLAG0) strcat(flagstr, "|FLAG0");
-				if (ev->flags&EV_FLAG1) strcat(flagstr, "|FLAG1");
-				if (ev->flags&EV_EOF) strcat(flagstr, "|EOF");
-				if (ev->flags&EV_ERROR) strcat(flagstr, "|ERROR");
-				if (*flagstr) *flagstr = ' ';
-				trace("kev> %llu %s (flags 0x%04x%s) (fflags 0x%08x) (data 0x%llx)",
-				      ev->ident,
-				      kev_filter_str(ev->filter),
-				      ev->flags, flagstr,
-				      ev->fflags,
-				      ev->data);
-			#endif
+			trace_kevent(ev);
 
+			// check if iopoll_interrupt was called
+			if (ev->filter == EVFILT_USER) {
+				trace("interruped");
+				break;
+			}
+
+			// nothing to do for TIMER events as they are only used for precise poll timeout
 			if (ev->filter == EVFILT_TIMER)
 				continue;
 

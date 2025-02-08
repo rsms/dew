@@ -3,7 +3,7 @@ return function()
 	-- at a certain point in time
 	local wait_until = __rt.time() + 500000000
 	local timer1 = __rt.timer_start(wait_until, 0, 0)
-	__rt.spawn(function()
+	__rt.spawn_task(function()
 		do
 			local start = __rt.time()
 			local timer = __rt.timer_start(start + 10000000, 0, 0)

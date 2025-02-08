@@ -153,7 +153,7 @@ typedef double    float64;
 #define IDIV_CEIL_X(x, divisor) \
 	( ( (x) + (__typeof__(x))(divisor) - 1 ) / (__typeof__(x))(divisor) )
 
-// int dew_clz(ANYUINT x) counts leading zeroes in x,
+// int dew_clz(ANYINT x) counts leading zeroes in x,
 // starting at the most significant bit position.
 // If x is 0, the result is undefined.
 #define dew_clz(x) ( \
@@ -165,6 +165,27 @@ typedef double    float64;
 		long long:  __builtin_clzll, unsigned long long:   __builtin_clzll \
 	)(x) - ( 32 - MIN_X(4, (int)sizeof(__typeof__(x)))*8 ) \
 )
+
+// int dew_ctz(ANYINT x) counts the number of trailing 0-bits in x,
+// starting at the least significant bit position.
+// If x is 0, the result is undefined.
+#define dew_ctz(x) _Generic((x), \
+	i8:   __builtin_ctz,   u8:    __builtin_ctz, \
+	i16:  __builtin_ctz,   u16:   __builtin_ctz, \
+	i32:  __builtin_ctz,   u32:   __builtin_ctz, \
+	long: __builtin_ctzl,  unsigned long: __builtin_ctzl, \
+	long long:  __builtin_ctzll, unsigned long long:   __builtin_ctzll \
+)(x)
+
+// int dew_ffs(ANYINT x) returns one plus the index of the least significant 1-bit of x,
+// or if x is zero, returns zero. ("Find First Set bit")
+#define dew_ffs(x) _Generic((x), \
+	i8:   __builtin_ffs,   u8:    __builtin_ffs, \
+	i16:  __builtin_ffs,   u16:   __builtin_ffs, \
+	i32:  __builtin_ffs,   u32:   __builtin_ffs, \
+	long: __builtin_ffsl,  unsigned long: __builtin_ffsl, \
+	long long:  __builtin_ffsll, unsigned long long:   __builtin_ffsll \
+)(x)
 
 // int dew_fls(ANYINT n) finds the Find Last Set bit
 // (last = most-significant)
@@ -296,13 +317,44 @@ i64 DTimeDurationNanoseconds(DTimeDuration d);
 
 struct Array { u32 cap, len; void* nullable v; };
 #define Array(T) struct { u32 cap, len; T* nullable v; }
+void array_free(struct Array* a); // respects embedded a->v
 void* nullable _array_reserve(struct Array* a, u32 elemsize, u32 minavail);
 inline static void* nullable array_reserve(struct Array* a, u32 elemsize, u32 minavail) {
 	return LIKELY(minavail <= a->cap - a->len) ? a->v + (usize)a->len*(usize)elemsize :
 	       _array_reserve(a, elemsize, minavail);
 }
 bool array_append(struct Array* a, u32 elemsize, const void* elemv, u32 elemc);
-void array_free(struct Array* a); // respects embedded a->v
+
+
+// Pool manages homogenous chunks of memory identified by indices rather than pointers.
+// Think "file descriptor" rather than virtual-memory address.
+// pool_alloc will allocate the first (smallest index) entry.
+typedef struct Pool {
+	u32 cap;      // capacity of the entries array (also max possible tid)
+	u32 maxidx;   // max allocated index
+	u64 freebm[]; // bitmap; bit=1 means entries[bit] is free
+	// TYPE entries[];
+} Pool;
+bool pool_init(Pool** pp, u32 cap, usize elemsize);
+inline static void pool_free_pool(Pool* nullable p) { free(p); }
+void* nullable pool_entry_alloc(Pool** pp, u32* idxp, usize elemsize);
+void pool_entry_free(Pool* p, u32 idx);
+inline static bool pool_entry_islive(const Pool* p, u32 idx) {
+	u32 chunk_idx = (idx - 1) / (sizeof(*p->freebm)*8);
+	u32 bit_idx = (idx - 1) % (sizeof(*p->freebm)*8);
+	return idx > 0 && idx <= p->maxidx &&
+	       (p->freebm[chunk_idx] & ((__typeof__(*p->freebm))1 << bit_idx)) == 0;
+}
+inline static usize pool_freebm_chunks(const Pool* p) {
+	return IDIV_CEIL(p->cap, sizeof(*p->freebm)*8);
+}
+inline static void* pool_entries(const Pool* p) {
+	return (void*)p->freebm + sizeof(*p->freebm)*pool_freebm_chunks(p);
+}
+inline static void* pool_entry(const Pool* p, u32 idx, usize elemsize) {
+	assert(idx > 0 && idx <= p->maxidx);
+	return pool_entries(p) + (idx-1)*elemsize;
+}
 
 
 API_END
