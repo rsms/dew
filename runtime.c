@@ -970,9 +970,26 @@ static int l_recv_cont(lua_State* L, int ltstatus, void* arg) {
 }
 
 
-// fun recv() (what, sender int, data any)
+// fun recv(from... Task|Worker) (what, sender int, data any)
+// If no 'from' is specified, receive from anyone
 static int l_recv(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
+
+	// check arguments
+	int argc = lua_gettop(L);
+	for (int i = 1; i <= argc; i++) {
+		if (lua_isthread(L, i)) {
+			lua_State* arg_L = lua_tothread(L, i);
+			T* arg_task = L_t(arg_L);
+			if UNLIKELY(arg_task->s == NULL) {
+				dlog("arg[%u] = coroutine", i);
+			} else {
+				dlog("arg[%u] = " T_ID_F, i, t_id(arg_task));
+			}
+		}
+	}
+
+
 	if (t->inbox) {
 		InboxMsg* msg = inbox_pop(t->inbox);
 		if (msg) {
@@ -1919,7 +1936,7 @@ static void s_free(S* s) {
 
 static void s_stop_tasks(S* s) {
 	for (u32 tid = s->tasks->maxidx; tid > 0 && s->nlive > 0; tid--) {
-		if (pool_entry_islive(s->tasks, tid)) {
+		if (!pool_entry_isfree(s->tasks, tid)) {
 			T* t = *(T**)pool_entry(s->tasks, tid, sizeof(T*));
 			// dlog("stop " T_ID_F " status=%s", t_id(t),
 			//      t->status == TStatus_READY     ? "READY" :

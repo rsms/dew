@@ -187,6 +187,7 @@ end
 -- __rt.main(require("tests/rt/deadlock"))
 -- __rt.main(require("tests/rt/socket-read"))
 __rt.main(require("tests/rt/worker"))
+-- __rt.main(require("tests/rt/await-task"))
 -- __rt.main(function()
 -- 	local A = __rt.spawn_task(function()
 -- 		print("A")

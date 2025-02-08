@@ -110,8 +110,8 @@ struct T {
 };
 
 struct S {
-	lua_State* L;      // base Lua environment
-	IOPoll     iopoll; // platform-specific I/O facility
+	lua_State*  L;      // base Lua environment
+	IOPoll      iopoll; // platform-specific I/O facility
 
 	_Atomic(bool) isclosed; // true when the parent worker is shutting down
 

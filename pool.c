@@ -1,103 +1,77 @@
 #include "dew.h"
 
 
-typedef __typeof__(((Pool*)NULL)->freebm[0]) BitChunk;
-enum { CHUNKBITS = sizeof(BitChunk)*8 };
-
-
 static bool pool_grow(Pool** pp, u32 newcap, usize elemsize) {
 	Pool* p = *pp;
+	u32 oldcap = 0;
 
-	// TODO: This growth heuristic can be improved to align up to cache lines or page sizes.
-	// Currently growth often looks like this:
-	//   pool_grow (cap 256 -> 512) total 4164 B (entries 4096 B, freebm 64 B)
-	//
-
+	// if p is not empty, newcap is current capacity + one extra chunk
 	if (p && p->cap > 0) {
-		if (check_mul_overflow(p->cap, 2u, &newcap)) {
-			if (p->cap == U32_MAX)
-				return false;
-			newcap = p->cap + 1;
-		}
+		oldcap = p->cap;
+		if (check_add_overflow(oldcap, 64u, &newcap))
+			return false;
 	}
 
-	usize newsize;
-	usize newsize_1, newsize_2;
-	usize newnfreebm = IDIV_CEIL((usize)newcap, CHUNKBITS);
-	if (check_mul_overflow(elemsize, (usize)newcap, &newsize_1) ||
-	    check_mul_overflow(sizeof(BitChunk), newnfreebm, &newsize_2) ||
-	    check_add_overflow(newsize_1, newsize_2, &newsize) ||
-	    check_add_overflow(sizeof(Pool), newsize, &newsize) )
+	// calculate new size, checking for overflow
+	usize newentsize;
+	usize newsize = sizeof(Pool) + ((usize)newcap >> 3); // newcap>>3 == newcap/sizeof(u64)
+	if (check_mul_overflow(elemsize, (usize)newcap, &newentsize) ||
+	    check_add_overflow(newentsize, newsize, &newsize) )
 	{
 		return false;
 	}
 
-	// dlog("pool_grow (cap %u -> %u) total %zu B (entries %zu B, freebm %zu B)",
-	//      p ? p->cap : 0, newcap, newsize, newsize_1, newsize_2);
+	dlog("pool_grow (cap %u -> %u) total %zu B (entries %zu B, freebm %u B)",
+	     oldcap, newcap, newsize, newentsize, newcap/(u32)sizeof(u64));
 
-	if (p == NULL) {
-		p = malloc(newsize);
-		if UNLIKELY(!p) {
-			dlog("malloc failed");
-			return false;
-		}
-		*pp = p;
+	// attempt to resize allocation
+	Pool* newp = realloc(p, newsize);
+	if UNLIKELY(!newp)
+		return false;
+	p = newp;
+	p->cap = newcap;
+	*pp = p;
+
+	if (oldcap == 0) {
+		// new allocation; set all freebm chunks' bits to 1 (all slots are free)
 		p->maxidx = 0;
-		memset(p->freebm, 0xff, newnfreebm*sizeof(BitChunk));
+		memset(p->freebm, 0xff, (usize)newcap >> 3);
 	} else {
-		usize oldcap = p->cap;
-		usize oldnfreebm = IDIV_CEIL(oldcap, CHUNKBITS);
-		Pool* newp = realloc(p, newsize);
-		if UNLIKELY(!newp) {
-			dlog("realloc failed");
-			return false;
-		}
-		*pp = newp;
-		p = newp;
-		if (newnfreebm > oldnfreebm) {
-			// new freebm will overlap with existing entries
-			usize extra_freebm_size = (newnfreebm - oldnfreebm) * sizeof(BitChunk);
-			// move up entries to make room for extended freebm
-			memmove(p->freebm + newnfreebm, p->freebm + oldnfreebm, p->maxidx * elemsize);
-			// set all bits to 1 of new freebm slots (1 bit = "free")
-			memset(&newp->freebm[oldnfreebm], 0xff, extra_freebm_size);
-		}
+		// new freebm overlap with existing entries, so we need to move the entries up
+		// before we set all bits to 1 in the new freebm chunk
+		void* oldfreebm = (void*)p->freebm + ((usize)oldcap >> 3);
+		void* newfreebm = (void*)p->freebm + ((usize)newcap >> 3);
+		memmove(newfreebm, oldfreebm, p->maxidx * elemsize);
+		*(u64*)oldfreebm = ~(u64)0; // set all bits to 1 (all slots are free);
 	}
 
-	p->cap = newcap;
 	return true;
 }
 
 
 bool pool_init(Pool** pp, u32 cap, usize elemsize) {
 	*pp = NULL;
-	return pool_grow(pp, cap, elemsize);
+	u32 aligned_cap = ALIGN2(cap, 64);
+	if (aligned_cap < cap) // overflow; cap too large
+		return false;
+	return pool_grow(pp, aligned_cap, elemsize);
 }
 
 
 void* nullable pool_entry_alloc(Pool** pp, u32* idxp, usize elemsize) {
 	Pool* p;
-	u32 nchunks;
-
 	if UNLIKELY(*pp == NULL)
 		goto grow;
-
 again:
 	p = *pp;
-	nchunks = pool_freebm_chunks(p);
-	for (u32 chunk_idx = 0; chunk_idx < nchunks; chunk_idx++) {
-		BitChunk bm = p->freebm[chunk_idx];
-
-		// ffs effectively returns the lowest free buffer id, if any, in this chunk
-		u32 bit_idx = dew_ffs(bm);
-
-		// note: we don't do bit_idx-1 since idx is 1 based, not 0 based
-		u32 idx = chunk_idx*CHUNKBITS + bit_idx;
-
-		if (bit_idx && idx <= p->cap) {
+	for (u32 chunk_idx = 0, nchunks = p->cap>>6; chunk_idx < nchunks; chunk_idx++) {
+		u64 bm = p->freebm[chunk_idx];
+		u32 bit_idx = dew_ffs(bm); // find first free buffer id (if any) in this chunk
+		if (bit_idx) {
 			// found a free block; mark it as used by setting bit (bit_idx-1) to 0
+			u32 idx = chunk_idx*64 + bit_idx; // note: idx is 1-based, not 0-based
 			// dlog(">>> allocate bit %u in chunk %u (idx = %u)", bit_idx-1, chunk_idx, idx);
-			p->freebm[chunk_idx] = bm & ~((BitChunk)1 << (bit_idx - 1));
+			p->freebm[chunk_idx] = bm & ~((u64)1 << (bit_idx - 1));
 			*idxp = idx;
 			if (idx > p->maxidx)
 				p->maxidx = idx;
@@ -106,40 +80,117 @@ again:
 		// all blocks of this chunk are in use; try next chunk
 	}
 	// all chunks were occupied; grow pool
-
 grow:
-	if (!pool_grow(pp, 32, elemsize))
+	if (!pool_grow(pp, 64, elemsize))
 		return NULL;
 	goto again;
 }
 
 
 void pool_entry_free(Pool* p, u32 idx) {
-	assert(pool_entry_islive(p, idx));
+	u32 chunk_idx = (idx - 1) >> 6; // (idx-1)/64
+	u32 bit_idx = (idx - 1) & (64 - 1); // (idx-1)%64
 
-	u32 chunk_idx = (idx - 1) / CHUNKBITS;
-	u32 bit_idx = (idx - 1) % CHUNKBITS;
-	// dlog(">>> recycle bit %u in chunk %u (idx = %u)", bit_idx, chunk_idx, idx);
-	p->freebm[chunk_idx] |= ((BitChunk)1 << bit_idx);
+	// assert that this index is valid and that the slot is marked as occupied
+	assert(idx > 0 && idx <= p->cap);
+	assert((p->freebm[chunk_idx] & ((u64)1 << bit_idx)) == 0);
 
-	if (idx == p->maxidx)
-		// TODO: if it would benefit the common case, we could scan backwards for the first
-		// occupied (0 bit) slot and set maxidx correctly. Can use __builtin_ctz for this.
-		p->maxidx--;
+	p->freebm[chunk_idx] |= (u64)1 << bit_idx;
+
+	if (idx != p->maxidx)
+		return;
+
+	// maxidx was freed.
+	// We have three options in this scenario:
+
+	// 1. Do nothing else and leave maxidx as is.
+	//    Unless the free call pattern is "perfect", maxidx will often not be true.
+	//    We will waste time if we do a lot of operations that are bound by maxidx.
+	#if 0
+	p->maxidx--;
+	#endif
+
+	// 2. Scan for the actual maxidx.
+	//    This means looking through every bit of every chunk below current maxidx
+	//    until we find a 0 bit. This can be quite time intensive but is 100% accurate.
+	//    Good if we spend most of our time on operations that are bound by maxidx.
+	#if 1
+	for (;;) {
+		u64 chunk = p->freebm[chunk_idx];
+		if (chunk == 0) {
+			// chunk is full and next chunk is empty
+			p->maxidx = (chunk_idx + 1) << 6;
+			break;
+		} else if (chunk != ~(u64)0) {
+			// chunk has at least one 0 bit.
+			// Find first 0 bit by first flipping all bits with xor,
+			// then use ffs to find the first 1 bit.
+			p->maxidx = dew_ffs(chunk ^ ~(u64)0);
+			break;
+		} else {
+			// chunk is completely free
+			if (chunk_idx == 0) {
+				p->maxidx = 0;
+				break;
+			}
+			chunk_idx--;
+		}
+	}
+	#endif
+
+	// 3. Something in between: scan for entire free bit chunks.
+	//    Balanced trade off between accuracy and speed.
+	#if 0
+	p->maxidx--;
+	while (p->freebm[chunk_idx] == ~(u64)0) {
+		p->maxidx = chunk_idx << 6;
+		dlog("free chunk %u, setting maxidx %u", chunk_idx, p->maxidx);
+		if (chunk_idx == 0)
+			break;
+		chunk_idx--;
+	}
+	#endif
+}
+
+
+u32 _pool_find_entry(const Pool* p, const void* entry_ptr, usize elemsize) {
+	for (u32 idx = p->maxidx; idx > 0; idx--) {
+		if (!pool_entry_isfree(p, idx)) {
+			void* entp = pool_entry(p, idx, elemsize);
+			if (memcmp(entp, entry_ptr, elemsize) == 0)
+				return idx;
+		}
+	}
+	return 0;
+}
+
+u32 _pool_find_entry_ptr(const Pool* p, const void* entry_val) {
+	for (u32 idx = p->maxidx; idx > 0; idx--) {
+		if (!pool_entry_isfree(p, idx)) {
+			void** entp = (void**)pool_entry(p, idx, sizeof(entry_val));
+			if (*entp == entry_val)
+				return idx;
+		}
+	}
+	return 0;
 }
 
 
 #ifdef DEBUG
 __attribute__((constructor)) static void pool_test() {
 	Pool* p;
-	bool ok = pool_init(&p, /*cap*/3, sizeof(u64)); assert(ok);
+	bool ok = pool_init(&p, /*cap*/3, 8); assert(ok);
 
 	u32 N = 200;
+
+	// verify that all slots are free
+	for (u32 idx = 1; idx <= p->cap; idx++)
+		assert(pool_entry_isfree(p, idx));
 
 	// allocate dense range
 	for (u32 idx = 1; idx <= N; idx++) {
 		u32 idx2;
-		u64* vp = pool_entry_alloc(&p, &idx2, sizeof(u64));
+		u64* vp = pool_entry_alloc(&p, &idx2, 8);
 		assert(vp);
 		assert(idx == idx2); // expect dense sequential index
 		*vp = idx;
@@ -148,8 +199,8 @@ __attribute__((constructor)) static void pool_test() {
 
 	// verify
 	for (u32 idx = 1; idx <= N; idx++) {
-		assert(pool_entry_islive(p, idx));
-		u64* vp = pool_entry(p, idx, sizeof(u64));
+		assert(!pool_entry_isfree(p, idx));
+		u64* vp = pool_entry(p, idx, 8);
 		assert(*vp == idx);
 	}
 
@@ -162,10 +213,10 @@ __attribute__((constructor)) static void pool_test() {
 	// verify
 	for (u32 idx = 1; idx <= N; idx++) {
 		if (idx % 4 == 3) {
-			assert(!pool_entry_islive(p, idx));
+			assert(pool_entry_isfree(p, idx));
 		} else {
-			assert(pool_entry_islive(p, idx));
-			u64* vp = pool_entry(p, idx, sizeof(u64));
+			assert(!pool_entry_isfree(p, idx));
+			u64* vp = pool_entry(p, idx, 8);
 			assert(*vp == idx);
 		}
 	}
@@ -174,7 +225,7 @@ __attribute__((constructor)) static void pool_test() {
 	for (u32 idx = 1; idx <= N; idx++) {
 		if (idx % 4 == 3) {
 			u32 idx2;
-			u64* vp = pool_entry_alloc(&p, &idx2, sizeof(u64));
+			u64* vp = pool_entry_alloc(&p, &idx2, 8);
 			assert(vp);
 			assert(idx == idx2); // expect dense sequential index
 			*vp = idx;
@@ -183,13 +234,22 @@ __attribute__((constructor)) static void pool_test() {
 
 	// verify
 	for (u32 idx = 1; idx <= N; idx++) {
-		assert(pool_entry_islive(p, idx));
-		u64* vp = pool_entry(p, idx, sizeof(u64));
+		assert(!pool_entry_isfree(p, idx));
+		u64* vp = pool_entry(p, idx, 8);
 		assert(*vp == idx);
 	}
+
+	// free all entries with a pattern that causes idx==maxidx in a few cases
+	for (u32 idx = 10; idx <= N; idx++)
+		if ((idx % 4) != 3) pool_entry_free(p, idx);
+	for (u32 idx = 1; idx <= N; idx++)
+		if ((idx % 4) == 3 || idx < 10) pool_entry_free(p, idx);
+
+	// verify that all slots are free
+	for (u32 idx = 1; idx <= p->cap; idx++)
+		assert(pool_entry_isfree(p, idx));
 
 	pool_free_pool(p);
 	dlog("OK: %s", __FUNCTION__);
 }
 #endif // DEBUG
-

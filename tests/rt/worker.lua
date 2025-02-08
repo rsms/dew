@@ -1,7 +1,4 @@
 return function()
-	-- __rt.spawn_task(function()
-	-- 	print("in task")
-	-- end)
 	local worker = __rt.spawn_worker(function()
 		print("in worker")
 		for i = 1, 4 do
