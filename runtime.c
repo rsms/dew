@@ -41,6 +41,7 @@
 #endif
 
 
+// LUA_EXTRASPACE is defined in lua/src/luaconf.h
 static_assert(sizeof(T) == LUA_EXTRASPACE, "");
 
 
@@ -936,12 +937,10 @@ static bool send_to_t(T* t, InboxMsg msg) {
 typedef int(*TaskContinuation)(lua_State* L, int l_thrd_status, void* arg);
 
 
-inline static int t_suspend(
-	T* t, TStatus tstatus, void* nullable arg, TaskContinuation nullable cont)
-{
-	assert(tstatus != TStatus_READY ||
-	       tstatus != TStatus_RUNNING ||
-	       tstatus != TStatus_DEAD);
+inline static int t_suspend(T* t, u8 tstatus, void* nullable arg, TaskContinuation nullable cont) {
+	assert(tstatus != T_READY ||
+	       tstatus != T_RUNNING ||
+	       tstatus != T_DEAD);
 	t->status = tstatus;
 	return lua_yieldk(t_L(t), 0, (intptr_t)arg, (int(*)(lua_State*,int,lua_KContext))cont);
 }
@@ -952,7 +951,7 @@ inline static int t_suspend(
 // to be invoked on the unchanged stack in t_resume before execution is handed back to the task.
 inline static int t_iopoll_wait(T* t, IODesc* d, int(*cont)(lua_State*,int,IODesc*)) {
 	d->t = t;
-	return t_suspend(t, TStatus_WAIT_IO, d, (TaskContinuation)cont);
+	return t_suspend(t, T_WAIT_IO, d, (TaskContinuation)cont);
 	// return lua_yieldk(L, 0, (intptr_t)d, (int(*)(lua_State*,int,lua_KContext))cont);
 }
 
@@ -1011,7 +1010,7 @@ static int l_recv(lua_State* L) {
 		}
 	}
 
-	return t_suspend(t, TStatus_WAIT_RECV, t, l_recv_cont);
+	return t_suspend(t, T_WAIT_RECV, t, l_recv_cont);
 	// return lua_yieldk(L, 0, (intptr_t)t, l_recv_cont);
 }
 
@@ -1475,7 +1474,7 @@ static int l_sleep(lua_State* L) {
 	// return one result
 	t->resume_nres = 1;
 
-	return t_suspend(t, TStatus_WAIT_IO, NULL, NULL);
+	return t_suspend(t, T_WAIT_IO, NULL, NULL);
 	// return lua_yieldk(L, 0, 0, NULL);
 }
 
@@ -1577,28 +1576,30 @@ static void t_add_child(T* parent, T* child) {
 }
 
 
-static void t_remove_child_r(T* prev_sibling, T* child) {
-	if (prev_sibling->next_sibling == child) {
-		prev_sibling->next_sibling = child->next_sibling;
-		child->next_sibling = NULL;
-	} else if LIKELY(prev_sibling->next_sibling != NULL) {
-		t_remove_child_r(prev_sibling->next_sibling, child);
+static void t_remove_child(T* parent, T* t) {
+	assert(parent != NULL);
+	assert(parent == t->parent);
+	t->parent = NULL;
+	trace_sched("remove child " T_ID_F " from " T_ID_F, t_id(t), t_id(parent));
+	if (parent->first_child == t) {
+		parent->first_child = t->next_sibling;
+		t->next_sibling = NULL;
 	} else {
-		dlog("  child not found: " T_ID_F, t_id(child));
-		assert(!"child not found");
-	}
-}
-
-
-static void t_remove_child(T* parent, T* child) {
-	trace_sched("remove child " T_ID_F " from " T_ID_F, t_id(child), t_id(parent));
-	assert(child->parent == parent);
-	child->parent = NULL;
-	if (parent->first_child == child) {
-		parent->first_child = child->next_sibling;
-		child->next_sibling = NULL;
-	} else {
-		return t_remove_child_r(parent->first_child, child);
+		assert(parent->first_child != NULL);
+		T* prev = parent->first_child;
+		for (;;) {
+			if (prev->next_sibling == t) {
+				prev->next_sibling = t->next_sibling;
+				t->next_sibling = NULL;
+				break;
+			}
+			prev = prev->next_sibling;
+			if UNLIKELY(prev == NULL) {
+				dlog("  task not found: " T_ID_F, t_id(t));
+				assert(!"task not found");
+				break;
+			}
+		}
 	}
 }
 
@@ -1640,47 +1641,6 @@ static void dlog_task_tree(const T* t, int level) {
 // }
 
 
-enum : u32 { TID_SMALL_MAX = (__typeof__(((T*)NULL)->tid_small))-1 };
-
-
-static bool s_tasks_add(S* s, T* t) {
-	u32 tid;
-	T** tp = (T**)pool_entry_alloc(&s->tasks, &tid, sizeof(T*));
-	if (tp != NULL) {
-		trace_sched("register task " T_ID_F " tid=%u pool.entry=%p", t_id(t), tid, tp);
-		if (tid > TID_SMALL_MAX)
-			tid = 0;
-		t->tid_small = tid;
-		*tp = t;
-	}
-	return tp != NULL;
-}
-
-
-static void s_tasks_remove(S* s, T* t) {
-	u32 tid = t->tid_small;
-	if UNLIKELY(tid == 0) {
-		// tid is larger than what fits in tid_small; scan for t in tasks.
-		// Skip the first TID_SMALL_MAX entries since we know that's not where t is.
-		assert(s->tasks->maxidx > TID_SMALL_MAX);
-		T** task_start = (T**)pool_entries(s->tasks);
-		T** task_end = task_start + s->tasks->maxidx;
-		for (T** taskp = task_start + TID_SMALL_MAX; taskp != task_end; taskp++) {
-			if (*taskp == t) {
-				tid = (u32)(uintptr)(taskp - task_start) + 1;
-				break;
-			}
-		}
-		if (tid == 0) {
-			dlog("warning: task " T_ID_F " not found in s.tasks", t_id(t));
-			return;
-		}
-	}
-	trace_sched("unregister task " T_ID_F " tid=%u", t_id(t), tid);
-	pool_entry_free(s->tasks, tid);
-}
-
-
 static void t_finalize(T* t, int status);
 
 
@@ -1693,8 +1653,9 @@ static void t_stop(T* nullable parent, T* child) {
 
 	// set status to DEAD _before_ calling lua_closethread to ensure that any to-be-closed
 	// variables with __close metamethods that call into our API are properly handled.
-	bool is_on_runq = child->status == TStatus_READY;
-	child->status = TStatus_DEAD;
+	bool is_on_runq = child->status == T_READY;
+	assert(child->status != T_DEAD);
+	child->status = T_DEAD;
 
 	// Shut down Lua "thread"
 	//
@@ -1746,7 +1707,14 @@ static void t_finalize(T* t, int status) {
 	trace_sched(T_ID_F " exited (%s)", t_id(t), l_status_str(status));
 	if UNLIKELY(status != LUA_OK)
 		t_report_error(t, "Uncaught error");
-	t->status = TStatus_DEAD;
+	t->status = T_DEAD;
+
+	// decrement "live tasks" counter
+	if (t->s->nlive == 0) {
+		dlog("error: t->s->nlive==0 while task " T_ID_F " is still alive in " S_ID_F,
+			     t_id(t), s_id(t->s));
+	}
+	assert(t->s->nlive > 0);
 	t->s->nlive--;
 
 	// dlog("task tree for " T_ID_F ":", t_id(t)); dlog_task_tree(t, 1);
@@ -1755,19 +1723,22 @@ static void t_finalize(T* t, int status) {
 	if (t->first_child)
 		t_stop_r(t, t->first_child);
 
-	// clean up unless S is closing
-	if (!t->s->isclosed) {
-		// stop any still-running timers
-		if UNLIKELY(t->ntimers)
-			t_cancel_timers(t);
+	// stop any still-running timers (optimization: skip when S is shutting down)
+	if UNLIKELY(t->ntimers && !t->s->isclosed)
+		t_cancel_timers(t);
 
-		// remove task from parent's list of children
-		if (t->parent)
-			t_remove_child(t->parent, t);
+	// remove task from parent's list of children
+	if (t->parent)
+		t_remove_child(t->parent, t);
 
-		// unregister T if S is tracking tasks
-		if (t->s->tasks)
-			s_tasks_remove(t->s, t);
+	// if this is the main task, clear
+	if (t->s->main_task == t) {
+		if (t->s->nlive > 0) {
+			dlog("error: t->s->nlive %u after main task " T_ID_F " exited on " S_ID_F,
+			     t->s->nlive, t_id(t), s_id(t->s));
+		}
+		assert(t->s->nlive == 0); // else we failed to stop child tasks
+		t->s->main_task = NULL;
 	}
 
 	// remove GC ref to allow task (Lua thread) to be garbage collected
@@ -1793,7 +1764,7 @@ static void t_resume(T* t) {
 	// nres:  number of values passed to 'yield' by task.
 	int nargs = t->resume_nres, nres;
 	t->resume_nres = 0;
-	t->status = TStatus_RUNNING;
+	t->status = T_RUNNING;
 
 	trace_sched("resume " T_ID_F " nargs=%d", t_id(t), nargs);
 	int status = lua_resume(L, t->s->L, nargs, &nres);
@@ -1812,7 +1783,7 @@ static void t_resume(T* t) {
 // (Must only be called from a task, never l_main.)
 static int t_yield(T* t, int nresults) {
 	trace_sched(T_ID_F " yield", t_id(t));
-	t->status = TStatus_READY;
+	t->status = T_READY;
 	if UNLIKELY(!s_runq_put(t->s, t))
 		return luaL_error(t_L(t), "out of memory");
 	return lua_yieldk(t_L(t), nresults, 0, NULL);
@@ -1852,13 +1823,13 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	t->first_child = NULL;
 	t->inbox = NULL;
 	t->resume_nres = 0;
-	t->status = TStatus_READY;
+	t->status = T_READY;
 	t->ntimers = 0;
 
-	// register task
-	if (s->tasks && UNLIKELY(!s_tasks_add(s, t))) {
-		lua_closethread(NL, L);
-		return l_errno_error(L, ENOMEM);
+	// set s->main_task
+	if (!parent) {
+		assert(s->main_task == NULL);
+		s->main_task = t;
 	}
 
 	// setup t to be run next by schedule
@@ -1903,7 +1874,7 @@ int s_iopoll_wake(S* s, IODesc** dv, u32 count) {
 
 		// TODO: check if t is already on runq and don't add it if so.
 		// For now, use an assertion (note: this is likely to happen)
-		assert(t->status == TStatus_WAIT_IO);
+		assert(t->status == T_WAIT_IO);
 		assert(s_runq_find(s, t) == -1);
 
 		if (!s_runq_put(s, t))
@@ -1929,26 +1900,7 @@ static void s_shutdown(S* s) {
 static void s_free(S* s) {
 	iopoll_dispose(&s->iopoll);
 	free(s->runq);
-	pool_free_pool(s->tasks);
 	array_free((struct Array*)&s->timers);
-}
-
-
-static void s_stop_tasks(S* s) {
-	for (u32 tid = s->tasks->maxidx; tid > 0 && s->nlive > 0; tid--) {
-		if (!pool_entry_isfree(s->tasks, tid)) {
-			T* t = *(T**)pool_entry(s->tasks, tid, sizeof(T*));
-			// dlog("stop " T_ID_F " status=%s", t_id(t),
-			//      t->status == TStatus_READY     ? "READY" :
-			//      t->status == TStatus_RUNNING   ? "RUNNING" :
-			//      t->status == TStatus_WAIT_IO   ? "WAIT_IO" :
-			//      t->status == TStatus_WAIT_RECV ? "WAIT_RECV" :
-			//      t->status == TStatus_DEAD      ? "DEAD" :
-			//      "?");
-			if (t->status != TStatus_DEAD)
-				t_stop(NULL, t);
-		}
-	}
 }
 
 
@@ -1956,9 +1908,9 @@ static int s_finalize(S* s) {
 	trace_sched("finalize " S_ID_F, s_id(s));
 	atomic_store_explicit(&s->isclosed, true, memory_order_release);
 
-	// stop tasks
-	if (s->nlive && s->tasks)
-		s_stop_tasks(s);
+	// stop main task
+	if (s->main_task)
+		t_stop(NULL, s->main_task);
 
 	// clear timers before GC to avoid costly (and useless) timers_remove
 	s->timers.len = 0;
@@ -2224,9 +2176,6 @@ static void worker_thread(Worker* w) {
 
 	// create a Lua environment for this thread
 	lua_State* L = luaL_newstate();
-	// enable task tracking (for graceful shutdown)
-	if UNLIKELY(!L || !pool_init(&w->s.tasks, /*cap*/3, sizeof(T*)))
-		return logerr("failed to allocate memory");
 	w->s.L = L;
 
 	// open libraries

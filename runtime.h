@@ -87,13 +87,13 @@ struct RunQ {
 	T*   entries[];
 };
 
-typedef enum TStatus : u8 {
-	TStatus_READY,     // on runq
-	TStatus_RUNNING,   // currently running
-	TStatus_WAIT_IO,   // suspended, waiting for I/O or sleep timer
-	TStatus_WAIT_RECV, // suspended, waiting for inbox message
-	TStatus_DEAD,      // dead
-} TStatus;
+enum TStatus {
+	T_READY,     // on runq
+	T_RUNNING,   // currently running
+	T_WAIT_IO,   // suspended, waiting for I/O or sleep timer
+	T_WAIT_RECV, // suspended, waiting for inbox message
+	T_DEAD,      // dead
+};
 
 struct T {
 	S*              s;            // owning S
@@ -101,22 +101,20 @@ struct T {
 	T* nullable     next_sibling; // next sibling in parent's list of children
 	T* nullable     first_child;  // list of children
 	Inbox* nullable inbox;        // list of inbox messages
-	int             resume_nres;  // number of results on stack, to be returned via resume
-	TStatus         status;       // TStatus_ constant
-	u8              tid_small;    // low-numbered idx in s->tasks (if tracked) 0=scan
+	u8              status;       // T_ constant
+	u8              resume_nres;  // number of results on stack, to be returned via resume
 	u16             ntimers;      // number of live timers
+	u32             _unused;
 	// rest of struct is a lua_State struct
 	// Note: With Lua 5.4, the total size of T + lua_State is 248 B on 64-bit arch
 };
 
 struct S {
-	lua_State*  L;      // base Lua environment
-	IOPoll      iopoll; // platform-specific I/O facility
-
-	_Atomic(bool) isclosed; // true when the parent worker is shutting down
-
-	Pool* nullable tasks; // all currently live tasks (tracked if non-NULL)
-	u32            nlive; // number of live tasks (always tracked)
+	lua_State*    L;         // base Lua environment
+	IOPoll        iopoll;    // platform-specific I/O facility
+	T* nullable   main_task; // main task
+	u32           nlive;     // number of live tasks (always tracked)
+	_Atomic(bool) isclosed;  // true when the parent worker is shutting down
 
 	RunQ*       runq;    // queue of tasks ready to run; a circular buffer
 	T* nullable runnext; // task to be run immediately, skipping runq
