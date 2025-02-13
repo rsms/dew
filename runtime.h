@@ -63,18 +63,15 @@ struct TimerInfo {
 
 typedef Array(TimerInfo) TimerPQ;
 
-struct FIFO {
-	u32 cap;
-	u32 head;
-	u32 tail;
-	//TYPE entries[];
+enum InboxMsgType {
+	InboxMsgType_TIMER,      // timer rang
+	InboxMsgType_CHILD_EXIT, // parent task notified about child task existing
 };
 
 struct InboxMsg {
-	InboxMsg* nullable next;
-	u8                 what;
-	T*    nullable     sender;
-	void* nullable     data;
+	u8             type; // enum InboxMsgType
+	T* nullable    sender;
+	void* nullable data;
 };
 
 struct Inbox {
@@ -88,33 +85,70 @@ struct RunQ {
 };
 
 enum TStatus {
-	T_READY,     // on runq
-	T_RUNNING,   // currently running
-	T_WAIT_IO,   // suspended, waiting for I/O or sleep timer
-	T_WAIT_RECV, // suspended, waiting for inbox message
-	T_DEAD,      // dead
+	T_READY,       // on runq
+	T_RUNNING,     // currently running
+	T_WAIT_IO,     // suspended, waiting for I/O or sleep timer
+	T_WAIT_RECV,   // suspended, waiting for inbox message
+	T_WAIT_TASK,   // suspended, waiting for a task to exit
+	T_WAIT_WORKER, // suspended, waiting for a worker to exit
+	T_DEAD,        // dead
+};
+
+enum TDied {
+	TDied_ERR,   // uncaught error
+	TDied_CLEAN, // clean exit
+	TDied_STOP,  // stopped by parent task
 };
 
 struct T {
 	S*              s;            // owning S
-	T* nullable     parent;       // task that spawned this task (NULL = S's main task)
-	T* nullable     next_sibling; // next sibling in parent's list of children
-	T* nullable     first_child;  // list of children
-	Inbox* nullable inbox;        // list of inbox messages
-	u8              status;       // T_ constant
-	u8              resume_nres;  // number of results on stack, to be returned via resume
-	u16             ntimers;      // number of live timers
-	u32             _unused;
+	Inbox* nullable inbox;        // message queue
+
+	u32 tid;          // task identifier
+	u32 prev_sibling; // tid of previous sibling in parent's list of children
+	u32 next_sibling; // tid of next sibling in parent's list of children
+	u32 first_child;  // list of children (most recently spawned. tid)
+	u32 parent;       // tid of task that spawned this task (0 for main task)
+	u32 nrefs;        // references to task (when 0, T may be GC'd)
+	u8  status;       // T_ constant (enum TStatus)
+	u8  resume_nres;  // number of results on stack, to be returned via resume
+	u16 ntimers;      // number of live timers
+	u32 waiters;      // list of tasks (tid's) waiting for this task (info.wait_task)
+
+	// 'info' holds data specific to 'status', used while task is suspended
+	union {
+		struct { // T_WAIT_TASK
+			u32 wait_tid; // tid of other task this task is waiting for
+			u32 next_tid; // link to other waiting task in 'waiters' list
+		} wait_task;
+		struct { // T_WAIT_WORKER
+			u32 next_tid; // link to other waiting task in 'waiters' list
+		} wait_worker;
+		struct { // T_DEAD
+			u8 how; // TDied_ constant
+			// note: must not overlay wait_task.wait_tid
+		} dead;
+		u64 _align;
+	} info;
+
 	// rest of struct is a lua_State struct
 	// Note: With Lua 5.4, the total size of T + lua_State is 248 B on 64-bit arch
+};
+
+enum { // S.notes
+	S_NOTE_WEXIT = 1u<<0, // a worker spawned by this S has exited
 };
 
 struct S {
 	lua_State*    L;         // base Lua environment
 	IOPoll        iopoll;    // platform-specific I/O facility
-	T* nullable   main_task; // main task
-	u32           nlive;     // number of live tasks (always tracked)
+	Pool*         tasks;     // all live tasks
+	u32           nlive;     // number of live (not T_DEAD) tasks
 	_Atomic(bool) isclosed;  // true when the parent worker is shutting down
+	_Atomic(u8)   notes;     // events from a worker (e.g. worker exited; S_NOTE_ bits)
+	bool          exiterr;   // true if S ended because of a runtime error
+	bool          doexit;    // call exit(exiterr) when S ends
+	bool          isworker;  // true if S is part of a Worker
 
 	RunQ*       runq;    // queue of tasks ready to run; a circular buffer
 	T* nullable runnext; // task to be run immediately, skipping runq
@@ -126,24 +160,38 @@ struct S {
 	Worker* nullable workers; // list
 };
 
-typedef enum WorkerStatus : u8 {
-	WorkerStatus_CLOSED,
-	WorkerStatus_OPEN,
-	WorkerStatus_READY,
-} WorkerStatus;
+enum WorkerStatus {
+	Worker_CLOSED,
+	Worker_OPEN,
+	Worker_READY,
+};
 
 struct Worker {
 	// state accessed only by parent thread
-	Worker* nullable next; // list link in S.workers
+	T*               parent;  // T which spawned this worker
+	Worker* nullable next;    // list link in S.workers
 
 	// state accessed by both parent thread and worker thread
-	OSThread    thread;
-	_Atomic(u8) status;
-	_Atomic(u8) nrefs;
+	OSThread     thread;
+	_Atomic(u8)  status;  // Worker_ constant (enum WorkerStatus)
+	_Atomic(u8)  nrefs;
+	_Atomic(u32) waiters; // list of tasks (tid's) waiting for this task (T.info.wait_task)
 
-	// mainfun_lcode contains Lua bytecode for the main function
-	u32            mainfun_lcode_len; // number of bytes at mainfun_lcode
-	void* nullable mainfun_lcode;     // Worker owns this memory, free'd by worker_free
+	// input & output data (as input for worker_open, as output from worker exit.)
+	union {
+		struct {
+			// mainfun_lcode contains Lua bytecode for the main function, used during setup.
+			// Worker owns this memory, and it's free'd during thread setup.
+			u32            mainfun_lcode_len; // number of bytes at mainfun_lcode
+			void* nullable mainfun_lcode;
+		};
+		struct {
+			// When a worker has exited, this holds the description of an error
+			// which caused the worker to exit, or NULL if no error or if there are no waiters.
+			// Memory is free'd by worker_free.
+			char* nullable errdesc;
+		};
+	};
 
 	S s;
 };
@@ -154,8 +202,8 @@ struct Worker {
 #define S_ID_F  "S#%lx"
 
 // t_id formats an identifier of a T for logging
-#define t_id(t) ((unsigned long)(uintptr)t_L(t))
-#define T_ID_F  "T#%lx"
+#define t_id(t) (t)->tid, ((unsigned long)(uintptr)(t))
+#define T_ID_F  "T%u#%lx"
 
 
 // L_t returns Lua state of task, while L_t returns task of Lua state.

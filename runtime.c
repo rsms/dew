@@ -167,144 +167,17 @@ static int l_errstr(lua_State* L) {
 }
 
 
-// FIFO functions
-static bool fifo_allocsize(u32 cap, usize elemsize, usize* nbyte_out);
-static FIFO* nullable fifo_alloc(u32 cap, usize elemsize);
-static void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap);
-static void* nullable fifo_pop(FIFO* q, usize elemsize);
-
-
-static bool fifo_allocsize(u32 cap, usize elemsize, usize* nbyte_out) {
-	assert(IS_POW2_X(elemsize));
-	return !check_mul_overflow((usize)cap, elemsize, nbyte_out) &&
-	       !check_add_overflow(*nbyte_out, ALIGN2(sizeof(FIFO), elemsize), nbyte_out);
+// l_copy_values copies (by reference) n values from stack src to stack dst.
+// This is similar to lua_xmove but copies instead of moves.
+// Note: src & dst must belong to the same OS thread (not different Workers.)
+static void l_copy_values(lua_State* src, lua_State* dst, int n) {
+    assertf(lua_gettop(src) >= n, "src has at least n values at indices 1 .. n");
+    // make copies of the arguments onto the top of src stack
+    for (int i = 1; i <= n; i++)
+        lua_pushvalue(src, i);
+    // move them to dst
+    lua_xmove(src, dst, n);
 }
-
-
-static FIFO* nullable fifo_alloc(u32 cap, usize elemsize) {
-	FIFO* q;
-	usize newsize;
-	if (!fifo_allocsize(cap, elemsize, &newsize))
-		return NULL;
-	if (( q = malloc(newsize) )) {
-		q->cap = cap;
-		q->head = 0;
-		q->tail = 0;
-	}
-	return q;
-}
-
-
-static int _fifo_grow(FIFO** qp, usize elemsize, u32 maxcap) {
-	FIFO* q = *qp;
-	if (q->cap >= maxcap)
-		return -1;
-
-	// try to double capacity, fall back to incrementing it by 1
-	u32 newcap;
-	if (check_mul_overflow(q->cap, 2u, &newcap)) {
-		if (q->cap == U32_MAX)
-			return -1;
-		newcap = q->cap + 1;
-	} else if (newcap > maxcap) {
-		newcap = maxcap;
-	}
-
-	// calculate new memory allocation size
-	usize newsize;
-	if (!fifo_allocsize(newcap, elemsize, &newsize))
-		return -1;
-
-	// realloc
-	FIFO* newq = realloc(q, newsize);
-	if (!newq)
-		return -1;
-	q = newq;
-
-	// check for wrapping head & tail pointers
-	if (q->head > q->tail) {
-		u32 tailcount = q->cap - q->head;
-		u32 new_head = q->head + (newcap - q->cap);
-		void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
-		void* dst = entries + (usize)new_head*elemsize;
-		void* src = entries + (usize)q->head*elemsize;
-		memmove(dst, src, tailcount*elemsize);
-		q->head = new_head;
-	}
-
-	q->cap = newcap;
-	*qp = q;
-
-	return 0;
-}
-
-
-static void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap) {
-	FIFO* q = *qp;
-	u32 newtail = (q->tail + 1) % q->cap;
-	if UNLIKELY(newtail == q->head) {
-		if UNLIKELY(_fifo_grow(qp, elemsize, maxcap))
-			return NULL;
-		q = *qp;
-		newtail = (q->tail + 1) % q->cap;
-	}
-	void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
-	void* entry = entries + (usize)q->tail*elemsize;
-	q->tail = newtail;
-	return entry;
-}
-
-
-static void* nullable fifo_pop(FIFO* q, usize elemsize) {
-	if (q->head == q->tail) // empty
-		return NULL;
-	void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
-	void* entry = entries + (usize)q->head*elemsize;
-	q->head = (q->head + 1) % q->cap;
-	return entry;
-}
-
-
-// little unit test for FIFO
-#ifdef DEBUG
-__attribute__((constructor)) static void fifo_test() {
-	struct { FIFO fifo; u32 entries[]; }* q;
-	q = (__typeof__(q))fifo_alloc(4, sizeof(*q->entries));
-	assert(q != NULL);
-	assert(q->fifo.cap == 4);
-
-	// note: actual capacity is cap-1; set maxcap to 2x to ensure _fifo_grow is tested
-	u32 maxcap = q->fifo.cap*2;
-	u32* entry;
-	for (u32 i = 0; i < maxcap-1; i++) {
-		entry = fifo_push((FIFO**)&q, sizeof(*q->entries), maxcap);
-		assert(entry != NULL);
-		*entry = i;
-		// dlog("entry #%u %p", i+1, entry);
-	}
-	// this should fail as we are at maxcap
-	entry = fifo_push((FIFO**)&q, sizeof(*q->entries), maxcap);
-	assert(entry == NULL);
-
-	// should dequeue in order
-	for (u32 i = 0; i < maxcap-1; i++) {
-		entry = fifo_pop(&q->fifo, sizeof(*q->entries));
-		assert(entry != NULL);
-		assert(*entry == i);
-	}
-	// should be empty now
-	entry = fifo_pop(&q->fifo, sizeof(*q->entries));
-	assert(entry == NULL);
-
-	// should have room for maxap-1 more entries now without needing to grow in size
-	assert(q->fifo.cap == maxcap);
-	for (u32 i = 0; i < maxcap-1; i++)
-		fifo_push((FIFO**)&q, sizeof(*q->entries), maxcap);
-	assert(q->fifo.cap == maxcap); // ensure it did not grow
-
-	dlog("OK: fifo_test");
-}
-#endif
 
 
 // dew_intscan parses a byte string as an unsigned integer, up to 0xffffffffffffffff
@@ -664,6 +537,18 @@ static int l_error_not_a_task(lua_State* L, T* t) {
 }
 
 
+static T* nullable l_check_task(lua_State* L, int idx) {
+	lua_State* other_L = lua_tothread(L, idx);
+	if LIKELY(other_L) {
+		T* other_t = L_t(other_L);
+		if LIKELY(other_t->s)
+			return other_t;
+	}
+	luaL_typeerror(L, idx, "Task");
+	return NULL;
+}
+
+
 #define REQUIRE_TASK(L) ({ \
 	T* __t = L_t(L); \
 	if UNLIKELY(__t->s == NULL) \
@@ -924,23 +809,27 @@ static InboxMsg* nullable inbox_add(Inbox** inboxp) {
 }
 
 
-static bool send_to_t(T* t, InboxMsg msg) {
-	trace_sched(T_ID_F, t_id(t));
-	InboxMsg* msgp = inbox_add(&t->inbox);
-	if (msgp == NULL)
-		return false;
-	*msgp = msg;
-	return true;
-}
-
-
 typedef int(*TaskContinuation)(lua_State* L, int l_thrd_status, void* arg);
 
 
+static const char* t_status_str(u8 status) {
+	switch ((enum TStatus)status) {
+		case T_READY:       return "T_READY";
+		case T_RUNNING:     return "T_RUNNING";
+		case T_WAIT_IO:     return "T_WAIT_IO";
+		case T_WAIT_RECV:   return "T_WAIT_RECV";
+		case T_WAIT_TASK:   return "T_WAIT_TASK";
+		case T_WAIT_WORKER: return "T_WAIT_WORKER";
+		case T_DEAD:        return "T_DEAD";
+	}
+	return "?";
+}
+
+
 inline static int t_suspend(T* t, u8 tstatus, void* nullable arg, TaskContinuation nullable cont) {
-	assert(tstatus != T_READY ||
-	       tstatus != T_RUNNING ||
-	       tstatus != T_DEAD);
+	assertf(tstatus != T_READY || tstatus != T_RUNNING || tstatus != T_DEAD,
+	        "%s", t_status_str(tstatus));
+	trace_sched(T_ID_F " %s", t_id(t), t_status_str(tstatus));
 	t->status = tstatus;
 	return lua_yieldk(t_L(t), 0, (intptr_t)arg, (int(*)(lua_State*,int,lua_KContext))cont);
 }
@@ -953,87 +842,6 @@ inline static int t_iopoll_wait(T* t, IODesc* d, int(*cont)(lua_State*,int,IODes
 	d->t = t;
 	return t_suspend(t, T_WAIT_IO, d, (TaskContinuation)cont);
 	// return lua_yieldk(L, 0, (intptr_t)d, (int(*)(lua_State*,int,lua_KContext))cont);
-}
-
-
-static int l_recv_cont(lua_State* L, int ltstatus, void* arg) {
-	T* t = arg;
-	assert(t->inbox != NULL);
-	InboxMsg* msg = inbox_pop(t->inbox);
-	assert(msg != NULL);
-	trace_sched(T_ID_F " deliver msg what=%u", t_id(t), msg->what);
-	lua_pushinteger(L, msg->what);
-	lua_pushinteger(L, (uintptr)msg->sender); // FIXME
-	lua_pushinteger(L, (uintptr)msg->data); // FIXME
-	return 3;
-}
-
-
-// fun recv(from... Task|Worker) (what, sender int, data any)
-// If no 'from' is specified, receive from anyone
-static int l_recv(lua_State* L) {
-	T* t = REQUIRE_TASK(L);
-
-	// check arguments
-	int argc = lua_gettop(L);
-	for (int i = 1; i <= argc; i++) {
-		if (lua_isthread(L, i)) {
-			lua_State* arg_L = lua_tothread(L, i);
-			T* arg_task = L_t(arg_L);
-			if UNLIKELY(arg_task->s == NULL) {
-				dlog("arg[%u] = coroutine", i);
-			} else {
-				dlog("arg[%u] = " T_ID_F, i, t_id(arg_task));
-			}
-		}
-	}
-
-
-	if (t->inbox) {
-		InboxMsg* msg = inbox_pop(t->inbox);
-		if (msg) {
-			lua_pushinteger(L, msg->what);
-			lua_pushinteger(L, (uintptr)msg->sender); // FIXME
-			lua_pushinteger(L, (uintptr)msg->data); // FIXME
-			return 1;
-		}
-	}
-	trace_sched(T_ID_F " wait", t_id(t));
-
-	// check for deadlock
-	S* s = t->s;
-	if UNLIKELY(s->runnext == NULL && s->runq->fifo.head == s->runq->fifo.tail) {
-		// empty runq
-		if (s->nlive == 1 && t->ntimers == 0) {
-			// T is the only live task and no timers are active
-			return luaL_error(t_L(t), "deadlock detected: recv would never return");
-		}
-	}
-
-	return t_suspend(t, T_WAIT_RECV, t, l_recv_cont);
-	// return lua_yieldk(L, 0, (intptr_t)t, l_recv_cont);
-}
-
-
-// s_userdata_acquire prevents Lua's GC from collecting an object
-static void s_userdata_acquire(S* s, void* ud) {
-	lua_State* L = s->L;
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_reftabkey); // put ref table on stack
-	lua_pushlightuserdata(L, ud); // key = ud
-	lua_pushboolean(L, 1);        // value = true
-	lua_rawset(L, -3);            // reftab[key] = value
-	lua_pop(L, 1);                // remove the reftab from stack
-}
-
-
-// s_userdata_release releases our internal reference to an object tracked by Lua's GC
-static void s_userdata_release(S* s, void* ud) {
-	lua_State* L = s->L;
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_reftabkey); // put ref table on stack
-	lua_pushlightuserdata(L, ud); // key = ud
-	lua_pushnil(L);               // value = nil
-	lua_rawset(L, -3);            // reftab[key] = value
-	lua_pop(L, 1);                // remove the reftab from stack
 }
 
 
@@ -1282,23 +1090,29 @@ static int l_timerobj_gc(lua_State* L) {
 }
 
 
-static T* l_timer_done(Timer* timer, void* arg) {
+static T* nullable l_timer_done(Timer* timer, void* arg) {
 	// dlog("*** l_timer_done %p ***", timer);
 	T* t = arg;
 	// deliver timer message to task's inbox
-	if UNLIKELY(!send_to_t(t, (InboxMsg){ .what = 123 })) {
-		// Inbox is full.
-		//
-		// In the case of a task calling send(), it should block until there's space in the
-		// receiver's inbox.
-		//
-		// But in the case of a timer delivering a message ... how do we handle this safely?
-		// We can't really block since that would block the entire scheduler...
-		// Maybe when the timer starts we can somehow pre-allocate an inbox message.
-		// For example, the Inbox could have a field 'npending' which is checked by
-		// inbox_add when considering if the inbox is full or not.
+	InboxMsg* msg = inbox_add(&t->inbox);
+	if LIKELY(msg != NULL) {
+		memset(msg, 0, sizeof(*msg));
+		msg->type = InboxMsgType_TIMER;
+		return t; // wake t
 	}
-	return t; // wake t
+
+	// Inbox is full.
+	//
+	// In the case of a task calling send(), it should block until there's space in the
+	// receiver's inbox.
+	//
+	// But in the case of a timer delivering a message ... how do we handle this safely?
+	// We can't really block since that would block the entire scheduler...
+	// Maybe when the timer starts we can somehow pre-allocate an inbox message.
+	// For example, the Inbox could have a field 'npending' which is checked by
+	// inbox_add when considering if the inbox is full or not.
+	dlog("TODO: task inbox is full when timer rang");
+	return NULL;
 }
 
 
@@ -1479,7 +1293,29 @@ static int l_sleep(lua_State* L) {
 }
 
 
+static bool s_task_register(S* s, T* t) {
+	T** tp = (T**)pool_entry_alloc(&s->tasks, &t->tid, sizeof(T*));
+	if (tp != NULL)
+		*tp = t;
+	return tp != NULL;
+}
+
+
+static void s_task_unregister(S* s, T* t) {
+	// optimization for main task (tid 1): skip work incurred by pool_entry_free
+	if (t->tid != 1)
+		pool_entry_free(s->tasks, t->tid);
+}
+
+
+inline static T* s_task(S* s, u32 tid) {
+	T** tp = (T**)pool_entry(s->tasks, tid, sizeof(T*));
+	return *tp;
+}
+
+
 static bool s_runq_put(S* s, T* t) {
+	t->status = T_READY;
 	const u32 runq_cap_limit = U32_MAX;
 	T** tp = (T**)fifo_push((FIFO**)&s->runq, sizeof(*s->runq->entries), runq_cap_limit);
 	if (tp == NULL)
@@ -1498,6 +1334,7 @@ static bool s_runq_put_runnext(S* s, T* t) {
 		if UNLIKELY(!s_runq_put(s, s->runnext))
 			return false;
 	}
+	t->status = T_READY;
 	s->runnext = t;
 	return true;
 }
@@ -1570,43 +1407,61 @@ static i32 s_runq_find(const S* s, const T* t) {
 
 
 static void t_add_child(T* parent, T* child) {
-	assert(child->next_sibling == NULL /* not in a list */);
+	assertf(child->prev_sibling == 0, "should not be in a list");
+	assertf(child->next_sibling == 0, "should not be in a list");
+	// T uses a doubly-linked list of tids.
+	// As an example, consider the following task tree:
+	//    T1
+	//      T2
+	//      T3
+	//      T4
+	// where T1 is the parent, the list looks like this:
+	//   T1 —> T4 <—> T3 <—> T2
+	// i.e.
+	//   T1  .first_child = 4
+	//   T4  .prev_sibling = 0  .next_sibling = 3
+	//   T3  .prev_sibling = 4  .next_sibling = 2
+	//   T2  .prev_sibling = 3  .next_sibling = 0
+	// so if we were to t_add_child(T1, T5) we'd get:
+	//   T1 —> T5 <—> T4 <—> T3 <—> T2
+	// i.e.
+	//   T1  .first_child = 5
+	//   T5  .prev_sibling = 0  .next_sibling = 4
+	//   T4  .prev_sibling = 5  .next_sibling = 3
+	//   T3  .prev_sibling = 4  .next_sibling = 2
+	//   T2  .prev_sibling = 3  .next_sibling = 0
+	//
+	if (parent->first_child) {
+		T* first_child = s_task(parent->s, parent->first_child);
+		first_child->prev_sibling = child->tid;
+	}
 	child->next_sibling = parent->first_child;
-	parent->first_child = child;
+	parent->first_child = child->tid;
 }
 
 
 static void t_remove_child(T* parent, T* t) {
-	assert(parent != NULL);
-	assert(parent == t->parent);
-	t->parent = NULL;
+	assertf(parent->tid == t->parent, "%u == %u", parent->tid, t->parent);
+	t->parent = 0;
 	trace_sched("remove child " T_ID_F " from " T_ID_F, t_id(t), t_id(parent));
-	if (parent->first_child == t) {
+	if (parent->first_child == t->tid) {
+		// removing the most recently spawned task
 		parent->first_child = t->next_sibling;
-		t->next_sibling = NULL;
-	} else {
-		assert(parent->first_child != NULL);
-		T* prev = parent->first_child;
-		for (;;) {
-			if (prev->next_sibling == t) {
-				prev->next_sibling = t->next_sibling;
-				t->next_sibling = NULL;
-				break;
-			}
-			prev = prev->next_sibling;
-			if UNLIKELY(prev == NULL) {
-				dlog("  task not found: " T_ID_F, t_id(t));
-				assert(!"task not found");
-				break;
-			}
+		if (parent->first_child) {
+			T* first_child = s_task(parent->s, parent->first_child);
+			first_child->prev_sibling = 0;
+			t->next_sibling = 0;
 		}
+	} else {
+		// removing a task in the middle or end of the list
+		assert(t->prev_sibling > 0);
+		T* prev_sibling = s_task(parent->s, t->prev_sibling);
+		prev_sibling->next_sibling = t->next_sibling;
 	}
 }
 
 
-static void t_report_error(T* t, const char* context_msg) {
-	lua_State* L = t_L(t);
-
+static const char* l_fmt_error(lua_State* L) {
 	const char* msg = lua_tostring(L, -1);
 	if (msg == NULL) { /* is error object not a string? */
 		if (luaL_callmeta(L, 1, "__tostring") &&  /* does it have a metamethod */
@@ -1619,29 +1474,36 @@ static void t_report_error(T* t, const char* context_msg) {
 	}
 	luaL_traceback(L, L, msg, 1);  /* append a standard traceback */
 	const char* msg2 = lua_tostring(L, -1);
-	if (msg2) msg = msg2;
-
-	fprintf(stderr, "%s: ["T_ID_F "]\n%s\n", context_msg, t_id(t), msg);
 	lua_pop(L, 1);
+	return msg2 ? msg2 : msg;
+}
+
+
+static void t_report_error(T* t, const char* context_msg) {
+	lua_State* L = t_L(t);
+	const char* msg = l_fmt_error(L);
+	fprintf(stderr, "%s: ["T_ID_F "]\n%s\n", context_msg, t_id(t), msg);
+}
+
+
+static char* t_report_error_buf(T* t) {
+	lua_State* L = t_L(t);
+	const char* msg = l_fmt_error(L);
+	return strdup(msg);
 }
 
 
 static void dlog_task_tree(const T* t, int level) {
-	for (T* child = t->first_child; child; child = child->next_sibling) {
+	for (u32 child_tid = t->first_child; child_tid;) {
+		T* child = s_task(t->s, child_tid);
 		dlog("%*s" T_ID_F, level*4, "", t_id(child));
 		dlog_task_tree(child, level + 1);
+		child_tid = child->next_sibling;
 	}
 }
 
 
-// // t_gc is called by Lua's luaE_freethread when a task is GC'd, thus it must not be 'static'
-// __attribute__((visibility("hidden")))
-// void t_gc(lua_State* L, T* t) {
-// 	trace_sched(T_ID_F " GC", t_id(t));
-// }
-
-
-static void t_finalize(T* t, int status);
+static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus);
 
 
 static void t_stop(T* nullable parent, T* child) {
@@ -1655,6 +1517,7 @@ static void t_stop(T* nullable parent, T* child) {
 	// variables with __close metamethods that call into our API are properly handled.
 	bool is_on_runq = child->status == T_READY;
 	assert(child->status != T_DEAD);
+	u8 prev_status = child->status;
 	child->status = T_DEAD;
 
 	// Shut down Lua "thread"
@@ -1689,58 +1552,38 @@ static void t_stop(T* nullable parent, T* child) {
 	// return t_finalize(child, LUA_ERRRUN);
 
 	// finalize as "clean exit"
-	return t_finalize(child, LUA_OK);
+	child->resume_nres = 0;
+	return t_finalize(child, TDied_STOP, prev_status);
 }
 
 
 static void t_stop_r(T* parent, T* child) {
 	if (child->next_sibling)
-		t_stop_r(parent, child->next_sibling);
+		t_stop_r(parent, s_task(parent->s, child->next_sibling));
 	if (child->first_child)
-		t_stop_r(child, child->first_child);
+		t_stop_r(child, s_task(parent->s, child->first_child));
 	return t_stop(parent, child);
 }
 
 
-static void t_finalize(T* t, int status) {
-	// task is dead, either from clean exit or error (LUA_OK or LUA_ERR* status)
-	trace_sched(T_ID_F " exited (%s)", t_id(t), l_status_str(status));
-	if UNLIKELY(status != LUA_OK)
-		t_report_error(t, "Uncaught error");
-	t->status = T_DEAD;
+// t_gc is called by Lua's luaE_freethread when a task is GC'd, thus it must not be 'static'
+__attribute__((visibility("hidden")))
+void t_gc(lua_State* L, T* t) {
+	trace_sched(T_ID_F " GC", t_id(t));
+	// remove from S's 'tasks' registry, effectively invalidating tid
+	s_task_unregister(t->s, t);
+}
 
-	// decrement "live tasks" counter
-	if (t->s->nlive == 0) {
-		dlog("error: t->s->nlive==0 while task " T_ID_F " is still alive in " S_ID_F,
-			     t_id(t), s_id(t->s));
-	}
-	assert(t->s->nlive > 0);
-	t->s->nlive--;
 
-	// dlog("task tree for " T_ID_F ":", t_id(t)); dlog_task_tree(t, 1);
+inline static void t_retain(T* t) {
+	t->nrefs++;
+}
 
-	// stop child tasks
-	if (t->first_child)
-		t_stop_r(t, t->first_child);
 
-	// stop any still-running timers (optimization: skip when S is shutting down)
-	if UNLIKELY(t->ntimers && !t->s->isclosed)
-		t_cancel_timers(t);
-
-	// remove task from parent's list of children
-	if (t->parent)
-		t_remove_child(t->parent, t);
-
-	// if this is the main task, clear
-	if (t->s->main_task == t) {
-		if (t->s->nlive > 0) {
-			dlog("error: t->s->nlive %u after main task " T_ID_F " exited on " S_ID_F,
-			     t->s->nlive, t_id(t), s_id(t->s));
-		}
-		assert(t->s->nlive == 0); // else we failed to stop child tasks
-		t->s->main_task = NULL;
-	}
-
+static void t_release(T* t) {
+	if (--t->nrefs != 0)
+		return;
+	trace_sched(T_ID_F " release", t_id(t));
 	// remove GC ref to allow task (Lua thread) to be garbage collected
 	lua_State* TL = t_L(t);
 	lua_State* SL = t->s->L;
@@ -1750,6 +1593,175 @@ static void t_finalize(T* t, int status) {
 	lua_pushnil(SL);      // Use `nil` to remove the key
 	lua_rawset(SL, -3);   // reftab[thread] = nil in `SL`
 	lua_pop(SL, 1);       // Remove the thread table from the stack
+}
+
+
+static void t_remove_from_waiters(T* t) {
+	S* s = t->s;
+
+	u32 next_waiter_tid = t->info.wait_task.next_tid;
+	u32 wait_tid = t->info.wait_task.wait_tid;
+	assertf(!pool_entry_isfree(s->tasks, wait_tid), "%u", wait_tid);
+	T* other_t = s_task(s, wait_tid);
+
+	// common case is head of list
+	if (other_t->waiters == t->tid) {
+		other_t->waiters = next_waiter_tid;
+		return;
+	}
+
+	// find in middle or end of list
+	u32 next_tid = other_t->waiters;
+	while (next_tid > 0) {
+		T* waiter_t = s_task(s, next_tid);
+		assert(waiter_t->status == T_WAIT_TASK);
+		assert(waiter_t->info.wait_task.wait_tid == wait_tid);
+		next_tid = waiter_t->info.wait_task.next_tid;
+		if (next_tid == t->tid) {
+			waiter_t->info.wait_task.next_tid = next_waiter_tid;
+			return;
+		}
+	}
+
+	dlog("warning: %s " T_ID_F ": not found", __FUNCTION__, t_id(t));
+}
+
+
+static void worker_wake_waiters(Worker* w) {
+	S* s = w->parent->s;
+	for (u32 tid = w->waiters; tid > 0;) {
+		T* waiting_t = s_task(s, tid);
+		assert(waiting_t->status == T_WAIT_WORKER);
+		trace_sched("wake " T_ID_F " waiting on Worker %p", t_id(waiting_t), w);
+
+		// put waiting task on (priority) runq
+		bool ok;
+		if (tid == w->waiters) {
+			ok = s_runq_put_runnext(s, waiting_t);
+		} else {
+			ok = s_runq_put(s, waiting_t);
+		}
+		if UNLIKELY(!ok)
+			dlog("failed to allocate memory");
+
+		tid = waiting_t->info.wait_worker.next_tid;
+	}
+	w->waiters = 0;
+}
+
+
+static void t_wake_waiters(T* t) {
+	S* s = t->s;
+	for (u32 tid = t->waiters; tid > 0;) {
+		T* waiting_t = s_task(s, tid);
+		assert(waiting_t->status == T_WAIT_TASK);
+		trace_sched("wake " T_ID_F " waiting on " T_ID_F, t_id(waiting_t), t_id(t));
+
+		// put waiting task on (priority) runq
+		bool ok;
+		if (tid == t->waiters) {
+			ok = s_runq_put_runnext(s, waiting_t);
+		} else {
+			ok = s_runq_put(s, waiting_t);
+		}
+		if UNLIKELY(!ok) {
+			dlog("failed to allocate memory");
+			t_stop(t, waiting_t);
+		}
+
+		tid = waiting_t->info.wait_task.next_tid;
+	}
+	t->waiters = 0;
+}
+
+
+static Worker* s_worker(S* s) {
+	assert(s->isworker);
+	return (void*)s - offsetof(Worker, s);
+}
+
+
+static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
+	S* s = t->s;
+
+	// Note: t_stop updates t->status before calling t_finalize. For that reason we can't trust
+	// the current value of t->status in here but must use prev_tstatus.
+	trace_sched(T_ID_F " exited (died_how=%d)", t_id(t), died_how);
+	if UNLIKELY(died_how == TDied_ERR) {
+		// if this is the main task, set s->exiterr
+		if (t->tid == 1)
+			s->exiterr = true;
+
+		// one error as the final result value
+		t->resume_nres = 1;
+
+		// unless there are tasks waiting for this task, report the error as unhandled
+		if (t->waiters == 0) {
+			if (s->isworker && t->tid == 1) {
+				// main task of a worker; only report error if no task is waiting for worker
+				Worker* w = s_worker(s);
+				if (atomic_load_explicit(&w->waiters, memory_order_acquire)) {
+					free(w->errdesc); // just in case...
+					w->errdesc = t_report_error_buf(t);
+				} else {
+					t_report_error(t, "Uncaught error in worker");
+				}
+			} else {
+				t_report_error(t, "Uncaught error");
+			}
+		}
+	}
+	t->status = T_DEAD;
+
+	// decrement "live tasks" counter
+	if (s->nlive == 0) {
+		dlog("error: s->nlive==0 while task " T_ID_F " is still alive in " S_ID_F,
+		     t_id(t), s_id(t->s));
+		assert(s->nlive > 0);
+	}
+	assert(s->nlive > 0);
+	s->nlive--;
+
+	// dlog("task tree for " T_ID_F ":", t_id(t)); dlog_task_tree(t, 1);
+
+	// cancel associated waiting state
+	if (prev_tstatus == T_WAIT_TASK) {
+		// Task was stopped while waiting for another task.
+		// Remove task from list of waiters of target task.
+		t_remove_from_waiters(t);
+	}
+
+	// stop child tasks
+	if (t->first_child)
+		t_stop_r(t, s_task(s, t->first_child));
+
+	// wake any tasks waiting for this task to exit
+	if (t->waiters)
+		t_wake_waiters(t);
+
+	// if S is supposed to exit() when done, do that now if this is the last task
+	if (s->doexit && s->nlive == 0 && s->workers == NULL) {
+		trace_sched("exit(%d)", (int)s->exiterr);
+		return exit(s->exiterr);
+	}
+
+	// stop any still-running timers (optimization: skip when S is shutting down)
+	if UNLIKELY(t->ntimers && !s->isclosed)
+		t_cancel_timers(t);
+
+	if (t->parent) {
+		// remove task from parent's list of children
+		T* parent = s_task(s, t->parent);
+		t_remove_child(parent, t);
+	} else {
+		assertf(t->waiters == 0, "cannot wait for the main task");
+	}
+
+	// set info.dead.how
+	t->info.dead.how = died_how;
+
+	// release S's "live" reference to the task
+	t_release(t);
 }
 
 
@@ -1770,20 +1782,22 @@ static void t_resume(T* t) {
 	int status = lua_resume(L, t->s->L, nargs, &nres);
 
 	// check if task exited
-	if UNLIKELY(status != LUA_YIELD)
-		return t_finalize(t, status);
+	if UNLIKELY(status != LUA_YIELD) {
+		t->resume_nres = nres > 0xff ? 0xff : nres;
+		u8 died_how = (status == LUA_OK) ? TDied_CLEAN : TDied_ERR;
+		return t_finalize(t, died_how, t->status);
+	}
 
 	// discard results
 	return lua_pop(L, nres);
 }
 
 
-// t_yield schedules t for immediate resumption,
-// suspends t and switches control back to scheduler loop.
-// (Must only be called from a task, never l_main.)
+// t_yield suspends t and puts it on the run queue.
+// Switches control back to scheduler loop.
+// Note: Must only be called from a task, never l_main.
 static int t_yield(T* t, int nresults) {
 	trace_sched(T_ID_F " yield", t_id(t));
-	t->status = T_READY;
 	if UNLIKELY(!s_runq_put(t->s, t))
 		return luaL_error(t_L(t), "out of memory");
 	return lua_yieldk(t_L(t), nresults, 0, NULL);
@@ -1817,32 +1831,34 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 
 	// initialize T struct (which lives in the LUA_EXTRASPACE header of lua_State)
 	T* t = L_t(NL);
+	memset(t, 0, sizeof(*t));
 	t->s = s;
-	t->parent = parent;
-	t->next_sibling = NULL;
-	t->first_child = NULL;
-	t->inbox = NULL;
-	t->resume_nres = 0;
-	t->status = T_READY;
-	t->ntimers = 0;
+	if (parent) t->parent = parent->tid;
+	t->nrefs = 1; // S's "live" reference
 
-	// set s->main_task
-	if (!parent) {
-		assert(s->main_task == NULL);
-		s->main_task = t;
+	// allocate id and store in 'tasks' set
+	if UNLIKELY(!s_task_register(s, t)) {
+		lua_closethread(NL, L);
+		return l_errno_error(L, ENOMEM);
 	}
+	trace_sched("register task " T_ID_F, t_id(t));
+
+	// assert that main task is assigned tid 1
+	if (!parent)
+		assertf(t->tid == 1, "main task was not assigned tid 1");
 
 	// setup t to be run next by schedule
 	if UNLIKELY(!s_runq_put_runnext(s, t)) {
+		s_task_unregister(s, t);
 		lua_closethread(NL, L);
 		return l_errno_error(L, ENOMEM);
 	}
 
+	s->nlive++;
+
 	// add t as a child of parent
 	if (parent)
 		t_add_child(parent, t);
-
-	s->nlive++;
 
 	if (parent) {
 		trace_sched(T_ID_F " spawns " T_ID_F, t_id(parent), t_id(t));
@@ -1884,8 +1900,59 @@ int s_iopoll_wake(S* s, IODesc** dv, u32 count) {
 }
 
 
+static void worker_retain(Worker* w);
 static void worker_release(Worker* w);
 static bool worker_close(Worker* w);
+
+
+static void s_workers_add(S* s, Worker* w) {
+	assert(w->next == NULL);
+	w->next = s->workers;
+	s->workers = w;
+	worker_retain(w);
+}
+
+
+static void s_reap_workers(S* s) {
+	Worker* w = s->workers;
+	Worker* prev_w = NULL;
+	while (w) {
+		if (atomic_load_explicit(&w->status, memory_order_acquire) == Worker_CLOSED) {
+			trace_worker("worker %p exited", w);
+
+			// wake any tasks waiting for this worker
+			if (w->waiters)
+				worker_wake_waiters(w);
+
+			// remove from list of live workers
+			Worker* next = w->next;
+			if (prev_w) {
+				prev_w->next = next;
+			} else {
+				s->workers = next;
+			}
+			w->next = NULL;
+			worker_release(w);
+			w = next;
+		} else {
+			prev_w = w;
+			w = w->next;
+		}
+	}
+}
+
+
+static void s_check_notes(S* s, u8 notes) {
+	if (notes & S_NOTE_WEXIT)
+		s_reap_workers(s);
+
+	// Clear notes bits.
+	// We are racing with worker threads here, so use a CAS but don't loop to retry since
+	// s_check_notes is called by s_find_runnable, which will call s_check_notes again if a
+	// worker raced us and added more events.
+	atomic_compare_exchange_strong_explicit(
+		&s->notes, &notes, 0, memory_order_acq_rel, memory_order_relaxed);
+}
 
 
 static void s_shutdown(S* s) {
@@ -1899,6 +1966,7 @@ static void s_shutdown(S* s) {
 
 static void s_free(S* s) {
 	iopoll_dispose(&s->iopoll);
+	pool_free_pool(s->tasks);
 	free(s->runq);
 	array_free((struct Array*)&s->timers);
 }
@@ -1909,8 +1977,11 @@ static int s_finalize(S* s) {
 	atomic_store_explicit(&s->isclosed, true, memory_order_release);
 
 	// stop main task
-	if (s->main_task)
-		t_stop(NULL, s->main_task);
+	if (s->nlive > 0) {
+		assertf(!pool_entry_isfree(s->tasks, 1),
+		        "main task is DEAD but other tasks are still alive");
+		t_stop(NULL, s_task(s, 1));
+	}
 
 	// clear timers before GC to avoid costly (and useless) timers_remove
 	s->timers.len = 0;
@@ -1929,6 +2000,12 @@ static int s_finalize(S* s) {
 				logwarn("failed to wait for worker thread=%p: %s", w->thread, strerror(err));
 			worker_release(w);
 			w = next_w;
+		}
+
+		// if S is supposed to exit() when done, do that now
+		if (s->doexit) {
+			trace_sched("exit(%d)", (int)s->exiterr);
+			exit(s->exiterr);
 		}
 	}
 
@@ -1951,6 +2028,11 @@ static int s_find_runnable(S* s, T** tp) {
 		trace_sched(T_ID_F " taken from timers", t_id(*tp));
 		return 1;
 	}
+
+	// check for worker events
+	u8 notes = atomic_load_explicit(&s->notes, memory_order_acquire);
+	if (notes != 0)
+		s_check_notes(s, notes);
 
 	// try to grab a task from the run queue
 	if (( *tp = s_runq_get(s) )) {
@@ -1992,12 +2074,25 @@ static int s_find_runnable(S* s, T** tp) {
 	// wait for events
 	int n = iopoll_poll(&s->iopoll, deadline, deadline_leeway);
 	if UNLIKELY(n < 0) {
+		if (s->isclosed) // ignore i/o errors that occur during shutdown
+			return 0;
 		logerr("internal I/O error: %s", strerror(-n));
 		return l_errno_error(s->L, -n);
 	}
 
 	// check timers & runq again
 	TAIL_CALL s_find_runnable(s, tp);
+}
+
+
+bool runtime_handle_signal(int signo) {
+	S* s = tls_s;
+	if (s && s->doexit) {
+		trace_sched("got signal %d; shutting down " S_ID_F, signo, s_id(s));
+		atomic_store_explicit(&s->isclosed, true, memory_order_release);
+		return true;
+	}
+	return false;
 }
 
 
@@ -2016,6 +2111,10 @@ static int s_main(S* s) {
 
 	// allocate runq with inital space for (8 - 1) entries
 	if (!( s->runq = (RunQ*)fifo_alloc(8, sizeof(*s->runq)) ))
+		return l_errno_error(L, ENOMEM);
+
+	// allocate task pool with inital space for 8 entries
+	if UNLIKELY(!pool_init(&s->tasks, 8, sizeof(T*)))
 		return l_errno_error(L, ENOMEM);
 
 	// initialize platform I/O facility
@@ -2049,9 +2148,13 @@ static int s_main(S* s) {
 }
 
 
+// fun main(main fun(), exit_when_done bool = true)
 static int l_main(lua_State* L) {
 	// create scheduler for this OS thread & Lua context
-	S* s = &(S){ .L = L };
+	S* s = &(S){
+		.L = L,
+		.doexit = lua_isboolean(L, 2) ? lua_toboolean(L, 2) : true,
+	};
 	return s_main(s);
 }
 
@@ -2060,9 +2163,9 @@ static int l_main(lua_State* L) {
 // This allows a timer to be referenced by userland independently of its state.
 typedef struct WorkerObj { Worker* w; } WorkerObj;
 
-// static WorkerObj* nullable l_workerobj_check(lua_State* L, int idx) {
-// 	return l_uobj_check(L, idx, &g_workerobj_luatabkey, "Worker");
-// }
+static WorkerObj* nullable l_workerobj_check(lua_State* L, int idx) {
+	return l_uobj_check(L, idx, &g_workerobj_luatabkey, "Worker");
+}
 
 
 int luaopen_runtime(lua_State* L);
@@ -2070,54 +2173,20 @@ int luaopen_runtime(lua_State* L);
 
 static void worker_free(Worker* w) {
 	trace_worker("free");
-	free(w->mainfun_lcode);
+	free(w->errdesc);
 	free(w);
 }
 
 
 static void worker_retain(Worker* w) {
-	__attribute__((unused)) u8 nrefs =
-		atomic_fetch_add_explicit(&w->nrefs, 1, memory_order_acq_rel);
-	assert(nrefs < 0xff && "overflow");
+	UNUSED u8 nrefs = atomic_fetch_add_explicit(&w->nrefs, 1, memory_order_acq_rel);
+	assert(nrefs < 0xff || !"overflow");
 }
 
 
 static void worker_release(Worker* w) {
-	u8 nrefs = atomic_fetch_sub_explicit(&w->nrefs, 1, memory_order_acq_rel);
-	if (nrefs == 1)
+	if (atomic_fetch_sub_explicit(&w->nrefs, 1, memory_order_acq_rel) == 1)
 		worker_free(w);
-}
-
-
-static void s_workers_add(S* s, Worker* w) {
-	assert(w->next == NULL);
-	w->next = s->workers;
-	s->workers = w;
-	worker_retain(w);
-}
-
-
-static void s_workers_remove_r(Worker* find_w, Worker* prev_w, Worker* curr_w) {
-	if (curr_w == find_w) {
-		prev_w->next = curr_w->next;
-		curr_w->next = NULL;
-		worker_release(find_w);
-	} else {
-		s_workers_remove_r(find_w, curr_w, curr_w->next);
-	}
-}
-
-
-static void s_workers_remove(S* s, Worker* w) {
-	if (s->workers == w) {
-		// remove from head of list
-		s->workers = w->next;
-		w->next = NULL;
-		worker_release(w);
-	} else {
-		// remove from middle of list
-		s_workers_remove_r(w, s->workers, s->workers->next);
-	}
 }
 
 
@@ -2139,14 +2208,13 @@ static const char* worker_load_reader(lua_State* L, void* ud, usize* lenp) {
 
 // worker_cas_status attempts to set w->status to next_status.
 // Returns false if another thread set CLOSED "already" (it's a race.)
-static bool worker_cas_status(Worker* w, WorkerStatus next_status) {
-	WorkerStatus status = atomic_load_explicit(&w->status, memory_order_acquire);
+static bool worker_cas_status(Worker* w, u8 next_status) {
+	u8 status = atomic_load_explicit(&w->status, memory_order_acquire);
 	for (;;) {
-		if (status == WorkerStatus_CLOSED)
+		if (status == Worker_CLOSED)
 			return false;
 		if (atomic_compare_exchange_strong_explicit(
-				&w->status, &status, next_status,
-				memory_order_acq_rel, memory_order_relaxed))
+				&w->status, &status, next_status, memory_order_acq_rel, memory_order_relaxed))
 		{
 			return true;
 		}
@@ -2154,12 +2222,33 @@ static bool worker_cas_status(Worker* w, WorkerStatus next_status) {
 }
 
 
+static void s_notify(S* s, u8 addl_notes) {
+	// Called from another OS thread than S is running on
+	u8 notes = atomic_load_explicit(&s->notes, memory_order_acquire);
+	for (;;) {
+		u8 newnotes = notes | addl_notes;
+		if (atomic_compare_exchange_strong_explicit(
+				&s->notes, &notes, newnotes, memory_order_acq_rel, memory_order_relaxed))
+		{
+			break;
+		}
+	}
+	iopoll_interrupt(&s->iopoll);
+}
+
+
 static void worker_thread_exit(Worker** wp) {
 	Worker* w = *wp;
 	trace_worker("exit");
+
+	// set status to CLOSED (likely already set via worker_cas_status)
+	atomic_store_explicit(&w->status, Worker_CLOSED, memory_order_release);
+
+	// tell parent S that we exited
+	s_notify(w->parent->s, S_NOTE_WEXIT);
+
 	if (w->s.L)
 		lua_close(w->s.L);
-	atomic_store_explicit(&w->status, WorkerStatus_CLOSED, memory_order_release);
 	worker_release(w);
 }
 
@@ -2184,7 +2273,7 @@ static void worker_thread(Worker* w) {
 	lua_setglobal(L, "__rt");
 
 	// switch status to READY while checking if worker has been closed
-	if UNLIKELY(!worker_cas_status(w, WorkerStatus_READY))
+	if UNLIKELY(!worker_cas_status(w, Worker_READY))
 		return trace_worker("CLOSED before getting READY");
 
 	// actual work happens now
@@ -2211,21 +2300,25 @@ static void worker_thread(Worker* w) {
 		s_main(&w->s);
 	} else {
 		// allow passing a w->f to be run here
-		dlog("TODO: worker function");
+		assert(!"TODO: worker function");
 	}
 
 	pthread_cleanup_pop(&cleanup_pop_arg);
 }
 
 
-static int worker_open(Worker** wp, void* nullable mainfun_lcode, u32 mainfun_lcode_len) {
+static int worker_open(
+	Worker** wp, T* parent, void* nullable mainfun_lcode, u32 mainfun_lcode_len)
+{
 	Worker* w = calloc(1, sizeof(Worker));
 	if (!w)
 		return -ENOMEM;
-	w->status = WorkerStatus_OPEN;
+	w->parent = parent;
+	w->status = Worker_OPEN;
 	w->nrefs = 2; // thread + caller
 	w->mainfun_lcode_len = mainfun_lcode_len;
 	w->mainfun_lcode = mainfun_lcode;
+	w->s.isworker = true;
 	pthread_attr_t* thr_attr = NULL;
 	int err = pthread_create(&w->thread, thr_attr, (void*(*)(void*))worker_thread, w);
 	trace_sched("spawn worker thread=%p", w->thread);
@@ -2241,7 +2334,7 @@ static int worker_open(Worker** wp, void* nullable mainfun_lcode, u32 mainfun_lc
 static bool worker_close(Worker* w) {
 	assert(pthread_self() != w->thread); // must not call from worker's own thread
 
-	if (!worker_cas_status(w, WorkerStatus_CLOSED)) {
+	if (!worker_cas_status(w, Worker_CLOSED)) {
 		// already closed
 		return false;
 	}
@@ -2272,7 +2365,7 @@ static int l_spawn_worker(lua_State* L) {
 
 	// start a worker
 	Worker* w;
-	if UNLIKELY(( err = worker_open(&w, buf.bytes, buf.len) )) {
+	if UNLIKELY(( err = worker_open(&w, t, buf.bytes, buf.len) )) {
 		buf_free(&buf);
 		return l_errno_error(L, -err);
 	}
@@ -2492,6 +2585,164 @@ static int l_read(lua_State* L) {
 }
 
 
+static int l_recv_deliver(lua_State* L, T* t, InboxMsg* msg) {
+	trace_sched(T_ID_F " deliver msg type=%u", t_id(t), msg->type);
+	lua_pushinteger(L, msg->type);
+	lua_pushinteger(L, (uintptr)msg->sender); // FIXME
+	lua_pushinteger(L, (uintptr)msg->data); // FIXME
+	return 3;
+}
+
+
+static int l_recv_cont(lua_State* L, int ltstatus, void* arg) {
+	T* t = arg;
+	assert(t->inbox != NULL);
+	InboxMsg* msg = inbox_pop(t->inbox);
+	assert(msg != NULL);
+	return l_recv_deliver(L, t, msg);
+}
+
+
+// fun recv(from... Task|Worker) (type, sender int, data any)
+// If no 'from' is specified, receive from anyone
+static int l_recv(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+
+	// check if there's a message ready in the inbox
+	if (t->inbox) {
+		InboxMsg* msg = inbox_pop(t->inbox);
+		if (msg)
+			return l_recv_deliver(L, t, msg);
+	}
+
+	// check for deadlock
+	S* s = t->s;
+	if UNLIKELY(s->runnext == NULL && s->runq->fifo.head == s->runq->fifo.tail) {
+		// empty runq
+		if (s->nlive == 1 && t->ntimers == 0) {
+			// T is the only live task and no timers are active
+			return luaL_error(t_L(t), "deadlock detected: recv would never return");
+		}
+	}
+
+	// will for a message
+	return t_suspend(t, T_WAIT_RECV, t, l_recv_cont);
+}
+
+
+static int l_await_task_cont1(lua_State* L, T* t, T* other_t) {
+	// first return value is status 0=error, 1=clean exit, 2=stopped
+	lua_pushinteger(L, other_t->info.dead.how);
+
+	// copy return values from other task
+	int nres = other_t->resume_nres;
+	lua_State* other_L = t_L(other_t);
+	l_copy_values(other_L, L, nres);
+
+	return nres + 1;
+}
+
+
+static int l_await_task_cont(lua_State* L, int ltstatus, void* arg) {
+	T* t = arg;
+
+	// note: even though other_t is T_DEAD, its memory is still valid
+	// since await holds a GC reference via arguments.
+	T* other_t = s_task(t->s, t->info.wait_task.wait_tid);
+
+	return l_await_task_cont1(L, t, other_t);
+}
+
+
+// fun await(t Task) (ok int, ... any)
+// Returns ok=0 on error with the error as the 2nd result.
+// Returns ok=1 on clean exit with return values from t as rest results.
+// Returns ok=2 if t was stopped.
+static int l_await_task(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	T* other_t = l_check_task(L, 1);
+	if (!other_t)
+		return 0;
+
+	// a task can't await itself
+	if UNLIKELY(t == other_t)
+		return luaL_error(L, "attempt to 'await' itself");
+
+	// if the other task already existed, we can return immediately
+	if (other_t->status == T_DEAD)
+		return l_await_task_cont1(L, t, other_t);
+
+	// we don't support waiting for a task running on a different OS thread (Worker)
+	if UNLIKELY(other_t->s != t->s)
+		return luaL_error(L, "attempt to await task of a different Worker");
+
+	// other task cannot possibly be running, since the calling task is running
+	assert(other_t->status != T_RUNNING);
+
+	// add t to list of tasks waiting for other_t
+	t->info.wait_task.next_tid = other_t->waiters;
+	t->info.wait_task.wait_tid = other_t->tid;
+	other_t->waiters = t->tid;
+
+	t->resume_nres = 0;
+
+	// wait
+	return t_suspend(t, T_WAIT_TASK, t, l_await_task_cont);
+}
+
+
+static int l_await_worker_cont1(lua_State* L, Worker* w) {
+	if LIKELY(w->s.exiterr == 0) {
+		lua_pushboolean(L, true);
+		return 1;
+	}
+	// worker exited because of an error
+	lua_pushboolean(L, false);
+	lua_pushstring(L, (w->errdesc && *w->errdesc) ? w->errdesc : "unknown error");
+	return 2;
+}
+
+
+static int l_await_worker_cont(lua_State* L, int ltstatus, void* arg) {
+	return l_await_worker_cont1(L, arg);
+}
+
+
+// fun await(w Worker) (ok bool)
+// Returns true if w exited cleanly or false if w exited because of an error.
+static int l_await_worker(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	WorkerObj* obj = l_uobj_check(L, 1, &g_workerobj_luatabkey, "Task or Worker");
+	if (!obj)
+		return 0;
+	Worker* w = obj->w;
+
+	// can't await the worker the calling task is running on
+	if UNLIKELY(t->s == &w->s)
+		return luaL_error(L, "attempt to 'await' itself");
+
+	// Add t to list of tasks waiting for w.
+	// Note that this list is only ever modified by this current thread,
+	// but is read by the worker's thread.
+	t->info.wait_worker.next_tid = w->waiters;
+	atomic_store_explicit(&w->waiters, t->tid, memory_order_release);
+
+	// check if worker exited already
+	if (atomic_load_explicit(&w->status, memory_order_acquire) == Worker_CLOSED)
+		return l_await_worker_cont1(L, w);
+
+	t->resume_nres = 0;
+	return t_suspend(t, T_WAIT_WORKER, w, l_await_worker_cont);
+}
+
+
+static int l_await(lua_State* L) {
+	if (lua_isthread(L, 1))
+		return l_await_task(L);
+	return l_await_worker(L);
+}
+
+
 static int l_taskblock_begin(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 	trace_sched("taskblock_begin");
@@ -2535,6 +2786,7 @@ static const luaL_Reg dew_lib[] = {
 	{"timer_start", l_timer_start},
 	{"timer_update", l_timer_update},
 	{"timer_stop", l_timer_stop},
+	{"await", l_await},
 	{"recv", l_recv},
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},

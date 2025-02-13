@@ -65,6 +65,8 @@ static int msghandler(lua_State* L) {
 		#define dew_setsignal signal
 	#endif
 
+	bool runtime_handle_signal(int signo); // runtime.c
+
 	// Hook set by signal function to stop the interpreter
 	static void stop_process(lua_State* L, lua_Debug* ar) {
 		(void)ar; // unused
@@ -76,8 +78,12 @@ static int msghandler(lua_State* L) {
 	// (as there is no proper synchronization), this function only sets a hook that, when called,
 	// will stop the interpreter.
 	static void signal_handler(int signo) {
+		// dlog("signal_handler invoked with signo=%d", signo);
 		dew_setsignal(signo, SIG_DFL); // if another SIGINT happens, terminate process
-		lua_sethook(g_L, stop_process, LUA_MASKCALL | LUA_MASKRET | LUA_MASKLINE | LUA_MASKCOUNT, 1);
+		if (!runtime_handle_signal(signo)) {
+			lua_sethook(g_L, stop_process,
+			            LUA_MASKCALL | LUA_MASKRET | LUA_MASKLINE | LUA_MASKCOUNT, 1);
+		}
 	}
 #endif
 

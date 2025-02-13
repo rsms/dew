@@ -770,16 +770,16 @@
 ** CHANGE it if you need a different size.
 */
 // #define LUA_EXTRASPACE		(sizeof(void *))
-#define SIZEOF_DEW_T    (sizeof(void*)*5 + sizeof(int)*2) /* dew's struct T */
+#define SIZEOF_DEW_T    (sizeof(void*)*2 + sizeof(int)*8 + sizeof(uint64_t)) /* dew's struct T */
 #define LUA_EXTRASPACE  SIZEOF_DEW_T
 
-// // [dew] luai_userstatefree is called by luaE_freethread when a lua thread is free'd (GC'd.)
-// // We use this for a callback.
-// // L is parent, L1 is lua thread
-// typedef struct lua_State lua_State;
-// typedef struct T T;
-// void t_gc(lua_State* L, T*);
-// #define luai_userstatefree(L, L1) t_gc((L), (T*)((void*)(L1) - SIZEOF_DEW_T))
+// [dew] luai_userstatefree is called by luaE_freethread when a lua thread is free'd (GC'd.)
+// We use this for a callback.
+// L is parent, L1 is lua thread
+typedef struct lua_State lua_State;
+typedef struct T T;
+void t_gc(lua_State* L, T*);
+#define luai_userstatefree(L, L1) t_gc((L), (T*)((void*)(L1) - SIZEOF_DEW_T))
 
 
 /*

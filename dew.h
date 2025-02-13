@@ -15,7 +15,6 @@
 #include <string.h>
 #include <fcntl.h>
 #include <time.h>
-#include <assert.h>
 
 #include <lua.h>
 #include <lauxlib.h>
@@ -82,13 +81,19 @@ typedef double    float64;
 	#define WARN_UNUSED_RESULT
 #endif
 
+#if __has_attribute(unused)
+	#define UNUSED __attribute__((unused))
+#else
+	#define UNUSED
+#endif
+
 // __attribute__((noreturn)) void unreachable()
 #if __has_builtin(__builtin_unreachable)
-	#define unreachable() (assert(!"unreachable"),__builtin_unreachable())
+	#define unreachable() (panic("unreachable"),__builtin_unreachable())
 #elif __has_builtin(__builtin_trap)
-	#define unreachable() (assert(!"unreachable"),__builtin_trap)
+	#define unreachable() (panic("unreachable"),__builtin_trap)
 #else
-	#define unreachable() (assert(!"unreachable"),abort())
+	#define unreachable() (panic("unreachable"),abort())
 #endif
 
 #if __has_attribute(musttail) && !defined(__wasm__)
@@ -100,6 +105,21 @@ typedef double    float64;
 	#define MUSTTAIL
 #endif
 #define TAIL_CALL MUSTTAIL return
+
+#if __has_attribute(format)
+	#define ATTR_FORMAT(archetype, fmtarg, checkarg) \
+		__attribute__((format(archetype, fmtarg, checkarg)))
+#else
+	#define ATTR_FORMAT(archetype, fmtarg, checkarg)
+#endif
+
+// C23 introduced some aliases for "uglified" standard C functions.
+// Define them here for older C standards.
+// Testing for <202000L instead of <202300L because --std=c2x.
+#if __STDC_VERSION__ < 202000L
+	#define thread_local _Thread_local
+	#define static_assert _Static_assert
+#endif
 
 #define API_BEGIN \
 	_Pragma("clang diagnostic push") \
@@ -113,6 +133,13 @@ typedef double    float64;
 #ifndef countof
 	#define countof(x) \
 		( (sizeof(x)/sizeof(0[x])) / ((usize)(!(sizeof(x) % sizeof(0[x])))) )
+#endif
+
+#if __has_builtin(__builtin_offsetof)
+	#undef offsetof
+	#define offsetof __builtin_offsetof
+#elif !defined(offsetof)
+	#define offsetof(st, m) ((usize)&(((st*)0)->m))
 #endif
 
 #define MAX(a,b) ( \
@@ -231,11 +258,43 @@ typedef double    float64;
 	#define dlog(...) ((void)0)
 #endif
 
+
+// assert
+#undef assert
+#ifdef DEBUG
+	#define _assertfail(fmt, args...) \
+		_panic(__FILE__, __LINE__, __FUNCTION__, "Assertion failed: " fmt, args)
+	#define assert(cond) \
+		(UNLIKELY(!(cond)) ? _assertfail("%s", #cond) : ((void)0))
+	#define assertf(cond, fmt, args...) \
+		(UNLIKELY(!(cond)) ? _assertfail(fmt " (%s)", ##args, #cond) : ((void)0))
+	#define assertnull(a) \
+		assert((a) == NULL)
+	#define assertnotnull(a) ({ \
+		__typeof__(*(a))* nullable val__ = (a); \
+		UNUSED const void* valp__ = val__; /* build bug on non-pointer */ \
+		if (UNLIKELY(val__ == NULL)) \
+			_assertfail("%s != NULL", #a); \
+		val__; \
+	})
+#else
+	#define assert(cond) ((void)0)
+	#define assertf(cond, fmt, args...) ((void)0)
+	#define assertnull(cond) ((void)0)
+	#define assertnotnull(expr) ({ expr; })
+#endif
+
+
 API_BEGIN
 
 extern const char* g_prog; // dew.c
 
 void _logmsg(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+
+// panic prints a message with stack trace and then calls abort()
+_Noreturn void _panic(
+	const char* file, int line, const char* fun, const char* fmt, ...) ATTR_FORMAT(printf, 4, 5);
+#define panic(fmt, args...) _panic(__FILE__, __LINE__, __FUNCTION__, fmt, ##args)
 
 
 static inline WARN_UNUSED_RESULT bool __must_check_unlikely(bool unlikely) {
@@ -314,7 +373,7 @@ i64 DTimeDurationMicroseconds(DTimeDuration d);
 i64 DTimeDurationNanoseconds(DTimeDuration d);
 
 
-
+// Array is a dynamic array
 struct Array { u32 cap, len; void* nullable v; };
 #define Array(T) struct { u32 cap, len; T* nullable v; }
 void array_free(struct Array* a); // respects embedded a->v
@@ -324,6 +383,54 @@ inline static void* nullable array_reserve(struct Array* a, u32 elemsize, u32 mi
 	       _array_reserve(a, elemsize, minavail);
 }
 bool array_append(struct Array* a, u32 elemsize, const void* elemv, u32 elemc);
+
+
+// FIFO is a queue
+typedef struct FIFO {
+	u32 cap;
+	u32 head;
+	u32 tail;
+	u32 _alignment_padding;
+	//TYPE entries[];
+} FIFO;
+FIFO* nullable fifo_alloc(u32 cap, usize elemsize);
+void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap);
+void* nullable fifo_pop(FIFO* q, usize elemsize);
+
+
+// Pool maps data to dense indices.
+// It's like a slab allocator that uses u32 integers as addresses.
+// Think "file descriptor allocator" rather than "virtual-memory allocator."
+// Tries to be cache friendly by always using the smallest free index during allocation.
+typedef struct Pool {
+	u32 cap;      // capacity, a multiple of 64
+	u32 maxidx;   // max allocated index
+	u64 freebm[]; // bitmap; bit=1 means entries[bit] is free
+	// TYPE entries[];
+} Pool;
+bool pool_init(Pool** pp, u32 cap, usize elemsize);
+inline static void pool_free_pool(Pool* nullable p) { free(p); }
+void* nullable pool_entry_alloc(Pool** pp, u32* idxp, usize elemsize);
+void pool_entry_free(Pool* p, u32 idx);
+u32 _pool_find_entry(const Pool* p, const void* entry_ptr, usize elemsize);
+u32 _pool_find_entry_ptr(const Pool* p, const void* entry_val);
+inline static u32 pool_find_entry(const Pool* p, const void* entry_ptr, usize elemsize) {
+	if (elemsize == sizeof(void*))
+		return _pool_find_entry_ptr(p, *(const void**)entry_ptr);
+	return _pool_find_entry(p, entry_ptr, elemsize);
+}
+inline static bool pool_entry_isfree(const Pool* p, u32 idx) {
+	u32 chunk_idx = (idx - 1) >> 6; // (idx-1)/64
+	u32 bit_idx = (idx - 1) & (64 - 1); // (idx-1)%64
+	return idx > 0 && idx <= p->cap && (p->freebm[chunk_idx] & ((u64)1 << bit_idx));
+}
+inline static void* pool_entries(const Pool* p) {
+	return (void*)p->freebm + (p->cap >> 3); // + cap/bytes_per_freebm
+}
+inline static void* pool_entry(const Pool* p, u32 idx, usize elemsize) {
+	assert(idx > 0 && idx <= p->maxidx);
+	return pool_entries(p) + (idx-1)*elemsize;
+}
 
 
 API_END

@@ -84,7 +84,9 @@ int iopoll_interrupt(IOPoll* iopoll) {
 	};
 	int err = kevent64(iopoll->kq, &req, 1, NULL, 0, 0, NULL);
 	if UNLIKELY(err < 0) {
-		dlog("kevent64 failed to setup EVFILT_USER");
+		// note: EPERM may happen here when S is shutting down
+		if (iopoll->s != NULL && !iopoll->s->isclosed)
+			dlog("kevent64 failed to setup EVFILT_USER: %s", strerror(-err));
 		close(iopoll->kq);
 		return err;
 	}
@@ -218,7 +220,9 @@ int iopoll_poll(IOPoll* iopoll, DTime deadline, DTimeDuration deadline_leeway) {
 		// check for error
 		if UNLIKELY(n < 0) {
 			if (n != -EINTR && n != -ETIMEDOUT) {
-				logerr("kevent on fd %d failed: %s", iopoll->kq, strerror(-n));
+				// ignore errors that happens while S is closing
+				if (!iopoll->s->isclosed)
+					logerr("kevent on fd %d failed: %s", iopoll->kq, strerror(-n));
 				return -n;
 			}
 			if (deadline > 0) {
