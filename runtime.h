@@ -64,14 +64,18 @@ struct TimerInfo {
 typedef Array(TimerInfo) TimerPQ;
 
 enum InboxMsgType {
-	InboxMsgType_TIMER,      // timer rang
-	InboxMsgType_CHILD_EXIT, // parent task notified about child task existing
+	InboxMsgType_TIMER, // timer rang
+	InboxMsgType_MSG,   // message via send()
 };
 
 struct InboxMsg {
-	u8             type; // enum InboxMsgType
-	T* nullable    sender;
-	void* nullable data;
+	u8  type; // enum InboxMsgType
+	int nres; // number of result values
+	union {
+		struct {
+			T* sender;
+		} msg;
+	};
 };
 
 struct Inbox {
@@ -202,7 +206,7 @@ struct Worker {
 #define S_ID_F  "S#%lx"
 
 // t_id formats an identifier of a T for logging
-#define t_id(t) (t)->tid, ((unsigned long)(uintptr)(t))
+#define t_id(t) (t)->tid, ((unsigned long)(uintptr)t_L(t))
 #define T_ID_F  "T%u#%lx"
 
 

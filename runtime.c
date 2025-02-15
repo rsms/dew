@@ -2587,10 +2587,7 @@ static int l_read(lua_State* L) {
 
 static int l_recv_deliver(lua_State* L, T* t, InboxMsg* msg) {
 	trace_sched(T_ID_F " deliver msg type=%u", t_id(t), msg->type);
-	lua_pushinteger(L, msg->type);
-	lua_pushinteger(L, (uintptr)msg->sender); // FIXME
-	lua_pushinteger(L, (uintptr)msg->data); // FIXME
-	return 3;
+	return msg->nres;
 }
 
 
@@ -2603,7 +2600,7 @@ static int l_recv_cont(lua_State* L, int ltstatus, void* arg) {
 }
 
 
-// fun recv(from... Task|Worker) (type, sender int, data any)
+// fun recv(from... Task|Worker) (type int, sender any, data any)
 // If no 'from' is specified, receive from anyone
 static int l_recv(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
@@ -2625,8 +2622,63 @@ static int l_recv(lua_State* L) {
 		}
 	}
 
-	// will for a message
+	// wait for a message
 	return t_suspend(t, T_WAIT_RECV, t, l_recv_cont);
+}
+
+
+// fun send(Task destination, msg... any)
+static int l_send(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+
+	T* dst_t = l_check_task(L, 1);
+	if (!dst_t)
+		return 0;
+
+	// if destination task is already waiting for a message, deliver it directly
+	if (dst_t->status == T_WAIT_RECV) {
+		dlog("send directly");
+		// Note: inbox must be empty in this case since destination task is waiting for a message
+		InboxMsg* msg = inbox_add(&dst_t->inbox);
+		if UNLIKELY(msg == NULL)
+			return l_errno_error(L, ENOMEM);
+		memset(msg, 0, sizeof(*msg));
+		msg->type = InboxMsgType_MSG;
+		msg->msg.sender = t;
+
+		// move message(s) from this function's argument to destination task's L stack,
+		// which is essentially the stack (activation record) of the recv() function call
+		// that dst_t is "in."
+		lua_State* dst_L = t_L(dst_t);
+		lua_pushinteger(dst_L, msg->type); // push message type
+		lua_pushthread(L);   // Push the thread onto its own stack
+		lua_xmove(L, dst_L, 1); // Move the thread object to the `SL` state
+		int nres = lua_gettop(L) - 1; // minus the destination argument
+		msg->nres = nres + 2; // + msg.type + sender
+		lua_xmove(L, dst_L, nres); // move any arguments passed after dst to send()
+
+		// Now, there are two options for how to resume the waiting receiver task.
+		// Either we can switch to it right here, by passing the scheduler,
+		// or we can put the receiver task on the priority run queue and switch to the scheduler.
+		// On my MacBook, a direct switch takes on average 140ns while going through the
+		// scheduler takes on average 170ns. Very small difference in practice.
+		// While switching directly is more efficient, it has the disadvantage of allowing two
+		// tasks to hog the scheduler, by ping ponging send, recv send, recv send, ...
+		// So we are going through the scheduler. A wee bit less efficient but more correct.
+		#if 0
+			dst_t->resume_nres = 0;
+			t_resume(dst_t);
+			return 0;
+		#else
+			// put destination task in the priority runq so that it runs asap
+			s_runq_put_runnext(t->s, dst_t);
+
+			// put the sender task at the end of the runq and return to scheduler loop (s_main)
+			return t_yield(t, 0);
+		#endif
+	}
+
+	return luaL_error(L, "TODO WIP");
 }
 
 
@@ -2708,7 +2760,7 @@ static int l_await_worker_cont(lua_State* L, int ltstatus, void* arg) {
 }
 
 
-// fun await(w Worker) (ok bool)
+// fun await(w Worker) (ok bool, err string)
 // Returns true if w exited cleanly or false if w exited because of an error.
 static int l_await_worker(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
@@ -2788,6 +2840,7 @@ static const luaL_Reg dew_lib[] = {
 	{"timer_stop", l_timer_stop},
 	{"await", l_await},
 	{"recv", l_recv},
+	{"send", l_send},
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
 

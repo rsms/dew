@@ -6,22 +6,22 @@ Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
 OBJDIR       := $(BUILDDIR)/obj
-SRCS         := dew.c panic.c logmsg.c array.c fifo.c pool.c time.c runtime.c platform.c \
+DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c pool.c time.c runtime.c platform.c \
                 lib_bignum.c bn.c
 LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c \
                 lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c \
                 lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c \
                 loslib.c lstrlib.c ltablib.c lutf8lib.c linit.c
 LUA_SRCS     := $(sort $(addprefix lua/src/,$(LUA_SRCS)))
-JSSRCS       := $(wildcard web/*.ts web/index.html)
+DEW_JSSRCS   := $(wildcard web/*.ts web/index.html)
 CFLAGS       := -std=c17 -g -fdebug-compilation-dir=/x/ \
                 -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
                 -Werror=incompatible-pointer-types \
                 -Werror=pointer-integer-compare \
                 -Werror=int-conversion \
-                -Ilua/src $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
+                -Ilua/src
+DEW_CFLAGS   := -D__dew__=1 $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
 LDFLAGS      :=
-LIBEV_CFLAGS := -Wno-comment -Wno-sign-compare -Wno-extern-initializer -Wno-bitwise-op-parentheses
 LUA_CFLAGS   :=
 LUA          := o.$(NATIVE_SYS)/lua
 LUAC         := o.$(NATIVE_SYS)/luac
@@ -34,7 +34,7 @@ else ifeq ($(TARGET),linux)
 	LUA_CFLAGS += -DLUA_USE_LINUX
 	LDFLAGS += -Wl,-E -ldl
 else ifeq ($(TARGET),web)
-	SRCS += wasm.c
+	DEW_SRCS += wasm.c
 	ALL := $(BUILDDIR)/dew.wasm $(BUILDDIR)/dew.js $(BUILDDIR)/index.html
 	CFLAGS += --target=wasm32-playbit -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS
 	CFLAGS += -fvisibility=hidden
@@ -83,13 +83,14 @@ else
 endif
 
 ifeq ($(DEBUG),1)
-	CFLAGS += -DDEBUG=1
+	DEW_CFLAGS += -DDEBUG=1
 	ifneq ($(TARGET),web)
 		CFLAGS += -fsanitize=address,undefined
 		LDFLAGS += -fsanitize=address,undefined
 	endif
 else ifeq ($(TEST),1)
-	CFLAGS += -DDEBUG=1 -O1 -fsanitize=address,undefined
+	DEW_CFLAGS += -DDEBUG=1
+	CFLAGS += -O1 -fsanitize=address,undefined
 	LDFLAGS += -fsanitize=address,undefined
 else
 	CFLAGS += -DNDEBUG -flto=thin $(if $(filter $(TARGET),web),-Oz,-O2)
@@ -101,16 +102,17 @@ else
 	LDFLAGS += -Wl,--thinlto-cache-dir=$(BUILDDIR)/lto
 endif
 
-LUA_OBJS := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(LUA_SRCS)))
-DEW_OBJS := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(SRCS)))
-OBJS     := $(DEW_OBJS) $(LUA_OBJS)
+DEW_OBJS    := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(DEW_SRCS)))
+LUADEW_OBJS := $(addprefix $(OBJDIR)/,$(patsubst %,%.o,$(LUA_SRCS)))
+LUAEXE_OBJS := $(addprefix $(OBJDIR)/luaexe.,$(patsubst %,%.o,$(LUA_SRCS)))
+OBJS        := $(DEW_OBJS) $(LUADEW_OBJS) $(LUAEXE_OBJS)
 
 all: $(ALL)
 clean:
 	rm -rf o.*
 
 dev:
-	autorun *.c *.h *.lua tests/rt/*.* lua/src/*.c libev/*.* examples/*.dew \
+	autorun *.c *.h *.lua tests/rt/*.* lua/src/*.c examples/*.dew \
 	-- '$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
 _dev: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew examples/dev.dew --debug-tokens --debug-parse --debug-resolve --debug-codegen
@@ -125,12 +127,12 @@ _test: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew --selftest$(if $(filter 1,$(V)),=v,)
 
 
-$(BUILDDIR)/dew: $(OBJS)
+$(BUILDDIR)/dew: $(DEW_OBJS) $(LUADEW_OBJS)
 	$(QLOG) "LINK  $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)$(CC) -o $@ $^ $(LDFLAGS)
 
-LSRCS := \
+DEW_LSRCS := \
 	util.lua \
 	unit.lua \
 	diag.lua \
@@ -141,12 +143,14 @@ LSRCS := \
 	parse.lua \
 	resolve.lua \
 	codegen.lua
-$(BUILDDIR)/dew.lua: $(LSRCS) dew.lua
+$(BUILDDIR)/dew.lua: $(DEW_LSRCS) dew.lua
 	$(QLOG) "GEN   $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)rm -f $@
 	$(Q)$(foreach f,$^,cat $(f) >> $@;)
-	$(Q)sed -i '' -E 's/\s*(require\()/--\1/' $@
+	$(Q)sed -i '' -E \
+		-e 's/\s*([^\(]require\()/--\1/' \
+		$@
 
 $(BUILDDIR)/dew.lua.o: $(BUILDDIR)/dew.lua $(LUAC)
 	$(QLOG) "LUAC  $@"
@@ -166,7 +170,7 @@ $(BUILDDIR)/dew.wasm: $(BUILDDIR)/dew.1.wasm
 	$(QLOG) "WOPT  $@"
 	$(Q)wasm-opt $(WOPTFLAGS) $< -o $@
 
-$(BUILDDIR)/dew.js: web/dew.ts $(ESBUILD) $(JSSRCS)
+$(BUILDDIR)/dew.js: web/dew.ts $(ESBUILD) $(DEW_JSSRCS)
 	$(QLOG) "ESBLD $@"
 	$(Q)$(ESBUILD) --bundle $(JSFLAGS) --outfile=$@ $<
 
@@ -179,7 +183,7 @@ $(BUILDDIR)/index.html: web/index.html
 ifeq ($(NATIVE_SYS),$(TARGET))
 $(LUA):  lua/src/lua.c
 $(LUAC): lua/src/luac.c
-$(LUA) $(LUAC): $(LUA_OBJS)
+$(LUA) $(LUAC): $(LUAEXE_OBJS)
 	$(QLOG) "LINK  $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)$(CC) -o $@ $^ $(LDFLAGS)
@@ -192,7 +196,9 @@ ifeq ($(EMBED_SRC),1)
 $(OBJDIR)/dew.c.o: $(BUILDDIR)/dew.lua.h
 endif
 
-$(OBJDIR)/libev/ev.c.o: CFLAGS += $(LIBEV_CFLAGS)
+$(DEW_OBJS):    override CFLAGS := $(CFLAGS) $(DEW_CFLAGS)
+$(LUADEW_OBJS): override CFLAGS := $(CFLAGS) $(DEW_CFLAGS) $(LUA_CFLAGS)
+$(LUAEXE_OBJS): override CFLAGS := $(CFLAGS) $(LUA_CFLAGS)
 
 ifeq ($(TARGET),web)
 $(OBJS): _deps/llvm/bin/clang
@@ -202,7 +208,9 @@ $(OBJS): _deps/llvm/bin/clang
 # 	$(Q)$(CXX) -MP -MMD $(CFLAGS) $(CXXFLAGS) -std=c++17 -xc++ -c -o "$@" $<
 endif
 
-$(OBJDIR)/lua/src/%.c.o: CFLAGS += $(LUA_CFLAGS)
+$(OBJDIR)/luaexe.%.c.o: %.c
+	$(QLOG) "CC    $<"
+	$(Q)$(CC) -MP -MMD $(CFLAGS) -c -o "$@" $<
 $(OBJDIR)/%.c.o: %.c
 	$(QLOG) "CC    $<"
 	$(Q)$(CC) -MP -MMD $(CFLAGS) -c -o "$@" $<
@@ -211,9 +219,9 @@ $(OBJDIR)/%.cc.o: %.cc
 	$(Q)$(CXX) -MP -MMD $(CFLAGS) $(CXXFLAGS) -std=c++17 -xc++ -c -o "$@" $<
 
 # source file dependencies
-OBJ_DIRS := $(sort $(patsubst %/,%,$(dir $(OBJS))))
-$(OBJS): | $(OBJ_DIRS)
-$(OBJ_DIRS):
+DIRST := $(sort $(patsubst %/,%,$(dir $(OBJS))) $(BUILDDIR))
+$(OBJS): | $(DIRST)
+$(DIRST):
 	$(QLOG) "MKDIR $@"
 	$(Q)mkdir -p "$@"
 -include $(wildcard $(OBJS:.o=.d))
