@@ -794,10 +794,9 @@ static InboxMsg* nullable inbox_pop(Inbox* inbox) {
 
 
 static InboxMsg* nullable inbox_add(Inbox** inboxp) {
-	const u32 message_limit = 64;
-	const u32 initcap = 8;
+	const u32 initcap = 8;  // messages to allocate space for up front
+	const u32 maxcap  = 64; // messages we can send() without blocking
 
-	// if the inbox is aready setup, push a message into it
 	// setup inbox if needed
 	if UNLIKELY(*inboxp == NULL) {
 		*inboxp = (Inbox*)fifo_alloc(initcap, sizeof(*(*inboxp)->entries));
@@ -805,7 +804,7 @@ static InboxMsg* nullable inbox_add(Inbox** inboxp) {
 			return NULL;
 	}
 
-	return fifo_push((FIFO**)inboxp, sizeof(*(*inboxp)->entries), message_limit);
+	return fifo_push((FIFO**)inboxp, sizeof(*(*inboxp)->entries), maxcap);
 }
 
 
@@ -1709,6 +1708,12 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 			} else {
 				t_report_error(t, "Uncaught error");
 			}
+		} else {
+			#ifdef DEBUG
+			char* s = t_report_error_buf(t);
+			dlog("warning: %s\n(Error not reported because a task is awaiting this task)", s);
+			free(s);
+			#endif
 		}
 	}
 	t->status = T_DEAD;
@@ -2585,9 +2590,65 @@ static int l_read(lua_State* L) {
 }
 
 
-static int l_recv_deliver(lua_State* L, T* t, InboxMsg* msg) {
+static int l_msg_stow(lua_State* src_L, lua_State* dst_L, InboxMsg* msg) {
+	// Store message payload in a table.
+	// This way the message payload gets GC'd when the destination task is GC'd,
+	// regardless of message delivery.
+	lua_createtable(dst_L, msg->nres, 0);
+
+	// first value is the sender task (Lua "thread")
+	lua_pushthread(src_L);      // push sender "thread" onto its own stack
+	lua_xmove(src_L, dst_L, 1); // move sender "thread" to receiver's stack
+	lua_rawseti(dst_L, -2, 1);  // Store in table at index 1
+
+	for (int i = 2; i <= msg->nres; i++) {
+        lua_pushvalue(src_L, i);    // Get argument from its position in src_L ...
+        lua_xmove(src_L, dst_L, 1); // ... and move it to dst_L
+        lua_rawseti(dst_L, -2, i);  // Store in table at index (i-1)
+	}
+
+	#ifdef DEBUG
+	for (int i = 1; i <= msg->nres; i++) {
+		lua_rawgeti(dst_L, -1, i);
+		if (lua_isnil(dst_L, -1)) {
+			lua_pop(dst_L, 2);  // pop nil and table
+			panic("failed to store argument %d", i);
+		} else {
+			// dlog("msg payload[%d] = %s", i, lua_typename(dst_L, lua_type(dst_L, -1)));
+		}
+		lua_pop(dst_L, 1);  // pop checked value
+	}
+	#endif
+
+	msg->msg.ref = luaL_ref(dst_L, LUA_REGISTRYINDEX);
+
+	return 0;
+}
+
+
+static int l_msg_unload(lua_State* dst_L, InboxMsg* msg) {
+	// Note: Payload table will be placed at index 2 in the stack.
+	// Stack index 1 is occupied by msg->type, pushed by l_recv_deliver.
+	lua_rawgeti(dst_L, LUA_REGISTRYINDEX, msg->msg.ref); // Get the payload table
+	assertf(lua_type(dst_L, 2) == LUA_TTABLE,
+	        "%s", lua_typename(dst_L, lua_type(dst_L, 2)));
+	for (int i = 1; i <= msg->nres; i++) {
+		lua_rawgeti(dst_L, 2, i); // get value i from table
+		assert(!lua_isnoneornil(dst_L, -1));
+	}
+	lua_remove(dst_L, 2); // remove payload table from stack
+	luaL_unref(dst_L, LUA_REGISTRYINDEX, msg->msg.ref); // free reference
+	return 1 + msg->nres; // msg.type + payload
+}
+
+
+static int l_recv_deliver(lua_State* dst_L, T* t, InboxMsg* msg) {
 	trace_sched(T_ID_F " deliver msg type=%u", t_id(t), msg->type);
-	return msg->nres;
+	assert(msg->type != InboxMsgType_MSG_DIRECT); // should never happen
+	lua_pushinteger(dst_L, msg->type);
+	if (msg->type == InboxMsgType_MSG)
+		return l_msg_unload(dst_L, msg);
+	return 1 + msg->nres;
 }
 
 
@@ -2596,16 +2657,24 @@ static int l_recv_cont(lua_State* L, int ltstatus, void* arg) {
 	assert(t->inbox != NULL);
 	InboxMsg* msg = inbox_pop(t->inbox);
 	assert(msg != NULL);
+	if (msg->type == InboxMsgType_MSG_DIRECT)
+		return 1 + msg->nres;
 	return l_recv_deliver(L, t, msg);
 }
 
 
-// fun recv(from... Task|Worker) (type int, sender any, data any)
+// fun recv(from... Task|Worker) (type int, sender any, ... any)
 // If no 'from' is specified, receive from anyone
 static int l_recv(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 
-	// check if there's a message ready in the inbox
+	// TODO: check "from" arguments.
+
+	// Remove all arguments. This is required for l_recv_deliver & l_msg_unload to
+	// work properly as they place return values onto the stack.
+	lua_pop(L, lua_gettop(L));
+
+	// check for a ready message in the inbox
 	if (t->inbox) {
 		InboxMsg* msg = inbox_pop(t->inbox);
 		if (msg)
@@ -2630,55 +2699,60 @@ static int l_recv(lua_State* L) {
 // fun send(Task destination, msg... any)
 static int l_send(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-
 	T* dst_t = l_check_task(L, 1);
 	if (!dst_t)
 		return 0;
 
-	// if destination task is already waiting for a message, deliver it directly
-	if (dst_t->status == T_WAIT_RECV) {
-		dlog("send directly");
-		// Note: inbox must be empty in this case since destination task is waiting for a message
-		InboxMsg* msg = inbox_add(&dst_t->inbox);
-		if UNLIKELY(msg == NULL)
-			return l_errno_error(L, ENOMEM);
-		memset(msg, 0, sizeof(*msg));
-		msg->type = InboxMsgType_MSG;
-		msg->msg.sender = t;
-
-		// move message(s) from this function's argument to destination task's L stack,
-		// which is essentially the stack (activation record) of the recv() function call
-		// that dst_t is "in."
-		lua_State* dst_L = t_L(dst_t);
-		lua_pushinteger(dst_L, msg->type); // push message type
-		lua_pushthread(L);   // Push the thread onto its own stack
-		lua_xmove(L, dst_L, 1); // Move the thread object to the `SL` state
-		int nres = lua_gettop(L) - 1; // minus the destination argument
-		msg->nres = nres + 2; // + msg.type + sender
-		lua_xmove(L, dst_L, nres); // move any arguments passed after dst to send()
-
-		// Now, there are two options for how to resume the waiting receiver task.
-		// Either we can switch to it right here, by passing the scheduler,
-		// or we can put the receiver task on the priority run queue and switch to the scheduler.
-		// On my MacBook, a direct switch takes on average 140ns while going through the
-		// scheduler takes on average 170ns. Very small difference in practice.
-		// While switching directly is more efficient, it has the disadvantage of allowing two
-		// tasks to hog the scheduler, by ping ponging send, recv send, recv send, ...
-		// So we are going through the scheduler. A wee bit less efficient but more correct.
-		#if 0
-			dst_t->resume_nres = 0;
-			t_resume(dst_t);
-			return 0;
-		#else
-			// put destination task in the priority runq so that it runs asap
-			s_runq_put_runnext(t->s, dst_t);
-
-			// put the sender task at the end of the runq and return to scheduler loop (s_main)
-			return t_yield(t, 0);
-		#endif
+	// place message in receiver's inbox
+	InboxMsg* msg = inbox_add(&dst_t->inbox);
+	if UNLIKELY(msg == NULL) {
+		// receiver inbox is full; wait until there's space
+		dlog("TODO: wait until there's space in destination task's inbox");
+		return luaL_error(L, "receiver inbox full");
 	}
+	memset(msg, 0, sizeof(*msg));
+	msg->type = InboxMsgType_MSG;
 
-	return luaL_error(L, "TODO WIP");
+	// Set message argument count, which includes msg type and sender.
+	// Note: The logical arithmetic is non-trivial here: It's actually "(lua_gettop(L)-1) + 1"
+	// -1 the destination argument to 'send()' +1 sender.
+	msg->nres = lua_gettop(L);
+
+	lua_State* src_L = L;
+	lua_State* dst_L = t_L(dst_t);
+
+	// if the destination task is not currently waiting in a call to recv(),
+	// the message will be delivered later.
+	if (dst_t->status != T_WAIT_RECV)
+		return l_msg_stow(src_L, dst_L, msg);
+
+	// Destination task is already waiting for a message, deliver it directly.
+	// Move message values from send() function's arguments to destination task's L stack,
+	// which is essentially the stack (activation record) of the recv() function call of the
+	// destination task.
+	lua_pushinteger(dst_L, msg->type); // push message type
+	lua_pushthread(src_L);             // push sender "thread" onto its own stack
+	lua_xmove(src_L, dst_L, 1);        // move sender "thread" to receiver's stack
+	lua_xmove(src_L, dst_L, msg->nres - 1); // arguments passed after 'dst' to send()
+	msg->type = InboxMsgType_MSG_DIRECT;
+
+	// Now, there are two options for how to resume the waiting receiver task.
+	// Either we can switch to it right here, bypassing the scheduler, with
+	//    t_resume(dst_t); return 0;
+	// or we can put the receiver task on the priority run queue and switch to the
+	// scheduler with
+	//    s_runq_put_runnext(t->s, dst_t); return t_yield(t, 0);
+	// On my MacBook, a direct switch takes on average 140ns while going through the
+	// scheduler takes on average 170ns. Very small difference in practice.
+	// While switching directly is more efficient, it has the disadvantage of allowing two
+	// tasks to hog the scheduler, by ping ponging send, recv send, recv send, ...
+	// So we are going through the scheduler. A wee bit less efficient but more correct.
+	//
+	// put destination task in the priority runq so that it runs asap
+	s_runq_put_runnext(t->s, dst_t);
+	//
+	// put the sender task at the end of the runq and return to scheduler loop (s_main)
+	return t_yield(t, 0);
 }
 
 

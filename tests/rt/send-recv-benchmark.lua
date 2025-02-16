@@ -1,5 +1,11 @@
 return function()
+	-- send_later: set to true to make it so that when we call send(),
+	-- the receiver has not yet called recv().
+	local send_later = false
 	local T2 = __rt.spawn_task(function()
+		if send_later then
+			__rt.yield() -- give control back to main task
+		end
 		while true do
 			__rt.recv()
 		end

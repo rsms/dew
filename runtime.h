@@ -64,8 +64,9 @@ struct TimerInfo {
 typedef Array(TimerInfo) TimerPQ;
 
 enum InboxMsgType {
-	InboxMsgType_TIMER, // timer rang
-	InboxMsgType_MSG,   // message via send()
+	InboxMsgType_TIMER,      // timer rang
+	InboxMsgType_MSG,        // message via send(), with payload
+	InboxMsgType_MSG_DIRECT, // message via send(), delivered directly
 };
 
 struct InboxMsg {
@@ -73,7 +74,7 @@ struct InboxMsg {
 	int nres; // number of result values
 	union {
 		struct {
-			T* sender;
+			int ref; // Lua ref to an array table holding values
 		} msg;
 	};
 };

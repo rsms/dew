@@ -93,7 +93,7 @@ else ifeq ($(TEST),1)
 	CFLAGS += -O1 -fsanitize=address,undefined
 	LDFLAGS += -fsanitize=address,undefined
 else
-	CFLAGS += -DNDEBUG -flto=thin $(if $(filter $(TARGET),web),-Oz,-O2)
+	CFLAGS += -DNDEBUG -flto=thin $(if $(filter $(TARGET),web),-Oz,-O3)
 endif
 
 ifeq ($(TARGET),darwin)
