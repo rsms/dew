@@ -7,7 +7,7 @@ return function()
 			__rt.yield() -- give control back to main task
 		end
 		local i = 1
-		for i = 1, 4 do
+		for i = 1, 8 do
 			print("T2: recv ...")
 			local typ, sender, msg1, msg2 = __rt.recv()
 			print("T2: recv =>", typ, sender, msg1, msg2)
@@ -16,7 +16,7 @@ return function()
 			i = i + 1
 		end
 	end)
-	for i = 1, 4 do
+	for i = 1, 8 do
 		print("T1: send(T2, " .. (i*10) .. ") ...")
 		print("T1: send(T2) =>", __rt.send(T2, i*10, i*100))
 	end

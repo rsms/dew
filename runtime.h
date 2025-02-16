@@ -80,7 +80,14 @@ struct InboxMsg {
 };
 
 struct Inbox {
-	FIFO     fifo;
+	union {
+		// Caution! The following struct makes assumptions about the layout of the FIFO struct
+		struct {
+			u32 _fifo_header[3];
+			u32 waiters; // list of tasks (tid's) waiting to send to this inbox
+		};
+		FIFO fifo;
+	};
 	InboxMsg entries[];
 };
 
@@ -93,6 +100,7 @@ enum TStatus {
 	T_READY,       // on runq
 	T_RUNNING,     // currently running
 	T_WAIT_IO,     // suspended, waiting for I/O or sleep timer
+	T_WAIT_SEND,   // suspended, waiting to send to inbox
 	T_WAIT_RECV,   // suspended, waiting for inbox message
 	T_WAIT_TASK,   // suspended, waiting for a task to exit
 	T_WAIT_WORKER, // suspended, waiting for a worker to exit

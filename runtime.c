@@ -794,14 +794,21 @@ static InboxMsg* nullable inbox_pop(Inbox* inbox) {
 
 
 static InboxMsg* nullable inbox_add(Inbox** inboxp) {
-	const u32 initcap = 8;  // messages to allocate space for up front
-	const u32 maxcap  = 64; // messages we can send() without blocking
+	#if !defined(DEBUG)
+		const u32 initcap = 8;  // messages to allocate space for up front
+		const u32 maxcap  = 64; // messages we can send() without blocking
+	#else
+		// DEBUG values
+		const u32 initcap = 4;
+		const u32 maxcap  = 4;
+	#endif
 
 	// setup inbox if needed
 	if UNLIKELY(*inboxp == NULL) {
 		*inboxp = (Inbox*)fifo_alloc(initcap, sizeof(*(*inboxp)->entries));
 		if UNLIKELY(!*inboxp)
 			return NULL;
+		(*inboxp)->waiters = 0;
 	}
 
 	return fifo_push((FIFO**)inboxp, sizeof(*(*inboxp)->entries), maxcap);
@@ -816,6 +823,7 @@ static const char* t_status_str(u8 status) {
 		case T_READY:       return "T_READY";
 		case T_RUNNING:     return "T_RUNNING";
 		case T_WAIT_IO:     return "T_WAIT_IO";
+		case T_WAIT_SEND:   return "T_WAIT_SEND";
 		case T_WAIT_RECV:   return "T_WAIT_RECV";
 		case T_WAIT_TASK:   return "T_WAIT_TASK";
 		case T_WAIT_WORKER: return "T_WAIT_WORKER";
@@ -1623,6 +1631,7 @@ static void t_remove_from_waiters(T* t) {
 	}
 
 	dlog("warning: %s " T_ID_F ": not found", __FUNCTION__, t_id(t));
+	dlog("TODO: check in other_t->inbox->waiters");
 }
 
 
@@ -1649,16 +1658,19 @@ static void worker_wake_waiters(Worker* w) {
 }
 
 
-static void t_wake_waiters(T* t) {
+static void t_wake_waiters(T* t, u32 waiters) {
 	S* s = t->s;
-	for (u32 tid = t->waiters; tid > 0;) {
+	for (u32 tid = waiters; tid > 0;) {
 		T* waiting_t = s_task(s, tid);
-		assert(waiting_t->status == T_WAIT_TASK);
+
+		assert(waiting_t->status == T_WAIT_TASK ||
+		       waiting_t->status == T_WAIT_SEND);
+
 		trace_sched("wake " T_ID_F " waiting on " T_ID_F, t_id(waiting_t), t_id(t));
 
 		// put waiting task on (priority) runq
 		bool ok;
-		if (tid == t->waiters) {
+		if (tid == waiters) {
 			ok = s_runq_put_runnext(s, waiting_t);
 		} else {
 			ok = s_runq_put(s, waiting_t);
@@ -1670,7 +1682,6 @@ static void t_wake_waiters(T* t) {
 
 		tid = waiting_t->info.wait_task.next_tid;
 	}
-	t->waiters = 0;
 }
 
 
@@ -1741,8 +1752,10 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 		t_stop_r(t, s_task(s, t->first_child));
 
 	// wake any tasks waiting for this task to exit
-	if (t->waiters)
-		t_wake_waiters(t);
+	if (t->waiters) {
+		t_wake_waiters(t, t->waiters);
+		t->waiters = 0;
+	}
 
 	// if S is supposed to exit() when done, do that now if this is the last task
 	if (s->doexit && s->nlive == 0 && s->workers == NULL) {
@@ -2645,6 +2658,13 @@ static int l_msg_unload(lua_State* dst_L, InboxMsg* msg) {
 static int l_recv_deliver(lua_State* dst_L, T* t, InboxMsg* msg) {
 	trace_sched(T_ID_F " deliver msg type=%u", t_id(t), msg->type);
 	assert(msg->type != InboxMsgType_MSG_DIRECT); // should never happen
+
+	// wake tasks waiting to send
+	if UNLIKELY(t->inbox->waiters) {
+		t_wake_waiters(t, t->inbox->waiters);
+		t->inbox->waiters = 0;
+	}
+
 	lua_pushinteger(dst_L, msg->type);
 	if (msg->type == InboxMsgType_MSG)
 		return l_msg_unload(dst_L, msg);
@@ -2696,19 +2716,32 @@ static int l_recv(lua_State* L) {
 }
 
 
-// fun send(Task destination, msg... any)
-static int l_send(lua_State* L) {
-	T* t = REQUIRE_TASK(L);
-	T* dst_t = l_check_task(L, 1);
-	if (!dst_t)
-		return 0;
+static int l_send1(lua_State* L, T* t, T* dst_t);
 
+
+static int l_send_cont(lua_State* L, int ltstatus, void* arg) {
+	T* dst_t = arg;
+	return l_send1(L, L_t(L), dst_t);
+}
+
+
+static int l_send1(lua_State* L, T* t, T* dst_t) {
 	// place message in receiver's inbox
 	InboxMsg* msg = inbox_add(&dst_t->inbox);
 	if UNLIKELY(msg == NULL) {
 		// receiver inbox is full; wait until there's space
-		dlog("TODO: wait until there's space in destination task's inbox");
-		return luaL_error(L, "receiver inbox full");
+		trace_sched("send later to " T_ID_F " (inbox full)", t_id(dst_t));
+		if UNLIKELY(dst_t->inbox == NULL) // failed to create inbox
+			return l_errno_error(L, ENOMEM);
+
+		// add t to list of tasks waiting to send to this inbox
+		t->info.wait_task.next_tid = dst_t->inbox->waiters;
+		t->info.wait_task.wait_tid = dst_t->tid;
+		dst_t->inbox->waiters = t->tid;
+		t->resume_nres = 0;
+
+		// wait until there's space in the inbox and try again
+		return t_suspend(t, T_WAIT_SEND, dst_t, l_send_cont);
 	}
 	memset(msg, 0, sizeof(*msg));
 	msg->type = InboxMsgType_MSG;
@@ -2723,8 +2756,12 @@ static int l_send(lua_State* L) {
 
 	// if the destination task is not currently waiting in a call to recv(),
 	// the message will be delivered later.
-	if (dst_t->status != T_WAIT_RECV)
+	if (dst_t->status != T_WAIT_RECV) {
+		trace_sched("send buffered to " T_ID_F, t_id(dst_t));
 		return l_msg_stow(src_L, dst_L, msg);
+	}
+
+	trace_sched("send directly to " T_ID_F, t_id(dst_t));
 
 	// Destination task is already waiting for a message, deliver it directly.
 	// Move message values from send() function's arguments to destination task's L stack,
@@ -2753,6 +2790,16 @@ static int l_send(lua_State* L) {
 	//
 	// put the sender task at the end of the runq and return to scheduler loop (s_main)
 	return t_yield(t, 0);
+}
+
+
+// fun send(Task destination, msg... any)
+static int l_send(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	T* dst_t = l_check_task(L, 1);
+	if (!dst_t)
+		return 0;
+	return l_send1(L, t, dst_t);
 }
 
 
