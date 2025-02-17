@@ -1797,6 +1797,7 @@ static void t_resume(T* t) {
 	t->status = T_RUNNING;
 
 	trace_sched("resume " T_ID_F " nargs=%d", t_id(t), nargs);
+	// dlog_lua_stackf(L, "stack: (nargs=%d)", nargs);
 	int status = lua_resume(L, t->s->L, nargs, &nres);
 
 	// check if task exited
@@ -1822,30 +1823,43 @@ static int t_yield(T* t, int nresults) {
 }
 
 
-// s_spawntask creates a new task, which function should be on stack L (the spawner thread),
+// s_spawn_task creates a new task, which function should be on stack L (the spawner thread),
 // and adds it to the runq as runnext.
 // L should be the Lua thread that initiated the spawn (S's L or a task's L.)
 // Returns 1 on success with Lua "thread" on L stack, or 0 on failure with Lua error set in L.
-static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
+static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 	// create Lua "thread".
 	// Note: See coroutine.create in luaB_cocreate (lcorolib.c).
+
+	// make sure first argument is a function
 	if UNLIKELY(lua_type(L, 1) != LUA_TFUNCTION)
 		return luaL_typeerror(L, 1, lua_typename(L, LUA_TFUNCTION));
+
+	// rest of arguments will be passed along to the task's main function when started
+	int nargs = lua_gettop(L) - 1;
+
+	// create "thread" & push it on stack
 	lua_State* NL = lua_newthread(L);
-	lua_pushvalue(L, 1); // move function to top of caller stack
-	lua_xmove(L, NL, 1); // move function from L to NL
+
+	// Move value on top of stack (the "thread" object) to the bottom of the stack.
+	// I.e. [function, arg1, arg2, argN, thread] -> [thread, function, arg1, arg2, argN]
+	lua_rotate(L, 1, 1);
+
+	// Move new task's function and arguments from caller task's stack to new task's stack.
+	// What remains on L's stack is the "thread".
+	lua_xmove(L, NL, 1 + nargs);
 
 	// Hold on to a GC reference to thread, e.g. "S.L.reftab[thread] = true"
 	// Note: this is quite complex of a Lua stack operation. In particular lua_pushthread is
 	// gnarly as it pushes the thread onto its own stack, which we then move over to S's stack.
 	// If we get things wrong we (at best) get a memory bus error in asan with no stack trace,
 	// making this tricky to debug.
-	lua_rawgetp(s->L, LUA_REGISTRYINDEX, &g_reftabkey);
-	lua_pushthread(NL);     // Push thread as key onto its own stack
-	lua_xmove(NL, s->L, 1); // Move the thread object to the `L` state
-	lua_pushboolean(s->L, 1);  // "true"
-	lua_rawset(s->L, -3);  // reftab[thread] = true
-	lua_pop(s->L, 1);  // Remove table from stack
+	lua_rawgetp(s->L, LUA_REGISTRYINDEX, &g_reftabkey); // push table on S's stack
+	lua_pushvalue(L, 1);      // Copy thread
+	lua_xmove(L, s->L, 1);    // Move thread to S's stack
+	lua_pushboolean(s->L, 1); // "true"
+	lua_rawset(s->L, -3);     // reftab[thread] = true
+	lua_pop(s->L, 1);         // Remove table from stack
 
 	// initialize T struct (which lives in the LUA_EXTRASPACE header of lua_State)
 	T* t = L_t(NL);
@@ -1853,6 +1867,7 @@ static int s_spawntask(S* s, lua_State* L, T* nullable parent) {
 	t->s = s;
 	if (parent) t->parent = parent->tid;
 	t->nrefs = 1; // S's "live" reference
+	t->resume_nres = nargs;
 
 	// allocate id and store in 'tasks' set
 	if UNLIKELY(!s_task_register(s, t)) {
@@ -2148,7 +2163,7 @@ static int s_main(S* s) {
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_reftabkey);
 
 	// create main task
-	int nres = s_spawntask(s, L, NULL);
+	int nres = s_spawn_task(s, L, NULL);
 	if UNLIKELY(nres == 0) { // error
 		s_free(s);
 		return 0;
@@ -2413,10 +2428,10 @@ static int l_yield(lua_State* L) {
 }
 
 
+// fun spawn_task(f fun(... any), ... any)
 static int l_spawn_task(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-
-	t->resume_nres = s_spawntask(t->s, L, t);
+	t->resume_nres = s_spawn_task(t->s, L, t);
 	if UNLIKELY(t->resume_nres == 0)
 		return 0;
 
@@ -2425,6 +2440,7 @@ static int l_spawn_task(lua_State* L) {
 }
 
 
+// fun socket(domain, socktype int) FD
 static int l_socket(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 	int domain = luaL_checkinteger(L, 1); // PF_ constant
@@ -2507,10 +2523,19 @@ static int l_connect_cont(lua_State* L, __attribute__((unused)) int ltstatus, IO
 }
 
 
-// connect(fd)
+// connect(fd FD, addr string)
 static int l_connect(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 	IODesc* d = l_iodesc_check(L, 1);
+
+	// Second argument is the address to connect to.
+	// Interpretation depends on d's socket type.
+	size_t addrstr_len;
+	const char* addrstr = luaL_checklstring(L, 2, &addrstr_len);
+	if (!addrstr)
+		return 0;
+
+	dlog("addrstr: %s", addrstr);
 
 	// construct network address
 	struct sockaddr_in addr;
@@ -2931,7 +2956,7 @@ static int l_taskblock_end(lua_State* L) {
 }
 
 
-static int l_time(lua_State* L) {
+static int l_monotime(lua_State* L) {
 	lua_pushinteger(L, DTimeNow());
 	return 1;
 }
@@ -2942,7 +2967,7 @@ static const luaL_Reg dew_lib[] = {
 	{"intfmt", l_intfmt},
 	{"intconv", l_intconv},
 	{"errstr", l_errstr},
-	{"time", l_time},
+	{"monotime", l_monotime},
 
 	// "new" runtime API
 	{"main", l_main},

@@ -4,18 +4,15 @@
 
 #ifdef __wasm__
 
-void _logmsg(int level, const char* fmt, ...) {
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(stderr, fmt, ap);
-	va_end(ap);
+void _vlogmsg(int level, const char* fmt, va_list args) {
+	vfprintf(stderr, fmt, args);
 	if (level < 1 || level > 2)
 		fflush(stderr);
 }
 
 #else
 
-void _logmsg(int level, const char* fmt, ...) {
+void _vlogmsg(int level, const char* fmt, va_list args) {
 	FILE* fp = stderr;
 	flockfile(fp);
 
@@ -67,10 +64,7 @@ void _logmsg(int level, const char* fmt, ...) {
 	}
 	#endif
 
-	va_list ap;
-	va_start(ap, fmt);
-	vfprintf(fp, fmt, ap);
-	va_end(ap);
+	vfprintf(fp, fmt, args);
 
 	#if 1 /* enable ANSI colors */
 		fprintf(fp, "\e[0m");
@@ -84,3 +78,10 @@ void _logmsg(int level, const char* fmt, ...) {
 }
 
 #endif
+
+void _logmsg(int level, const char* fmt, ...) {
+	va_list ap;
+	va_start(ap, fmt);
+	_vlogmsg(level, fmt, ap);
+	va_end(ap);
+}

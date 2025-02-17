@@ -178,25 +178,23 @@ function main(args)
 end
 
 
--- Runtime tests: (run manually by uncommenting a line, only works in debug builds)
+-- Runtime tests: (run manually by uncommenting)
 -- __rt.main(require("tests/rt/yield"))
 -- __rt.main(require("tests/rt/sleep"))
 -- __rt.main(require("tests/rt/timer"))
 -- __rt.main(require("tests/rt/repeating-timer"))
 -- __rt.main(require("tests/rt/stop-children-on-parent-exit"))
 -- __rt.main(require("tests/rt/deadlock"))
--- __rt.main(require("tests/rt/socket-read"))
 -- __rt.main(require("tests/rt/worker"))
 -- __rt.main(require("tests/rt/worker-error"))
 -- __rt.main(require("tests/rt/await-task"))
 __rt.main(require("tests/rt/send-recv"))
+-- __rt.main(require("tests/rt/tcp-echo"))
+
+-- Runtime tests requiring additional manual setup:
+-- __rt.main(require("tests/rt/socket-read"))
+
+-- Runtime benchmarks: (run manually by uncommenting)
 -- __rt.main(require("tests/rt/send-recv-benchmark"))
--- __rt.main(function()
--- 	local A = __rt.spawn_task(function()
--- 		print("A")
--- 		__rt.send(__rt.parent_task(), "hi")
--- 	end)
--- 	print("main recv", __rt.recv())
--- end)
 
 main(arg)

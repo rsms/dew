@@ -10,7 +10,7 @@ return function()
 	local ok, err = pcall(function()
 		__rt.recv()
 	end)
-	print("expecting error:", err)
+	-- print("expecting error. Got:", err)
 	assert(not ok)
 	assert(string.find(err, "deadlock", 1, true) ~= nil)
 end

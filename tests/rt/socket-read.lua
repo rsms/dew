@@ -2,7 +2,7 @@
 This test requires a local TCP server to be running on port 12345
 and write some short ASCII text every few milliseconds.
 You can use etc/hello-server.c, just start it like a shell script:
-  ./etc/hello-server.c
+    ./etc/hello-server.c
 ]]
 return function()
 	local buf = __rt.buf_alloc(64)

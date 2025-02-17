@@ -83,6 +83,7 @@ else
 endif
 
 ifeq ($(DEBUG),1)
+	DEW_SRCS += dlog_lua_stack.c
 	DEW_CFLAGS += -DDEBUG=1
 	ifneq ($(TARGET),web)
 		CFLAGS += -fsanitize=address,undefined

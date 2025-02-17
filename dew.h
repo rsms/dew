@@ -290,6 +290,7 @@ API_BEGIN
 extern const char* g_prog; // dew.c
 
 void _logmsg(int level, const char* fmt, ...) __attribute__((format(printf, 2, 3)));
+void _vlogmsg(int level, const char* fmt, va_list args);
 
 // panic prints a message with stack trace and then calls abort()
 _Noreturn void _panic(
@@ -371,6 +372,11 @@ float64 DTimeDurationSeconds(DTimeDuration d);
 i64 DTimeDurationMilliseconds(DTimeDuration d);
 i64 DTimeDurationMicroseconds(DTimeDuration d);
 i64 DTimeDurationNanoseconds(DTimeDuration d);
+
+
+#ifdef DEBUG
+void dlog_lua_stackf(lua_State* L, const char* fmt, ...);
+#endif
 
 
 // Array is a dynamic array

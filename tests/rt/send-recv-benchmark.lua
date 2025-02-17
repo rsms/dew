@@ -11,11 +11,11 @@ return function()
 		end
 	end)
 	local N = 400000
-	local time = __rt.time()
+	local time = __rt.monotime()
 	for i = 1, N do
 		__rt.send(T2, i)
 	end
-	time = __rt.time() - time
+	time = __rt.monotime() - time
 	print(string.format("Sent %d messages between two tasks: total %.2fms, avg %dns",
 	                    N, time / 1000000.0, time // N))
 end
