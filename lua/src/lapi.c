@@ -252,6 +252,33 @@ LUA_API void lua_rotate (lua_State *L, int idx, int n) {
 }
 
 
+LUA_API void lua_swap(lua_State *L, int idx1, int idx2) { // [dew]
+  // [rsms] I'm not sure what the correct way of doing this is.
+  // Using StkId seems to works well in practice, but maybe there's
+  // some weird GC interactions happening that I haven't run into yet.
+  // So, I'll keep a few implementations around here just in case.
+#if 1
+  // implementation using StkId
+  StkId o1 = index2stack(L, idx1);
+  StkId o2 = index2stack(L, idx2);
+  __typeof__(*((StkId)NULL)) temp = *o1;
+#elif 0
+  // implementation using TValue
+  TValue *o1 = index2value(L, idx1);
+  TValue *o2 = index2value(L, idx2);
+  TValue temp = *o1;
+#else
+  // portable implementation
+    lua_pushvalue(L, idx1); // Push copy of idx1: A,B,C,D,A
+    lua_pushvalue(L, idx2); // Push copy of idx2: A,B,C,D,A,D
+    lua_replace(L, idx1);   // Replace idx1 with D: D,B,C,D,A
+    lua_replace(L, idx2);   // Replace idx2 with A: D,B,C,A
+#endif
+  *o1 = *o2;
+  *o2 = temp;
+}
+
+
 LUA_API void lua_copy (lua_State *L, int fromidx, int toidx) {
   TValue *fr, *to;
   lua_lock(L);
