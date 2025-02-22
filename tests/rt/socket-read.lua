@@ -5,7 +5,7 @@ You can use etc/hello-server.c, just start it like a shell script:
     ./etc/hello-server.c
 ]]
 return function()
-	local buf = __rt.buf_alloc(64)
+	local buf = __rt.buf_create(64)
 	local fd = __rt.socket(__rt.PF_INET, __rt.SOCK_STREAM)
 	__rt.connect(fd, "127.0.0.1:12345")
 	while true do

@@ -9,6 +9,10 @@
 #include <stdatomic.h> // TODO: move into platform_SYS.c
 
 
+static_assert(sizeof(AWorkQ) % CPU_CACHE_LINE_SIZE == 0,
+              "size of AWorkQ is not a multiple of CPU_CACHE_LINE_SIZE");
+
+
 #define TRACE_SCHED
 // #define TRACE_SCHED_RUNQ
 #define TRACE_SCHED_WORKER
@@ -45,11 +49,11 @@
 static_assert(sizeof(T) == LUA_EXTRASPACE, "");
 
 
-static u8 g_reftabkey;           // table where objects with compex lifetime are stored, to avoid GC
-static u8 g_iodesc_luatabkey;    // IODesc object prototype
-static u8 g_buf_luatabkey;       // Buf object prototype
-static u8 g_timerobj_luatabkey;  // Timer object prototype
-static u8 g_workerobj_luatabkey; // Worker object prototype
+static u8 g_reftabkey;            // table where objects with compex lifetime are stored, to avoid GC
+static u8 g_iodesc_luatabkey;     // IODesc object prototype
+static u8 g_buf_luatabkey;        // Buf object prototype
+static u8 g_timerobj_luatabkey;   // Timer object prototype
+static u8 g_uworkerobj_luatabkey; // Worker object prototype
 
 // tls_s holds S for the current thread
 static _Thread_local S* tls_s = NULL;
@@ -739,8 +743,9 @@ static int l_buf_gc(lua_State* L) {
 }
 
 
-static int l_buf_alloc(lua_State* L) {
-	u64 cap = luaL_checkinteger(L, 1);
+// fun buf_create(cap u64)
+static int l_buf_create(lua_State* L) {
+	u64 cap = lua_tointegerx(L, 1, NULL);
 	if UNLIKELY(cap > (u64)USIZE_MAX - sizeof(Buf))
 		luaL_error(L, "capacity too large");
 	if (cap == 0) {
@@ -827,6 +832,7 @@ static const char* t_status_str(u8 status) {
 		case T_WAIT_RECV:   return "T_WAIT_RECV";
 		case T_WAIT_TASK:   return "T_WAIT_TASK";
 		case T_WAIT_WORKER: return "T_WAIT_WORKER";
+		case T_WAIT_ASYNC:  return "T_WAIT_ASYNC";
 		case T_DEAD:        return "T_DEAD";
 	}
 	return "?";
@@ -1636,11 +1642,13 @@ static void t_remove_from_waiters(T* t) {
 
 
 static void worker_wake_waiters(Worker* w) {
-	S* s = w->parent->s;
+	S* s = w->parent;
 	for (u32 tid = w->waiters; tid > 0;) {
 		T* waiting_t = s_task(s, tid);
-		assert(waiting_t->status == T_WAIT_WORKER);
 		trace_sched("wake " T_ID_F " waiting on Worker %p", t_id(waiting_t), w);
+
+		// we expect task to be waiting for a user worker or work performed by an async worker
+		assert(waiting_t->status == T_WAIT_WORKER || waiting_t->status == T_WAIT_ASYNC);
 
 		// put waiting task on (priority) runq
 		bool ok;
@@ -1685,9 +1693,9 @@ static void t_wake_waiters(T* t, u32 waiters) {
 }
 
 
-static Worker* s_worker(S* s) {
+static UWorker* s_worker(S* s) {
 	assert(s->isworker);
-	return (void*)s - offsetof(Worker, s);
+	return (void*)s - offsetof(UWorker, s);
 }
 
 
@@ -1709,8 +1717,8 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 		if (t->waiters == 0) {
 			if (s->isworker && t->tid == 1) {
 				// main task of a worker; only report error if no task is waiting for worker
-				Worker* w = s_worker(s);
-				if (atomic_load_explicit(&w->waiters, memory_order_acquire)) {
+				UWorker* w = s_worker(s);
+				if (atomic_load_explicit(&w->w.waiters, memory_order_acquire)) {
 					free(w->errdesc); // just in case...
 					w->errdesc = t_report_error_buf(t);
 				} else {
@@ -2192,12 +2200,12 @@ static int l_main(lua_State* L) {
 }
 
 
-// WorkerObj is a Lua-managed (GC'd) wrapper around a internally managed Worker.
+// UWorkerObj is a Lua-managed (GC'd) wrapper around a internally managed Worker.
 // This allows a timer to be referenced by userland independently of its state.
-typedef struct WorkerObj { Worker* w; } WorkerObj;
+typedef struct UWorkerObj { UWorker* uw; } UWorkerObj;
 
-static WorkerObj* nullable l_workerobj_check(lua_State* L, int idx) {
-	return l_uobj_check(L, idx, &g_workerobj_luatabkey, "Worker");
+static UWorkerObj* nullable l_uworkerobj_check(lua_State* L, int idx) {
+	return l_uobj_check(L, idx, &g_uworkerobj_luatabkey, "Worker");
 }
 
 
@@ -2206,7 +2214,8 @@ int luaopen_runtime(lua_State* L);
 
 static void worker_free(Worker* w) {
 	trace_worker("free");
-	free(w->errdesc);
+	if (w->wkind == WorkerKind_USER)
+		free(((UWorker*)w)->errdesc);
 	free(w);
 }
 
@@ -2223,17 +2232,29 @@ static void worker_release(Worker* w) {
 }
 
 
-static int l_workerobj_gc(lua_State* L) {
-	WorkerObj* obj = lua_touserdata(L, 1);
+static bool worker_add_waiter(Worker* w, T* waiter_task) {
+	// Add waiter_task to list of tasks waiting for w.
+	// Note that this list is only ever modified by this current thread,
+	// but is read by the worker's thread.
+	waiter_task->info.wait_worker.next_tid = w->waiters;
+	atomic_store_explicit(&w->waiters, waiter_task->tid, memory_order_release);
+
+	// check if worker exited already
+	return atomic_load_explicit(&w->status, memory_order_acquire) != Worker_CLOSED;
+}
+
+
+static int l_uworkerobj_gc(lua_State* L) {
+	UWorkerObj* obj = lua_touserdata(L, 1);
 	trace_worker("GC");
-	worker_close(obj->w);
-	worker_release(obj->w);
+	worker_close((Worker*)obj->uw);
+	worker_release((Worker*)obj->uw);
 	return 0;
 }
 
 
-static const char* worker_load_reader(lua_State* L, void* ud, usize* lenp) {
-	Worker* w = ud;
+static const char* uworker_load_reader(lua_State* L, void* ud, usize* lenp) {
+	UWorker* w = ud;
 	*lenp = w->mainfun_lcode_len;
 	return w->mainfun_lcode;
 }
@@ -2278,11 +2299,103 @@ static void worker_thread_exit(Worker** wp) {
 	atomic_store_explicit(&w->status, Worker_CLOSED, memory_order_release);
 
 	// tell parent S that we exited
-	s_notify(w->parent->s, S_NOTE_WEXIT);
+	if (w->parent)
+		s_notify(w->parent, S_NOTE_WEXIT);
 
-	if (w->s.L)
-		lua_close(w->s.L);
+	// close Lua environment of USER worker
+	if (w->wkind == WorkerKind_USER && ((UWorker*)w)->s.L)
+		lua_close(((UWorker*)w)->s.L);
+
 	worker_release(w);
+}
+
+
+static void uworker_main(UWorker* w) {
+	// create a Lua environment for this thread
+	lua_State* L = luaL_newstate();
+	w->s.L = L;
+
+	// open libraries
+	luaL_openlibs(L);
+	luaL_requiref(L, "__rt", luaopen_runtime, 1);
+	lua_setglobal(L, "__rt");
+
+	// switch status to READY while checking if worker has been closed
+	if UNLIKELY(!worker_cas_status((Worker*)w, Worker_READY))
+		return trace_worker("CLOSED before getting READY");
+
+	// disable thread cancelation to ensure graceful shutdown
+	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
+
+	// load Lua function from mainfun_lcode
+	int status = lua_load(L, uworker_load_reader, (void*)w, "<worker>", "bt");
+
+	// free memory back to malloc so we don't hold on to it "forever"
+	free(w->mainfun_lcode);
+	w->mainfun_lcode = NULL;
+	w->mainfun_lcode_len = 0;
+
+	// check if load succeeded
+	if UNLIKELY(status != LUA_OK) {
+		trace_worker("failed to load worker function: %s", l_status_str(status));
+		dlog("failed to load worker function: %s", l_status_str(status));
+		return;
+	}
+	// Enter scheduler which will use the function on top of the stack as the main coroutine.
+	// We ignore the return value from s_main since we exit on return regardless.
+	s_main(&w->s);
+}
+
+
+inline static u32 aworker_q_cap(const AWorker* aw) {
+	return countof(aw->q.entries);
+}
+
+
+static bool aworker_enq(AWorker* aw, AWorkload wl) {
+	u32 current_w = atomic_load_explicit(&aw->q.w, memory_order_acquire);
+	u32 next_w = current_w + 1;
+	if (next_w == aworker_q_cap(aw))
+		next_w = 0;
+	if (next_w == atomic_load_explicit(&aw->q.r, memory_order_acquire)) {
+		// queue is full
+		return false;
+	}
+	aw->q.entries[current_w] = wl;
+	atomic_store_explicit(&aw->q.w, next_w, memory_order_release);
+	return true;
+}
+
+
+static void aworker_main(AWorker* aw) {
+	// switch status to READY while checking if worker has been closed
+	if UNLIKELY(!worker_cas_status((Worker*)aw, Worker_READY))
+		return trace_worker("CLOSED before getting READY");
+
+	// process workq
+	for (;;) {
+		dlog("TODO: aworker_main: dequeue work queue");
+
+		// pick up some work
+		u32 current_r = atomic_load_explicit(&aw->q.r, memory_order_acquire);
+		if (current_r == atomic_load_explicit(&aw->q.w, memory_order_acquire)) {
+			dlog("aworker: workq is empty");
+			// TODO: carefully attempt to change status to CLOSED while respecting a race
+			// where we got more work while closing the worker.
+			break;
+		}
+
+		// dequeue work item
+		AWorkload work = aw->q.entries[current_r]; // copy, don't reference
+		u32 next_r = current_r + 1;
+		if (next_r == aworker_q_cap(aw))
+			next_r = 0;
+		atomic_store_explicit(&aw->q.r, next_r, memory_order_release);
+
+		// run work
+		work.f(aw, work.arg);
+		// TODO: handle error in work.f
+	}
 }
 
 
@@ -2296,70 +2409,70 @@ static void worker_thread(Worker* w) {
 		trace_worker("start worker thread=%p", w->thread);
 	#endif
 
-	// create a Lua environment for this thread
-	lua_State* L = luaL_newstate();
-	w->s.L = L;
-
-	// open libraries
-	luaL_openlibs(L);
-	luaL_requiref(L, "__rt", luaopen_runtime, 1);
-	lua_setglobal(L, "__rt");
-
-	// switch status to READY while checking if worker has been closed
-	if UNLIKELY(!worker_cas_status(w, Worker_READY))
-		return trace_worker("CLOSED before getting READY");
-
-	// actual work happens now
-	if (w->mainfun_lcode_len > 0) {
-		// disable thread cancelation to ensure graceful shutdown
-		pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
-
-		// load Lua function from mainfun_lcode
-		int status = lua_load(L, worker_load_reader, (void*)w, "<worker>", "bt");
-
-		// free memory back to malloc so we don't hold on to it "forever"
-		free(w->mainfun_lcode);
-		w->mainfun_lcode = NULL;
-		w->mainfun_lcode_len = 0;
-
-		// check if load succeeded
-		if UNLIKELY(status != LUA_OK) {
-			trace_worker("failed to load worker function: %s", l_status_str(status));
-			dlog("failed to load worker function: %s", l_status_str(status));
-			return;
-		}
-		// Enter scheduler which will use the function on top of the stack as the main coroutine.
-		// We ignore the return value from s_main since we exit on return regardless.
-		s_main(&w->s);
+	if (w->wkind == WorkerKind_USER) {
+		uworker_main((UWorker*)w);
 	} else {
-		// allow passing a w->f to be run here
-		assert(!"TODO: worker function");
+		assert(w->wkind == WorkerKind_ASYNC);
+		aworker_main((AWorker*)w);
 	}
 
 	pthread_cleanup_pop(&cleanup_pop_arg);
 }
 
 
-static int worker_open(
-	Worker** wp, T* parent, void* nullable mainfun_lcode, u32 mainfun_lcode_len)
-{
-	Worker* w = calloc(1, sizeof(Worker));
-	if (!w)
+static int uworker_open(UWorker** uwp, S* parent, void* mainfun_lcode, u32 mainfun_lcode_len) {
+	UWorker* uw = calloc(1, sizeof(UWorker));
+	if (!uw)
 		return -ENOMEM;
-	w->parent = parent;
-	w->status = Worker_OPEN;
-	w->nrefs = 2; // thread + caller
-	w->mainfun_lcode_len = mainfun_lcode_len;
-	w->mainfun_lcode = mainfun_lcode;
-	w->s.isworker = true;
+	uw->w.parent = parent;
+	uw->w.wkind = WorkerKind_USER;
+	uw->w.status = Worker_OPEN;
+	uw->w.nrefs = 2; // thread + caller
+	uw->mainfun_lcode_len = mainfun_lcode_len;
+	uw->mainfun_lcode = mainfun_lcode;
+	uw->s.isworker = true;
+
 	pthread_attr_t* thr_attr = NULL;
-	int err = pthread_create(&w->thread, thr_attr, (void*(*)(void*))worker_thread, w);
-	trace_sched("spawn worker thread=%p", w->thread);
+	int err = pthread_create(&uw->w.thread, thr_attr, (void*(*)(void*))worker_thread, uw);
+	trace_sched("spawn worker thread=%p", uw->w.thread);
 	if UNLIKELY(err) {
-		free(w);
+		free(uw);
 		return -err;
 	}
-	*wp = w;
+
+	// add worker to S's list of live workers
+	s_workers_add(parent, (Worker*)uw);
+
+	*uwp = uw;
+	return 0;
+}
+
+
+static int aworker_open(AWorker** awp, S* parent, const AWorkload* workv, u32 workc) {
+	assert(workc <= aworker_q_cap(*awp));
+
+	AWorker* aw = calloc(1, sizeof(AWorker));
+	if (!aw)
+		return -ENOMEM;
+	aw->w.parent = parent;
+	aw->w.wkind = WorkerKind_ASYNC;
+	aw->w.status = Worker_OPEN;
+	aw->w.nrefs = 2; // thread + caller
+	memcpy(aw->q.entries, workv, workc * sizeof(*workv)); // initial work
+	aw->q.w = workc;
+
+	pthread_attr_t* thr_attr = NULL;
+	int err = pthread_create(&aw->w.thread, thr_attr, (void*(*)(void*))worker_thread, aw);
+	trace_sched("spawn worker thread=%p", aw->w.thread);
+	if UNLIKELY(err) {
+		free(aw);
+		return -err;
+	}
+
+	// add worker to S's list of live workers
+	s_workers_add(parent, (Worker*)aw);
+
+	*awp = aw;
 	return 0;
 }
 
@@ -2375,7 +2488,9 @@ static bool worker_close(Worker* w) {
 	trace_worker("closing worker thread=%p", w->thread);
 
 	// signal to worker's scheduler that it's time to shut down
-	s_shutdown(&w->s);
+	if (w->wkind == WorkerKind_USER)
+		s_shutdown(&((UWorker*)w)->s);
+
 	pthread_cancel(w->thread);
 	return true;
 }
@@ -2397,25 +2512,22 @@ static int l_spawn_worker(lua_State* L) {
 	}
 
 	// start a worker
-	Worker* w;
-	if UNLIKELY(( err = worker_open(&w, t, buf.bytes, buf.len) )) {
+	UWorker* uw;
+	if UNLIKELY(( err = uworker_open(&uw, t->s, buf.bytes, buf.len) )) {
 		buf_free(&buf);
 		return l_errno_error(L, -err);
 	}
 
-	// add worker to S's list of live workers
-	s_workers_add(t->s, w);
-
 	// allocate & return Worker object so that we know when the user is done with it (GC)
-	WorkerObj* obj = lua_newuserdatauv(L, sizeof(Worker), 0);
+	UWorkerObj* obj = lua_newuserdatauv(L, sizeof(UWorkerObj), 0);
 	if UNLIKELY(!obj) {
-		worker_close(w);
-		worker_release(w);
+		worker_close((Worker*)uw);
+		worker_release((Worker*)uw);
 		return 0;
 	}
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_workerobj_luatabkey);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_uworkerobj_luatabkey);
 	lua_setmetatable(L, -2);
-	obj->w = w;
+	obj->uw = uw;
 
 	return 1;
 }
@@ -2549,7 +2661,7 @@ static int l_connect(lua_State* L) {
 	}
 
 	if (errno == EINPROGRESS) {
-		dlog("wait for connect");
+		trace_sched("wait for connect");
 		return t_iopoll_wait(t, d, l_connect_cont);
 	}
 
@@ -2889,14 +3001,14 @@ static int l_await_task(lua_State* L) {
 }
 
 
-static int l_await_worker_cont1(lua_State* L, Worker* w) {
-	if LIKELY(w->s.exiterr == 0) {
+static int l_await_worker_cont1(lua_State* L, UWorker* uw) {
+	if LIKELY(uw->s.exiterr == 0) {
 		lua_pushboolean(L, true);
 		return 1;
 	}
 	// worker exited because of an error
 	lua_pushboolean(L, false);
-	lua_pushstring(L, (w->errdesc && *w->errdesc) ? w->errdesc : "unknown error");
+	lua_pushstring(L, (uw->errdesc && *uw->errdesc) ? uw->errdesc : "unknown error");
 	return 2;
 }
 
@@ -2910,27 +3022,22 @@ static int l_await_worker_cont(lua_State* L, int ltstatus, void* arg) {
 // Returns true if w exited cleanly or false if w exited because of an error.
 static int l_await_worker(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	WorkerObj* obj = l_uobj_check(L, 1, &g_workerobj_luatabkey, "Task or Worker");
+	UWorkerObj* obj = l_uobj_check(L, 1, &g_uworkerobj_luatabkey, "Task or Worker");
 	if (!obj)
 		return 0;
-	Worker* w = obj->w;
+	UWorker* uw = obj->uw;
 
 	// can't await the worker the calling task is running on
-	if UNLIKELY(t->s == &w->s)
+	if UNLIKELY(t->s == &uw->s)
 		return luaL_error(L, "attempt to 'await' itself");
 
-	// Add t to list of tasks waiting for w.
-	// Note that this list is only ever modified by this current thread,
-	// but is read by the worker's thread.
-	t->info.wait_worker.next_tid = w->waiters;
-	atomic_store_explicit(&w->waiters, t->tid, memory_order_release);
+	if (worker_add_waiter((Worker*)uw, t)) {
+		t->resume_nres = 0;
+		return t_suspend(t, T_WAIT_WORKER, uw, l_await_worker_cont);
+	}
 
-	// check if worker exited already
-	if (atomic_load_explicit(&w->status, memory_order_acquire) == Worker_CLOSED)
-		return l_await_worker_cont1(L, w);
-
-	t->resume_nres = 0;
-	return t_suspend(t, T_WAIT_WORKER, w, l_await_worker_cont);
+	// worker closed before we could add t to list of tasks waiting for w
+	return l_await_worker_cont1(L, uw);
 }
 
 
@@ -2956,6 +3063,46 @@ static int l_taskblock_end(lua_State* L) {
 }
 
 
+
+static int l_xxx_blocking_syscall_cont(lua_State* L, int ltstatus, void* arg) {
+	trace_sched("l_xxx_blocking_syscall_cont");
+	return 0;
+}
+
+
+static void l_xxx_blocking_syscall_work(AWorker* cw, void* arg) {
+	dlog("l_xxx_blocking_syscall_work: sleep(1)");
+	sleep(1);
+	dlog("l_xxx_blocking_syscall_work: sleep(1) done");
+}
+
+
+static int l_xxx_blocking_syscall(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	trace_sched("l_xxx_blocking_syscall");
+
+	// start a worker
+	// TODO: use a pool
+	AWorker* aw;
+	AWorkload workload[] = {
+		{ .f = l_xxx_blocking_syscall_work, },
+	};
+	int err = aworker_open(&aw, t->s, workload, countof(workload));
+	if UNLIKELY(err)
+		return l_errno_error(L, -err);
+
+
+
+	if (worker_add_waiter((Worker*)aw, t)) {
+		t->resume_nres = 0;
+		return t_suspend(t, T_WAIT_ASYNC, aw, l_xxx_blocking_syscall_cont);
+	}
+
+	// worker closed before we could add the worker
+	return l_xxx_blocking_syscall_cont(L, 0, aw);
+}
+
+
 static int l_monotime(lua_State* L) {
 	lua_pushinteger(L, DTimeNow());
 	return 1;
@@ -2978,7 +3125,7 @@ static const luaL_Reg dew_lib[] = {
 	{"socket", l_socket},
 	{"connect", l_connect},
 	{"read", l_read},
-	{"buf_alloc", l_buf_alloc},
+	{"buf_create", l_buf_create},
 	{"buf_resize", l_buf_resize},
 	{"buf_str", l_buf_str},
 	{"timer_start", l_timer_start},
@@ -2987,8 +3134,11 @@ static const luaL_Reg dew_lib[] = {
 	{"await", l_await},
 	{"recv", l_recv},
 	{"send", l_send},
+
+	// WIP
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
+	{"xxx_blocking_syscall", l_xxx_blocking_syscall},
 
 	// wasm experiment
 	#ifdef __wasm__
@@ -3027,9 +3177,9 @@ int luaopen_runtime(lua_State* L) {
 
 	// Worker
 	luaL_newmetatable(L, "Worker");
-	lua_pushcfunction(L, l_workerobj_gc);
+	lua_pushcfunction(L, l_uworkerobj_gc);
 	lua_setfield(L, -2, "__gc");
-	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_workerobj_luatabkey);
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_uworkerobj_luatabkey);
 
 	// export libc & syscall constants
 	#define _(NAME) \

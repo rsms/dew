@@ -10,7 +10,11 @@ API_BEGIN
 
 typedef struct S          S;          // scheduler (M+P in Go lingo)
 typedef struct T          T;          // task
-typedef struct Worker     Worker;     // CPU-specific instance of S
+typedef struct Worker     Worker;     // worker base
+typedef struct UWorker    UWorker;    // user worker, with Lua environment
+typedef struct AWorker    AWorker;    // custom (internal) worker
+typedef struct AWorkload  AWorkload;  // unit of work performed by an AWorker
+typedef struct AWorkQ     AWorkQ;     // per-S async work queue (SPSC FIFO)
 typedef struct IOPoll     IOPoll;     // platform specific I/O facility
 typedef struct IOPollDesc IOPollDesc; // descriptor (state used for I/O requests)
 typedef struct IODesc     IODesc;     // wraps a file descriptor, used by iopoll
@@ -104,6 +108,7 @@ enum TStatus {
 	T_WAIT_RECV,   // suspended, waiting for inbox message
 	T_WAIT_TASK,   // suspended, waiting for a task to exit
 	T_WAIT_WORKER, // suspended, waiting for a worker to exit
+	T_WAIT_ASYNC,  // suspended, waiting for an async operation (e.g. syscall) to finish
 	T_DEAD,        // dead
 };
 
@@ -179,34 +184,69 @@ enum WorkerStatus {
 	Worker_READY,
 };
 
+enum WorkerKind {
+	WorkerKind_USER,  // UWorker: userspace worker, with Lua env
+	WorkerKind_ASYNC, // AWorker: for blocking async work like syscalls
+};
+
 struct Worker {
 	// state accessed only by parent thread
-	T*               parent;  // T which spawned this worker
+	S*               parent;  // S which spawned this worker
 	Worker* nullable next;    // list link in S.workers
 
 	// state accessed by both parent thread and worker thread
-	OSThread     thread;
-	_Atomic(u8)  status;  // Worker_ constant (enum WorkerStatus)
+	u8           wkind;   // enum WorkerKind
+	_Atomic(u8)  status;  // enum WorkerStatus
 	_Atomic(u8)  nrefs;
-	_Atomic(u32) waiters; // list of tasks (tid's) waiting for this task (T.info.wait_task)
+	_Atomic(u32) waiters; // list of tasks (tid's) waiting for this worker (T.info.wait_task)
+	OSThread     thread;
+};
 
-	// input & output data (as input for worker_open, as output from worker exit.)
-	union {
-		struct {
+struct UWorker { // wkind == WorkerKind_USER
+	Worker w;
+	union { // input & output data (as input for workeru_open, as output from worker exit.)
+		struct { // input
 			// mainfun_lcode contains Lua bytecode for the main function, used during setup.
 			// Worker owns this memory, and it's free'd during thread setup.
 			u32            mainfun_lcode_len; // number of bytes at mainfun_lcode
 			void* nullable mainfun_lcode;
 		};
-		struct {
+		struct { // output
 			// When a worker has exited, this holds the description of an error
 			// which caused the worker to exit, or NULL if no error or if there are no waiters.
 			// Memory is free'd by worker_free.
 			char* nullable errdesc;
 		};
 	};
-
 	S s;
+};
+
+struct AWorkload {
+	void(*f)(AWorker* cw, void* arg);
+	void* nullable arg;
+};
+
+struct AWorkQ {
+    // consumer cache line
+    _Atomic(u32) r;
+    u8 _pad[CPU_CACHE_LINE_SIZE - sizeof(u32)];
+
+    // producer cache line + entries
+    // Note: in practical tests there's very little difference in time between
+    // using a dedicated cache line here vs one shared with entries.
+    // This way we save some memory with maybe 4ns practical difference.
+    union {
+    	_Atomic(u32) w;
+    	AWorkload _pad1;
+    };
+    union {
+    	AWorkload entries[(CPU_CACHE_LINE_SIZE*16 - sizeof(AWorkload)) / sizeof(AWorkload)];
+    };
+};
+
+struct AWorker { // wkind == WorkerKind_ASYNC
+	Worker w;
+	AWorkQ q;
 };
 
 

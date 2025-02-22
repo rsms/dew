@@ -188,8 +188,9 @@ end
 -- __rt.main(require("tests/rt/worker"))
 -- __rt.main(require("tests/rt/worker-error"))
 -- __rt.main(require("tests/rt/await-task"))
-__rt.main(require("tests/rt/send-recv"))
+-- __rt.main(require("tests/rt/send-recv"))
 -- __rt.main(require("tests/rt/tcp-echo"))
+__rt.main(require("tests/rt/blocking-syscall"))
 
 -- Runtime tests requiring additional manual setup:
 -- __rt.main(require("tests/rt/socket-read"))

@@ -6,8 +6,7 @@ Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
 OBJDIR       := $(BUILDDIR)/obj
-DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c pool.c time.c runtime.c platform.c \
-                lib_bignum.c bn.c
+DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c pool.c time.c runtime.c lib_bignum.c bn.c
 LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c \
                 lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c \
                 lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c \
@@ -29,12 +28,14 @@ ALL          := $(BUILDDIR)/dew
 ORIGPATH     := ${PATH}
 
 ifeq ($(TARGET),darwin)
+	DEW_SRCS += iopoll_darwin.c
 	LUA_CFLAGS += -DLUA_USE_MACOSX
 else ifeq ($(TARGET),linux)
+	DEW_SRCS += iopoll_linux.c
 	LUA_CFLAGS += -DLUA_USE_LINUX
 	LDFLAGS += -Wl,-E -ldl
 else ifeq ($(TARGET),web)
-	DEW_SRCS += wasm.c
+	DEW_SRCS += wasm.c iopoll_wasm.c
 	ALL := $(BUILDDIR)/dew.wasm $(BUILDDIR)/dew.js $(BUILDDIR)/index.html
 	CFLAGS += --target=wasm32-playbit -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS
 	CFLAGS += -fvisibility=hidden

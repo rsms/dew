@@ -63,6 +63,14 @@ typedef double    float64;
 	#endif
 #endif
 
+#if defined(__aarch64__) && defined(__APPLE__)
+	// Apple Silicon (M1, M2 etc) has 128B cache lines (`sysctl hw.cachelinesize`)
+	#define CPU_CACHE_LINE_SIZE 128
+#else
+	// Most other x86_64/amd64 and aarch64 CPUs have 64B cache lines
+	#define CPU_CACHE_LINE_SIZE 64
+#endif
+
 // UNLIKELY(integralexpr)->bool
 #if __has_builtin(__builtin_expect)
 	#define LIKELY(x)   (__builtin_expect((bool)(x), true))
