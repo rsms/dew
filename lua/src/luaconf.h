@@ -770,7 +770,10 @@
 ** CHANGE it if you need a different size.
 */
 #ifdef __dew__
-	#define SIZEOF_DEW_T    (sizeof(void*)*2 + sizeof(int)*8 + sizeof(uint64_t)) /* dew's struct T */
+	// SIZEOF_DEW_T = sizeof(struct T)
+	// Note: sizeof(lua_State) = 200 (when sizeof(void*) = 8)
+
+	#define SIZEOF_DEW_T    (sizeof(void*)*2 + sizeof(int)*8 + sizeof(uint64_t))
 	#define LUA_EXTRASPACE  SIZEOF_DEW_T
 
 	// luai_userstatefree is called by luaE_freethread when a lua thread is free'd (GC'd.)

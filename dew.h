@@ -382,6 +382,40 @@ i64 DTimeDurationMicroseconds(DTimeDuration d);
 i64 DTimeDurationNanoseconds(DTimeDuration d);
 
 
+// thread semaphore
+#if defined(WIN32) || defined(__MACH__)
+typedef uintptr TSem;
+#else
+API_END
+#include <semaphore.h>
+typedef sem_t TSem;
+API_BEGIN
+#endif
+int  tsem_open(TSem*, u32 initcount); // returns -errno on failure
+void tsem_close(TSem*);
+bool tsem_signal(TSem*, u32 count /*must be >0*/); // increment
+bool tsem_wait(TSem*);    // decrement
+bool tsem_trywait(TSem*); // try acquire a signal; return false instead of blocking
+int  tsem_timedwait(TSem*, u64 timeout_usecs); // -ETIMEDOUT on timeout
+// tsem2 uses a counter to accelerate high contention and low collision scenarios
+int  tsem2_open(TSem* s, _Atomic(int32_t)* countp, u32 initcount);
+void tsem2_softclose(TSem* s, _Atomic(int32_t)* countp);
+void tsem2_close(TSem* s, _Atomic(int32_t)* countp);
+void tsem2_signal(TSem* s, _Atomic(int32_t)* countp, u32 count);
+int  tsem2_wait1(TSem* s, _Atomic(int32_t)* countp, u64 timeout_usecs);
+bool tsem2_trywait(TSem* s, _Atomic(int32_t)* countp);
+inline static bool tsem2_wait(TSem* s, _Atomic(int32_t)* countp) {
+    if LIKELY(tsem2_trywait(s, countp))
+        return true;
+    return tsem2_wait1(s, countp, 0) == 0;
+}
+inline static int tsem2_timedwait(TSem* s, _Atomic(int32_t)* countp, u64 timeout_usecs) {
+    if LIKELY(tsem2_trywait(s, countp))
+        return 0;
+    return tsem2_wait1(s, countp, timeout_usecs);
+}
+
+
 #ifdef DEBUG
 void dlog_lua_stackf(lua_State* L, const char* fmt, ...);
 #endif
@@ -399,7 +433,7 @@ inline static void* nullable array_reserve(struct Array* a, u32 elemsize, u32 mi
 bool array_append(struct Array* a, u32 elemsize, const void* elemv, u32 elemc);
 
 
-// FIFO is a queue
+// FIFO is a "first in, last out" queue (not thread safe, obviously)
 typedef struct FIFO {
 	u32 cap;
 	u32 head;
@@ -410,6 +444,35 @@ typedef struct FIFO {
 FIFO* nullable fifo_alloc(u32 cap, usize elemsize);
 void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap);
 void* nullable fifo_pop(FIFO* q, usize elemsize);
+
+
+// TSQ: thread submission queue (SP-MC FIFO)
+typedef struct TSQ {
+    _Atomic(u32) r;
+    u32          cap;
+    u32          mask;
+    u32          entsize;
+    TSem         rsem; // producer signals how many entries are available to read
+    _Atomic(i32) rsem_count;
+    u32          w __attribute__((aligned(CPU_CACHE_LINE_SIZE)));
+    _Atomic(i32) wsem_count;
+    TSem         wsem; // consumer signals how many entries are available to write
+    u8           entries[];
+} TSQ;
+TSQ* nullable tsq_open(u32 entsize, u32 cap); // NULL if memory could not be allocated
+void tsq_close(TSQ* nullable q);
+void tsq_close_reader(TSQ* q); // causes tsq_read to fail if it has to wait for a write
+void tsq_close_writer(TSQ* q); // causes tsq_write to fail if it has to wait for a read
+void* nullable tsq_write(TSQ* q); // NULL if read end of q closed
+inline static void tsq_write_commit(TSQ* q) { // commit a write
+	// signal to readers that there's a new entry available to read
+	tsem2_signal(&q->rsem, &q->rsem_count, 1);
+}
+void* nullable tsq_read(TSQ* q); // NULL if write end of q closed
+inline static void tsq_read_commit(TSQ* q) { // commit a read
+	// signal to writer that there's a free entry available to write
+	tsem2_signal(&q->wsem, &q->wsem_count, 1);
+}
 
 
 // Pool maps data to dense indices.

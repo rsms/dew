@@ -8,23 +8,22 @@
 
 API_BEGIN
 
-typedef struct S          S;          // scheduler (M+P in Go lingo)
-typedef struct T          T;          // task
-typedef struct Worker     Worker;     // worker base
-typedef struct UWorker    UWorker;    // user worker, with Lua environment
-typedef struct AWorker    AWorker;    // custom (internal) worker
-typedef struct AWorkload  AWorkload;  // unit of work performed by an AWorker
-typedef struct AWorkQ     AWorkQ;     // per-S async work queue (SPSC FIFO)
-typedef struct IOPoll     IOPoll;     // platform specific I/O facility
-typedef struct IOPollDesc IOPollDesc; // descriptor (state used for I/O requests)
-typedef struct IODesc     IODesc;     // wraps a file descriptor, used by iopoll
-typedef struct Buf        Buf;        // growable array usable via buf_* Lua functions
-typedef struct Timer      Timer;
-typedef struct TimerInfo  TimerInfo;  // cache friendly 'timers' array entry
-typedef struct FIFO       FIFO;
-typedef struct RunQ       RunQ;
-typedef struct Inbox      Inbox;
-typedef struct InboxMsg   InboxMsg;
+typedef struct S            S;            // scheduler (M+P in Go lingo)
+typedef struct T            T;            // task
+typedef struct Worker       Worker;       // worker base
+typedef struct UWorker      UWorker;      // user worker, with Lua environment
+typedef struct AWorker      AWorker;      // custom (internal) worker
+typedef struct AsyncWorkReq AsyncWorkReq; // unit of work performed by an AWorker
+typedef struct IOPoll       IOPoll;       // platform specific I/O facility
+typedef struct IOPollDesc   IOPollDesc;   // descriptor (state used for I/O requests)
+typedef struct IODesc       IODesc;       // wraps a file descriptor, used by iopoll
+typedef struct Buf          Buf;          // growable array usable via buf_* Lua functions
+typedef struct Timer        Timer;
+typedef struct TimerInfo    TimerInfo; // cache friendly 'timers' array entry
+typedef struct FIFO         FIFO;
+typedef struct RunQ         RunQ;
+typedef struct Inbox        Inbox;
+typedef struct InboxMsg     InboxMsg;
 
 
 struct Buf {
@@ -119,19 +118,21 @@ enum TDied {
 };
 
 struct T {
-	S*              s;            // owning S
-	Inbox* nullable inbox;        // message queue
+	S*              s;     // owning S
+	Inbox* nullable inbox; // message queue
 
-	u32 tid;          // task identifier
+	u32 tid;   // task identifier
+	u32 nrefs; // references to task (when 0, T may be GC'd)
+
+	u8  status;      // T_ constant (enum TStatus)
+	u8  resume_nres; // number of results on stack, to be returned via resume
+	u16 ntimers;     // number of live timers
+	u32 waiters;     // list of tasks (tid's) waiting for this task (info.wait_task)
+
+	u32 parent;       // tid of task that spawned this task (0 for main task)
 	u32 prev_sibling; // tid of previous sibling in parent's list of children
 	u32 next_sibling; // tid of next sibling in parent's list of children
 	u32 first_child;  // list of children (most recently spawned. tid)
-	u32 parent;       // tid of task that spawned this task (0 for main task)
-	u32 nrefs;        // references to task (when 0, T may be GC'd)
-	u8  status;       // T_ constant (enum TStatus)
-	u8  resume_nres;  // number of results on stack, to be returned via resume
-	u16 ntimers;      // number of live timers
-	u32 waiters;      // list of tasks (tid's) waiting for this task (info.wait_task)
 
 	// 'info' holds data specific to 'status', used while task is suspended
 	union {
@@ -150,12 +151,33 @@ struct T {
 	} info;
 
 	// rest of struct is a lua_State struct
-	// Note: With Lua 5.4, the total size of T + lua_State is 248 B on 64-bit arch
 };
 
 enum { // S.notes
-	S_NOTE_WEXIT = 1u<<0, // a worker spawned by this S has exited
+	S_NOTE_WEXIT     = 1u<<0, // a worker spawned by this S has exited
+	S_NOTE_ASYNCWORK = 1u<<1, // a worker completed AsyncWorkReq
 };
+
+typedef i64(*AsyncWorkF)(AsyncWorkReq* req);
+
+struct AsyncWorkReq {
+	AsyncWorkF f;      // note: invalid after work completes
+	T*         t;      // task waiting for this work
+};
+
+typedef struct AsyncWorkRes {
+	u32 tid;
+	u32 _unused;
+	i64 result;
+} AsyncWorkRes;
+
+typedef struct AsyncWorkCQ { // linked with corresponding TSQ
+	_Atomic(u32) w;
+	u32          r;
+	u32          cap;
+	u32          mask;
+	AsyncWorkRes entries[];
+} AsyncWorkCQ;
 
 struct S {
 	lua_State*    L;         // base Lua environment
@@ -176,6 +198,12 @@ struct S {
 
 	// workers spawned by this S
 	Worker* nullable workers; // list
+
+	// asyncwork threads
+	u32                   asyncwork_nworkers; // number of live asyncwork worker threads
+	_Atomic(u32)          asyncwork_nreqs;    // number of pending work requests
+	TSQ* nullable         asyncwork_sq;       // submission queue
+	AsyncWorkCQ* nullable asyncwork_cq;       // completion queue
 };
 
 enum WorkerStatus {
@@ -191,8 +219,8 @@ enum WorkerKind {
 
 struct Worker {
 	// state accessed only by parent thread
-	S*               parent;  // S which spawned this worker
-	Worker* nullable next;    // list link in S.workers
+	S*               s;    // S which spawned this worker
+	Worker* nullable next; // list link in S.workers
 
 	// state accessed by both parent thread and worker thread
 	u8           wkind;   // enum WorkerKind
@@ -221,32 +249,20 @@ struct UWorker { // wkind == WorkerKind_USER
 	S s;
 };
 
-struct AWorkload {
-	void(*f)(AWorker* cw, void* arg);
-	void* nullable arg;
-};
-
-struct AWorkQ {
-    // consumer cache line
-    _Atomic(u32) r;
-    u8 _pad[CPU_CACHE_LINE_SIZE - sizeof(u32)];
-
-    // producer cache line + entries
-    // Note: in practical tests there's very little difference in time between
-    // using a dedicated cache line here vs one shared with entries.
-    // This way we save some memory with maybe 4ns practical difference.
-    union {
-    	_Atomic(u32) w;
-    	AWorkload _pad1;
-    };
-    union {
-    	AWorkload entries[(CPU_CACHE_LINE_SIZE*16 - sizeof(AWorkload)) / sizeof(AWorkload)];
-    };
-};
-
 struct AWorker { // wkind == WorkerKind_ASYNC
 	Worker w;
-	AWorkQ q;
+	//
+	// ———— HERE ————
+	// change to...
+	// - using one SPSC queue per worker (can use AsyncWorkCQ)
+	// - upon work to be done, selecting a free worker (1:1 S:AWorker so no race)
+	// - get rid of TSQ
+	//
+	// AsyncWorkCQ q;
+	union {
+		uintptr      req_is_active; // 0 when work is unused
+		AsyncWorkReq req;           // work currently being processed
+	};
 };
 
 

@@ -6,7 +6,8 @@ Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
 OBJDIR       := $(BUILDDIR)/obj
-DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c pool.c time.c runtime.c lib_bignum.c bn.c
+DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c tsem.c tsq.c pool.c time.c \
+                runtime.c lib_bignum.c bn.c
 LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c \
                 lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c \
                 lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c \
