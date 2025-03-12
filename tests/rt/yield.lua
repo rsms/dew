@@ -1,4 +1,4 @@
-return function()
+__rt.main(function()
 	__rt.spawn_task(function()
 		print("task A yield")
 		__rt.yield()
@@ -12,7 +12,7 @@ return function()
 	print("main yield")
 	__rt.yield()
 	print("main resumed")
-end
+end)
 --[[ output:
 task A yield
 task B yield

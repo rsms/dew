@@ -6,8 +6,9 @@ Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
 OBJDIR       := $(BUILDDIR)/obj
-DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c tsem.c tsq.c pool.c time.c \
+DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c tsem.c chan.c pool.c time.c \
                 runtime.c lib_bignum.c bn.c
+TEST_PROGS   := $(BUILDDIR)/chan_test $(BUILDDIR)/chan_test.opt
 LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c \
                 lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c \
                 lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c \
@@ -92,7 +93,7 @@ ifeq ($(DEBUG),1)
 		LDFLAGS += -fsanitize=address,undefined
 	endif
 else ifeq ($(TEST),1)
-	DEW_CFLAGS += -DDEBUG=1
+	#DEW_CFLAGS += -DDEBUG=1
 	CFLAGS += -O1 -fsanitize=address,undefined
 	LDFLAGS += -fsanitize=address,undefined
 else
@@ -125,10 +126,27 @@ dev-web:
 	'$(MAKE) DEBUG=1 TARGET=web'
 
 test:
-	$(MAKE) TEST=1 EMBED_SRC=0 _test
-_test: $(BUILDDIR)/dew
+	$(MAKE) TEST=1 EMBED_SRC=0 run_tests run_dew_selftest run_runtime_tests
+
+runtime_tests:
+	$(MAKE) TEST=1 EMBED_SRC=0 run_runtime_tests
+
+run_dew_selftest: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew --selftest$(if $(filter 1,$(V)),=v,)
 
+run_tests: $(TEST_PROGS)
+	$(Q)$(foreach f,$^,echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(f).log)"; $(f) $(if $(filter 1,$(V)),,>$(f).log 2>&1 || { echo "$(f): FAILED"; cat $(f).log; exit 1; }) && ) true
+
+run_runtime_tests: RUNTIME_TESTS := $(filter-out %benchmark.lua,$(wildcard tests/rt/*.lua))
+run_runtime_tests: $(BUILDDIR)/dew
+	$(Q)$(foreach f,$(RUNTIME_TESTS),echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(BUILDDIR)/$(notdir $(f)).log)"; DEW_RUNTIME_TEST=1 DEW_MAIN_SCRIPT=$(f) $<$(if $(filter 1,$(V)),,>$(BUILDDIR)/$(notdir $(f)).log 2>&1 || { echo "$(f): FAILED"; cat $(BUILDDIR)/$(notdir $(f)).log; exit 1; }) && ) true
+
+
+$(BUILDDIR)/chan_test.opt: CFLAGS += -O2 -DNDEBUG -fno-sanitize=address,undefined
+$(BUILDDIR)/chan_test $(BUILDDIR)/chan_test.opt: chan_test.c tsem.c panic.c logmsg.c
+	$(QLOG) "CC+LD $@"
+	$(Q)mkdir -p $(@D)
+	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
 
 $(BUILDDIR)/dew: $(DEW_OBJS) $(LUADEW_OBJS)
 	$(QLOG) "LINK  $@"
@@ -271,4 +289,5 @@ _deps/download/llvm-%:
 
 
 MAKEFLAGS += --no-print-directory
-.PHONY: all clean dev _dev dev-web test _test
+.PHONY: all clean dev _dev dev-web
+.PHONY: test run_tests run_dew_selftest runtime_tests run_runtime_tests

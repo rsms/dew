@@ -1,5 +1,6 @@
 #pragma once
 #include "dew.h"
+#include "chan.h"
 
 #if defined(__linux__) || defined(__APPLE__)
 	#include <pthread.h>
@@ -200,9 +201,9 @@ struct S {
 	Worker* nullable workers; // list
 
 	// asyncwork threads
-	u32                   asyncwork_nworkers; // number of live asyncwork worker threads
+	u32                   asyncwork_nworkers; // number of live workers (monotonic)
 	_Atomic(u32)          asyncwork_nreqs;    // number of pending work requests
-	TSQ* nullable         asyncwork_sq;       // submission queue
+	Chan* nullable        asyncwork_sq;       // submission queue
 	AsyncWorkCQ* nullable asyncwork_cq;       // completion queue
 };
 

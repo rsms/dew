@@ -1,4 +1,4 @@
-return function()
+__rt.main(function()
 	-- send_later: set to true to make it so that when we call send(),
 	-- the receiver has not yet called recv().
 	local send_later = true
@@ -22,4 +22,4 @@ return function()
 	end
 	local ok, err = __rt.await(T2)
 	if ok == 0 then error(err) end
-end
+end)

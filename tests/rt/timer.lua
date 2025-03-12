@@ -1,4 +1,4 @@
-return function()
+__rt.main(function()
 	-- start_timer() schedules a "timer" message to be delivered to the calling task
 	-- at a certain point in time
 	local wait_until = __rt.monotime() + 50000000
@@ -23,4 +23,4 @@ return function()
 	-- update the timer to expire 500ms later than we initially asked for
 	__rt.timer_update(timer1, wait_until + 50000000, 0, 0)
 	print("recv =>", __rt.recv())
-end
+end)

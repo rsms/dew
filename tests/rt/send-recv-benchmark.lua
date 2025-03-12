@@ -1,4 +1,4 @@
-return function()
+__rt.main(function()
 	-- send_later: set to true to make it so that when we call send(),
 	-- the receiver has not yet called recv().
 	local send_later = false
@@ -18,4 +18,4 @@ return function()
 	time = __rt.monotime() - time
 	print(string.format("Sent %d messages between two tasks: total %.2fms, avg %dns",
 	                    N, time / 1000000.0, time // N))
-end
+end)

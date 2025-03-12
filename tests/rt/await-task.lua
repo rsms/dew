@@ -1,4 +1,4 @@
-return function()
+__rt.main(function()
 	do	-- waiting for a task which exits immediately
 		local T2 = __rt.spawn_task(function()
 			print("T2: exiting")
@@ -74,4 +74,4 @@ return function()
 		__rt.sleep(10*1000*1000)
 		print("T1: exiting")
 	end
-end
+end)

@@ -1,6 +1,7 @@
 #pragma once
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE
 #include <lprefix.h>
 
 #include <stddef.h>
@@ -253,6 +254,35 @@ typedef double    float64;
 	+ (__typeof__(x))2 \
 )
 
+// ANYINT FLOOR_POW2(ANYINT x) rounds down x to nearest power of two.
+// Returns 1 if x is 0.
+#define FLOOR_POW2(x) ({ \
+  __typeof__(x) xtmp__ = (x); \
+  FLOOR_POW2_X(xtmp__); \
+})
+// FLOOR_POW2_X is a constant-expression implementation of FLOOR_POW2.
+// When used as a constant expression, compilation fails if x is 0.
+#define FLOOR_POW2_X(x) ( \
+  ((x) <= 1) ? (__typeof__(x))1 : \
+  ((__typeof__(x))1 << dew_ilog2(x)) \
+)
+
+
+// cpu_yield() yields the CPU core
+#if defined(__i386) || defined(__i386__) || defined(__x86_64__)
+  #define cpu_yield() __asm__ __volatile__("pause")
+#elif defined(__arm__) || defined(__arm64__) || defined(__aarch64__)
+  #define cpu_yield() __asm__ __volatile__("yield")
+#elif defined(WIN32)
+    #include <immintrin.h>
+    #define cpu_yield() _mm_pause()
+#elif defined(__wasm__)
+    #define cpu_yield() ((void)0)
+#else
+    // default to scheduler yield
+    #define cpu_yield() sched_yield()
+#endif
+
 
 // logging (0=error, 1=warning, 2=info, 3=debug)
 #define logerr(fmt, args...)  \
@@ -269,7 +299,7 @@ typedef double    float64;
 
 // assert
 #undef assert
-#ifdef DEBUG
+#if defined(DEBUG) || !defined(NDEBUG)
 	#define _assertfail(fmt, args...) \
 		_panic(__FILE__, __LINE__, __FUNCTION__, "Assertion failed: " fmt, args)
 	#define assert(cond) \
@@ -382,7 +412,7 @@ i64 DTimeDurationMicroseconds(DTimeDuration d);
 i64 DTimeDurationNanoseconds(DTimeDuration d);
 
 
-// thread semaphore
+// tsem is a thread semaphore
 #if defined(WIN32) || defined(__MACH__)
 typedef uintptr TSem;
 #else
@@ -391,29 +421,12 @@ API_END
 typedef sem_t TSem;
 API_BEGIN
 #endif
-int  tsem_open(TSem*, u32 initcount); // returns -errno on failure
-void tsem_close(TSem*);
-bool tsem_signal(TSem*, u32 count /*must be >0*/); // increment
-bool tsem_wait(TSem*);    // decrement
-bool tsem_trywait(TSem*); // try acquire a signal; return false instead of blocking
-int  tsem_timedwait(TSem*, u64 timeout_usecs); // -ETIMEDOUT on timeout
-// tsem2 uses a counter to accelerate high contention and low collision scenarios
-int  tsem2_open(TSem* s, _Atomic(int32_t)* countp, u32 initcount);
-void tsem2_softclose(TSem* s, _Atomic(int32_t)* countp);
-void tsem2_close(TSem* s, _Atomic(int32_t)* countp);
-void tsem2_signal(TSem* s, _Atomic(int32_t)* countp, u32 count);
-int  tsem2_wait1(TSem* s, _Atomic(int32_t)* countp, u64 timeout_usecs);
-bool tsem2_trywait(TSem* s, _Atomic(int32_t)* countp);
-inline static bool tsem2_wait(TSem* s, _Atomic(int32_t)* countp) {
-    if LIKELY(tsem2_trywait(s, countp))
-        return true;
-    return tsem2_wait1(s, countp, 0) == 0;
-}
-inline static int tsem2_timedwait(TSem* s, _Atomic(int32_t)* countp, u64 timeout_usecs) {
-    if LIKELY(tsem2_trywait(s, countp))
-        return 0;
-    return tsem2_wait1(s, countp, timeout_usecs);
-}
+int  tsem_open(TSem*, u32 initcount);          // -errno on failure
+void tsem_close(TSem*);                        // no thread must be tsem_wait-ing
+void tsem_signal(TSem*);                       // increment
+void tsem_wait(TSem*);                         // decrement
+bool tsem_trywait(TSem*);                      // true if decremented, false if would block
+bool tsem_timedwait(TSem*, u64 timeout_usecs); // true if decremented, false on timeout
 
 
 #ifdef DEBUG
@@ -444,35 +457,6 @@ typedef struct FIFO {
 FIFO* nullable fifo_alloc(u32 cap, usize elemsize);
 void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap);
 void* nullable fifo_pop(FIFO* q, usize elemsize);
-
-
-// TSQ: thread submission queue (SP-MC FIFO)
-typedef struct TSQ {
-    _Atomic(u32) r;
-    u32          cap;
-    u32          mask;
-    u32          entsize;
-    TSem         rsem; // producer signals how many entries are available to read
-    _Atomic(i32) rsem_count;
-    u32          w __attribute__((aligned(CPU_CACHE_LINE_SIZE)));
-    _Atomic(i32) wsem_count;
-    TSem         wsem; // consumer signals how many entries are available to write
-    u8           entries[];
-} TSQ;
-TSQ* nullable tsq_open(u32 entsize, u32 cap); // NULL if memory could not be allocated
-void tsq_close(TSQ* nullable q);
-void tsq_close_reader(TSQ* q); // causes tsq_read to fail if it has to wait for a write
-void tsq_close_writer(TSQ* q); // causes tsq_write to fail if it has to wait for a read
-void* nullable tsq_write(TSQ* q); // NULL if read end of q closed
-inline static void tsq_write_commit(TSQ* q) { // commit a write
-	// signal to readers that there's a new entry available to read
-	tsem2_signal(&q->rsem, &q->rsem_count, 1);
-}
-void* nullable tsq_read(TSQ* q); // NULL if write end of q closed
-inline static void tsq_read_commit(TSQ* q) { // commit a read
-	// signal to writer that there's a free entry available to write
-	tsem2_signal(&q->wsem, &q->wsem_count, 1);
-}
 
 
 // Pool maps data to dense indices.

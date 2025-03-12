@@ -118,13 +118,6 @@ function parse_args(args)
 	return opt
 end
 
-function selftest(verbose)
-	print("intscan_test: start")
-	require("intscan_test"){ verbose = verbose }
-	print("intconv_test: start")
-	require("intconv_test"){ verbose = verbose }
-end
-
 function compile_and_run(unit)
 	-- tokenize
 	tokens = tokenize_unit(unit)
@@ -158,7 +151,7 @@ function main(args)
 	local prog = args[0]
 	local opt = parse_args(args)
 	if opt.selftest > 0 then
-		selftest(opt.selftest > 1)
+		require("selftest")(opt.selftest > 1)
 		os.exit(0)
 	end
 	if #opt.args == 0 then
@@ -179,23 +172,23 @@ end
 
 
 -- Runtime tests: (run manually by uncommenting)
--- __rt.main(require("tests/rt/yield"))
--- __rt.main(require("tests/rt/sleep"))
--- __rt.main(require("tests/rt/timer"))
--- __rt.main(require("tests/rt/repeating-timer"))
--- __rt.main(require("tests/rt/stop-children-on-parent-exit"))
--- __rt.main(require("tests/rt/deadlock"))
--- __rt.main(require("tests/rt/worker"))
--- __rt.main(require("tests/rt/worker-error"))
--- __rt.main(require("tests/rt/await-task"))
--- __rt.main(require("tests/rt/send-recv"))
--- __rt.main(require("tests/rt/tcp-echo"))
-__rt.main(require("tests/rt/blocking-syscall"))
+-- require("tests/rt/yield")
+-- require("tests/rt/sleep")
+-- require("tests/rt/timer")
+-- require("tests/rt/repeating-timer")
+-- require("tests/rt/stop-children-on-parent-exit")
+-- require("tests/rt/deadlock")
+-- require("tests/rt/worker")
+-- require("tests/rt/worker-error")
+-- require("tests/rt/await-task")
+-- require("tests/rt/send-recv")
+-- require("tests/rt/tcp-echo")
+-- require("tests/rt/blocking-syscall")
 
 -- Runtime tests requiring additional manual setup:
--- __rt.main(require("tests/rt/socket-read"))
+-- require("tests/rt/socket-read")
 
 -- Runtime benchmarks: (run manually by uncommenting)
--- __rt.main(require("tests/rt/send-recv-benchmark"))
+-- require("tests/rt/send-recv-benchmark")
 
 main(arg)

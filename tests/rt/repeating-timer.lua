@@ -1,4 +1,4 @@
-return function()
+__rt.main(function()
 	local total_delay = 0
 	local N = 3
 	local start = __rt.monotime()
@@ -16,4 +16,4 @@ return function()
 		start = __rt.monotime()
 	end
 	print("avg interval:", ((total_delay / N) / 1000000).."ms")
-end
+end)

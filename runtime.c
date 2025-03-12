@@ -2079,17 +2079,21 @@ static int s_finalize(S* s) {
 	if UNLIKELY(s->workers) {
 		trace_worker("shutting down workers");
 
-		if (s->asyncwork_sq) {
-			tsq_close_reader(s->asyncwork_sq);
-			// tsq_close_writer(s->asyncwork_sq);
+		// close all workers
+		for (Worker* w = s->workers; w; w = w->next) {
+			if (w->wkind == WorkerKind_ASYNC) {
+				// signal shutdown in case worker is blocked on sq
+				assert(s->asyncwork_sq != NULL);
+				chan_shutdown(s->asyncwork_sq);
+			}
+			worker_close(w);
 		}
 
 		for (Worker* w = s->workers; w;) {
-			Worker* next_w = w->next;
-			worker_close(w);
 			int err = pthread_join(w->thread, NULL);
 			if (err)
 				logwarn("failed to wait for worker thread=%p: %s", w->thread, strerror(err));
+			Worker* next_w = w->next;
 			worker_release(w);
 			w = next_w;
 		}
@@ -2100,7 +2104,8 @@ static int s_finalize(S* s) {
 			exit(s->exiterr);
 		}
 
-		tsq_close(s->asyncwork_sq);
+		if (s->asyncwork_sq)
+			chan_close(s->asyncwork_sq);
 	}
 
 	trace_sched("finalized " S_ID_F, s_id(s));
@@ -2437,19 +2442,12 @@ static void asyncworker_main(AWorker* aw) {
 
 	for (;;) {
 		// pick up a work request
-		AsyncWorkReq* reqp = tsq_read(aw->w.s->asyncwork_sq);
-		if UNLIKELY(reqp == NULL) {
+		// Note: This can't be interrupted by pthread_cancel; work_is_active checks are safe
+		trace_worker("TSQ read...");
+		if UNLIKELY(!chan_read(aw->w.s->asyncwork_sq, &aw->req)) {
 			// asyncwork_sq closed
-			dlog("asyncworker existing; TSQ closed");
 			break;
 		}
-
-		// copy, so we can tsq_read_commit immediately
-		aw->req = *reqp;
-
-		// Commit the read.
-		// Note: This can't be interrupted by pthread_cancel; work_is_active checks are safe
-		tsq_read_commit(aw->w.s->asyncwork_sq);
 
 		// run work
 		// TODO: handle error in work.f?
@@ -2498,13 +2496,26 @@ static int worker_start(Worker* w) {
 }
 
 
+static int worker_open(Worker* w, S* s, u8 wkind) {
+	w->s = s;
+	w->wkind = wkind;
+	w->nrefs = 1; // caller's reference
+
+	// Chan* nullable chan_open(u32 cap, u32 entsize);
+
+	return 0;
+}
+
+
 static int uworker_open(UWorker** uwp, S* s, void* mainfun_lcode, u32 mainfun_lcode_len) {
 	UWorker* uw = calloc(1, sizeof(UWorker));
 	if (!uw)
 		return -ENOMEM;
-	uw->w.s = s;
-	uw->w.wkind = WorkerKind_USER;
-	uw->w.nrefs = 1; // caller's reference
+	int err = worker_open(&uw->w, s, WorkerKind_USER);
+	if (err) {
+		free(uw);
+		return err;
+	}
 	uw->mainfun_lcode_len = mainfun_lcode_len;
 	uw->mainfun_lcode = mainfun_lcode;
 	uw->s.isworker = true; // note: uw->s is the worker's S, not the spawner S 's'
@@ -2518,12 +2529,13 @@ static int s_asyncwork_spawn_worker(S* s) {
 	AWorker* aw = calloc(1, sizeof(AWorker));
 	if (!aw)
 		return -ENOMEM;
-	aw->w.s = s;
-	aw->w.wkind = WorkerKind_ASYNC;
-	aw->w.nrefs = 1; // caller's reference
+	int err = worker_open(&aw->w, s, WorkerKind_ASYNC);
+	if (err) {
+		free(aw);
+		return err;
+	}
 	aw->req_is_active = 0;
-
-	int err = worker_start((Worker*)aw);
+	err = worker_start((Worker*)aw);
 	if (err == 0)
 		s->asyncwork_nworkers++;
 	return err;
@@ -2546,7 +2558,7 @@ static bool worker_close(Worker* w) {
 	} else {
 		assert(w->wkind == WorkerKind_ASYNC);
 		AWorker* aw = (AWorker*)w;
-		w->s->asyncwork_nworkers--;
+		// w->s->asyncwork_nworkers--;
 	}
 
 	pthread_cancel(w->thread);
@@ -3127,18 +3139,19 @@ static int s_asyncwork_sq_create(S* s) {
 	trace_sched("create asyncwork_sq");
 	u32 cap = 256;
 
-	TSQ* sq = tsq_open(sizeof(AsyncWorkReq), cap);
+	Chan* sq = chan_open(cap, sizeof(AsyncWorkReq));
 	if (!sq)
 		return -ENOMEM;
 
-	AsyncWorkCQ* cq = malloc(sizeof(AsyncWorkCQ) + sizeof(AsyncWorkRes)*sq->cap);
+	cap = MAX(cap, chan_cap(sq));
+	AsyncWorkCQ* cq = malloc(sizeof(AsyncWorkCQ) + sizeof(AsyncWorkRes)*cap);
 	if (!cq) {
-		tsq_close(sq);
+		chan_close(sq);
 		return -ENOMEM;
 	}
 	cq->r = 0;
-	cq->cap = sq->cap;
-	cq->mask = sq->mask;
+	cq->cap = cap;
+	cq->mask = chan_cap(sq);
 	atomic_store_explicit(&cq->w, 0, memory_order_relaxed);
 
 	s->asyncwork_sq = sq;
@@ -3148,7 +3161,7 @@ static int s_asyncwork_sq_create(S* s) {
 }
 
 
-static int s_asyncwork_setup(S* s) {
+static int s_asyncwork_prepare(S* s) {
 	u32 nreqs = atomic_fetch_add_explicit(&s->asyncwork_nreqs, 1, memory_order_acq_rel);
 	trace_sched("[asyncwork] nreqs, nworkers = %u, %u", nreqs+1, s->asyncwork_nworkers);
 	if LIKELY(s->asyncwork_sq != NULL && nreqs < s->asyncwork_nworkers)
@@ -3171,7 +3184,7 @@ static i64 l_xxx_blocking_syscall_work(AsyncWorkReq* req) {
 
 static int l_xxx_blocking_syscall(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	trace_sched("l_xxx_blocking_syscall");
+	trace_sched(T_ID_F " l_xxx_blocking_syscall", t_id(t));
 
 	if (0) { // XXX disabled for development of thread workers
 	// if t is the only task running on S's thread we can just block,
@@ -3184,18 +3197,19 @@ static int l_xxx_blocking_syscall(lua_State* L) {
 	}
 
 	// setup submission queue and/or spawn a worker thread, if needed
-	int err = s_asyncwork_setup(t->s);
+	int err = s_asyncwork_prepare(t->s);
 	if (err)
 		return l_errno_error(L, -err);
 
 	// enqueue work request
-	AsyncWorkReq* req = tsq_write(t->s->asyncwork_sq);
-	if UNLIKELY(!req)
-		return l_errno_error(L, ENOMEM);
+	ChanTx tx = chan_write_begin(t->s->asyncwork_sq);
+	assert(tx.entry != NULL);
+	AsyncWorkReq* req = tx.entry;
 	req->f = l_xxx_blocking_syscall_work;
 	req->t = t;
 	t_retain(t); // work's ref, released by s_asyncwork_complete
-	tsq_write_commit(t->s->asyncwork_sq);
+	chan_write_commit(t->s->asyncwork_sq, tx);
+	trace_sched(T_ID_F " TSQ write_commit", t_id(t));
 
 	// to check if a worker is closed:
 	// atomic_load_explicit(&w->status, memory_order_acquire) == Worker_CLOSED;

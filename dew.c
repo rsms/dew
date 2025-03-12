@@ -155,7 +155,10 @@ static int pmain(lua_State* L) {
 		// int status = luaL_loadfile(L, "o.darwin.debug/dew.lua");
 		int status = lua_load(L_co, src_readchunk, (void*)kDewLuaData, "dew.lua", "bt");
 	#else
-		int status = luaL_loadfile(L_co, "dew.lua");
+		const char* filename = getenv("DEW_MAIN_SCRIPT");
+		if (!filename || *filename == 0)
+			filename = "dew.lua";
+		int status = luaL_loadfile(L_co, filename);
 	#endif
 	if (status != LUA_OK) {
 		check_status(L_co, status);

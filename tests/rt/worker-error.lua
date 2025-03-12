@@ -1,6 +1,6 @@
 -- When an error occurs in the main task of a worker,
 -- the worker is stopped and await(worker) returns false.
-return function()
+__rt.main(function()
 	local worker = __rt.spawn_worker(function()
 		error("error in worker's main task")
 	end)
@@ -15,4 +15,4 @@ return function()
 	print("T1: await(worker) =>", ok, err)
 	assert(ok == false)
 	__rt.await(T2)
-end
+end)

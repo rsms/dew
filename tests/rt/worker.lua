@@ -1,4 +1,4 @@
-return function()
+__rt.main(function()
 	local worker = __rt.spawn_worker(function()
 		print("in worker")
 		local tasks = {}
@@ -20,4 +20,4 @@ return function()
 	local ok = __rt.await(worker)
 	assert(ok)
 	__rt.await(T2)
-end
+end)
