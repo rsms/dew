@@ -773,6 +773,9 @@
 	// SIZEOF_DEW_T = sizeof(struct T)
 	// Note: sizeof(lua_State) = 200 (when sizeof(void*) = 8)
 
+	#undef  LUA_KCONTEXT
+	#define LUA_KCONTEXT unsigned long
+
 	#define SIZEOF_DEW_T    (sizeof(void*)*2 + sizeof(int)*8 + sizeof(uint64_t))
 	#define LUA_EXTRASPACE  SIZEOF_DEW_T
 

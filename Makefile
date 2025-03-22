@@ -141,7 +141,21 @@ run_tests: $(TEST_PROGS)
 	$(Q)$(foreach f,$^,echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(f).log)"; $(f) $(if $(filter 1,$(V)),,>$(f).log 2>&1 || { echo "$(f): FAILED"; cat $(f).log; exit 1; }) && ) true
 
 run_runtime_tests: RUNTIME_TESTS := $(filter-out %benchmark.lua,$(wildcard tests/rt/*.lua))
-run_runtime_tests: $(BUILDDIR)/dew
+run_runtime_tests: $(BUILDDIR)/dew $(RUNTIME_TESTS)
+	$(Q)_FC=0; $(foreach f,$(RUNTIME_TESTS),\
+	      $(if $(filter 1,$(V)),echo "RUN   $(f)";,) \
+	      if ! DEW_RUNTIME_TEST=1 DEW_MAIN_SCRIPT=$(f) $< \
+	           $(if $(filter 1,$(V)),\
+	             ; then echo "$(f): FAILED">&2; _FC=$$(( _FC + 1 )); ,\
+	             > $(BUILDDIR)/$(notdir $(f)).log 2>&1; \
+	               then echo "$(f): FAILED ——————————">&2; _FC=$$(( _FC + 1 )); \
+	               cat $(BUILDDIR)/$(notdir $(f)).log; \
+	               echo "——————————"; \
+	             ) else echo "$(f): PASS"; fi; ) \
+	    if [ $$_FC -eq 0 ]; then echo "all tests PASS"; \
+	    else echo "$$_FC test(s) FAILED">&2; exit 1; fi
+
+run_runtime_tests_v1: $(BUILDDIR)/dew
 	$(Q)$(foreach f,$(RUNTIME_TESTS),echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(BUILDDIR)/$(notdir $(f)).log)"; DEW_RUNTIME_TEST=1 DEW_MAIN_SCRIPT=$(f) $<$(if $(filter 1,$(V)),,>$(BUILDDIR)/$(notdir $(f)).log 2>&1 || { echo "$(f): FAILED"; cat $(BUILDDIR)/$(notdir $(f)).log; exit 1; }) && ) true
 
 

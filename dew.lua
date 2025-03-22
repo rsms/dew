@@ -184,6 +184,7 @@ end
 -- require("tests/rt/send-recv")
 -- require("tests/rt/tcp-echo")
 -- require("tests/rt/blocking-syscall")
+-- require("tests/rt/getaddrinfo")
 
 -- Runtime tests requiring additional manual setup:
 -- require("tests/rt/socket-read")

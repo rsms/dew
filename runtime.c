@@ -2,8 +2,10 @@
 
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
-#include <sys/socket.h>
+#include <netdb.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 
 #include <pthread.h> // TODO: move into platform_SYS.c
 #include <stdatomic.h> // TODO: move into platform_SYS.c
@@ -749,7 +751,7 @@ static int l_buf_create(lua_State* L) {
 	} else {
 		cap = ALIGN2(cap, sizeof(void*));
 	}
-	// dlog("allocating buffer with cap %llu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
+	// dlog("allocating buffer with cap %lu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
 
 	// see comment in l_iodesc_create
 	int nuvalue = 0;
@@ -840,7 +842,7 @@ inline static int t_suspend(T* t, u8 tstatus, void* nullable arg, TaskContinuati
 	        "%s", t_status_str(tstatus));
 	trace_sched(T_ID_F " %s", t_id(t), t_status_str(tstatus));
 	t->status = tstatus;
-	return lua_yieldk(t_L(t), 0, (intptr_t)arg, (int(*)(lua_State*,int,lua_KContext))cont);
+	return lua_yieldk(t_L(t), 0, (intptr_t)arg, (int(*)(lua_State*,int,u64))cont);
 }
 
 
@@ -930,7 +932,7 @@ static void timers_dlog(const TimerPQ* timers_readonly) {
 
 	for (u32 i = 0; timers.len > 0; i++) {
 		Timer* timer = timers_remove_min(&timers);
-		dlog("  [%u] %10llu %p", i, timer->when, timer);
+		dlog("  [%u] %10lu %p", i, timer->when, timer);
 	}
 
 	free(v_copy);
@@ -1164,7 +1166,7 @@ static int l_timer_start(lua_State* L) {
 	// increment task's "live timers" counter
 	if UNLIKELY(++t->ntimers == 0) {
 		t->ntimers--;
-		return luaL_error(L, "too many concurrent timers (%u)", t->ntimers);
+		return luaL_error(L, "too many concurrent timers (%d)", t->ntimers);
 	}
 
 	// create & schedule a timer
@@ -1224,7 +1226,7 @@ static int l_timer_update(lua_State* L) {
 		// First, increment task's "live timers" counter
 		if UNLIKELY(++t->ntimers == 0) {
 			t->ntimers--;
-			return luaL_error(L, "too many concurrent timers (%u)", t->ntimers);
+			return luaL_error(L, "too many concurrent timers (%d)", t->ntimers);
 		}
 		if UNLIKELY(!timers_add(&t->s->timers, timer))
 			return l_errno_error(L, ENOMEM);
@@ -1283,7 +1285,7 @@ static int l_sleep(lua_State* L) {
 	// increment task's "live timers" counter
 	if UNLIKELY(++t->ntimers == 0) {
 		t->ntimers--;
-		return luaL_error(L, "too many concurrent timers (%u)", t->ntimers);
+		return luaL_error(L, "too many concurrent timers (%d)", t->ntimers);
 	}
 
 	// create & schedule a timer
@@ -1727,6 +1729,10 @@ static UWorker* s_worker(S* s) {
 static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 	S* s = t->s;
 
+	// Looking for a bug that trips assert(s->nlive > 0) further down.
+	// Seems to happens when a child task is begin stopped
+	assert(prev_tstatus != T_DEAD);
+
 	// Note: t_stop updates t->status before calling t_finalize. For that reason we can't trust
 	// the current value of t->status in here but must use prev_tstatus.
 	trace_sched(T_ID_F " exited (died_how=%d)", t_id(t), died_how);
@@ -1768,7 +1774,6 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 		     t_id(t), s_id(t->s));
 		assert(s->nlive > 0);
 	}
-	assert(s->nlive > 0);
 	s->nlive--;
 
 	// dlog("task tree for " T_ID_F ":", t_id(t)); dlog_task_tree(t, 1);
@@ -2008,24 +2013,6 @@ static void s_reap_workers(S* s) {
 }
 
 
-/*static void s_asyncwork_complete_v1(S* s) {
-	atomic_thread_fence(memory_order_acquire);
-	u32 w = atomic_load_explicit(&s->asyncwork_cq->w, memory_order_acquire);
-	u32 r = s->asyncwork_cq->r;
-	for (; r < w; r++) {
-		AsyncWorkRes* res = &s->asyncwork_cq->entries[r & s->asyncwork_cq->mask];
-		T* t = s_task(s, res->tid);
-		trace_sched("wake " T_ID_F " waiting on asyncwork", t_id(t));
-		lua_pushinteger(t_L(t), res->result);
-		t->resume_nres = 1;
-		if UNLIKELY(!s_runq_put(s, t))
-			dlog("failed to allocate memory");
-		t_release(t);
-	}
-	s->asyncwork_cq->r = r;
-}*/
-
-
 static void s_asyncwork_process_completions(S* s) {
 	// There's a natural race condition with asyncwork completions where delivering
 	// S_NOTE_ASYNCWORK to wake up a runloop races with delivery of AsyncWorkRes on the
@@ -2043,12 +2030,17 @@ static void s_asyncwork_process_completions(S* s) {
 	for (;;) {
 		if (!chan_read(s->asyncwork_cq, CHAN_TRY, &res))
 			break;
-		trace_sched("wake " T_ID_F " waiting on asyncwork", t_id(res.t));
-		lua_pushinteger(t_L(res.t), res.result);
-		res.t->resume_nres = 1;
-		if UNLIKELY(!s_runq_put(s, res.t))
+		T* t = s_task(s, res.tid);
+		trace_sched("wake " T_ID_F " waiting on asyncwork", t_id(t));
+		if (res.flags & AsyncWorkFlag_HAS_CONT) {
+			t->info.wait_async.result = res.result;
+		} else {
+			lua_pushinteger(t_L(t), res.result);
+			t->resume_nres = 1;
+		}
+		if UNLIKELY(!s_runq_put(s, t))
 			panic_oom();
-		t_release(res.t);
+		t_release(t);
 	}
 }
 
@@ -2379,17 +2371,18 @@ static void s_notify(S* s, u8 addl_notes) {
 
 
 static void asyncworker_complete(AWorker* aw, i64 result) {
-	dlog("—— CQ PUSH %lld", result);
 	S* s = aw->w.s;
 
 	ChanTx tx = chan_write_begin(s->asyncwork_cq, 0);
 	assertf(tx.entry != NULL, "chan_write(cq) failed");
 	AsyncWorkRes* res = tx.entry;
+	res->op = aw->req.op;
+	res->flags = aw->req.flags;
+	res->tid = aw->req.tid;
 	res->result = result;
-	res->t = aw->req.t;
 	chan_write_commit(s->asyncwork_cq, tx);
 
-	trace_sched(T_ID_F " TCQ write_commit", t_id(res->t));
+	trace_sched("T%u TCQ write_commit result=%ld", res->tid, result);
 	aw->req_is_active = 0;
 }
 
@@ -2465,6 +2458,9 @@ static void uworker_main(UWorker* w) {
 }
 
 
+static i64 asyncwork_do(const AsyncWorkReq* req);
+
+
 static void asyncworker_main(AWorker* aw) {
 	// switch status to READY while checking if worker has been closed
 	if UNLIKELY(!worker_cas_status((Worker*)aw, Worker_READY)) {
@@ -2475,15 +2471,14 @@ static void asyncworker_main(AWorker* aw) {
 	for (;;) {
 		// pick up a work request
 		// Note: This can't be interrupted by pthread_cancel; work_is_active checks are safe
-		trace_worker("TSQ read...");
+		trace_worker("asyncwork SQ read...");
 		if UNLIKELY(!chan_read(aw->w.s->asyncwork_sq, 0, &aw->req)) {
 			// asyncwork_sq closed
 			break;
 		}
 
-		// run work
-		// TODO: handle error in work.f?
-		i64 result = aw->req.f(&aw->req);
+		// perform the work
+		i64 result = asyncwork_do(&aw->req);
 
 		// notify S that the work has completed
 		asyncworker_complete(aw, result);
@@ -2556,24 +2551,6 @@ static int uworker_open(UWorker** uwp, S* s, void* mainfun_lcode, u32 mainfun_lc
 }
 
 
-static int s_asyncwork_spawn_worker(S* s) {
-	trace_sched("spawn asyncwork worker");
-	AWorker* aw = calloc(1, sizeof(AWorker));
-	if (!aw)
-		return -ENOMEM;
-	int err = worker_open(&aw->w, s, WorkerKind_ASYNC);
-	if (err) {
-		free(aw);
-		return err;
-	}
-	aw->req_is_active = 0;
-	err = worker_start((Worker*)aw);
-	if (err == 0)
-		s->asyncwork_nworkers++;
-	return err;
-}
-
-
 static bool worker_close(Worker* w) {
 	assert(pthread_self() != w->thread); // must not call from worker's own thread
 
@@ -2632,6 +2609,256 @@ static int l_spawn_worker(lua_State* L) {
 	obj->uw = uw;
 
 	return 1;
+}
+
+
+static int s_asyncwork_spawn_worker(S* s) {
+	trace_sched("spawn asyncwork worker");
+	AWorker* aw = calloc(1, sizeof(AWorker));
+	if (!aw)
+		return -ENOMEM;
+	int err = worker_open(&aw->w, s, WorkerKind_ASYNC);
+	if (err) {
+		free(aw);
+		return err;
+	}
+	aw->req_is_active = 0;
+	err = worker_start((Worker*)aw);
+	if (err == 0)
+		s->asyncwork_nworkers++;
+	return err;
+}
+
+
+static int s_asyncwork_setup(S* s) {
+	trace_sched("creating asyncwork SQ & CQ");
+	u32 cap = 64;
+
+	Chan* sq = chan_open(cap, sizeof(AsyncWorkReq));
+	if (!sq)
+		return -ENOMEM;
+
+	Chan* cq = chan_open(cap, sizeof(AsyncWorkRes));
+	if (!cq) {
+		chan_close(sq);
+		return -ENOMEM;
+	}
+
+	s->asyncwork_sq = sq;
+	s->asyncwork_cq = cq;
+
+	return 0;
+}
+
+
+static int s_asyncwork_prepare(S* s) {
+	u32 nreqs = atomic_fetch_add_explicit(&s->asyncwork_nreqs, 1, memory_order_acq_rel);
+	trace_sched("[asyncwork] nreqs, nworkers = %u, %u", nreqs+1, s->asyncwork_nworkers);
+	if LIKELY(s->asyncwork_sq != NULL && nreqs < s->asyncwork_nworkers)
+		return 0;
+	if (s->asyncwork_sq == NULL) {
+		int err = s_asyncwork_setup(s);
+		if (err)
+			return err;
+	}
+	return s_asyncwork_spawn_worker(s);
+}
+
+
+static int t_asyncwork_req(
+	T* t, AsyncWorkReq* req, void* nullable cont_arg, TaskContinuation nullable cont)
+{
+	// if t is the only task running on S's thread we can just block, bypassing worker threads
+	if (t->s->nlive == 1 && t->ntimers == 0) {
+		trace_sched(T_ID_F " asyncwork op=%u immediate", t_id(t), req->op);
+		i64 result = asyncwork_do(req);
+		if (cont) {
+			t->info.wait_async.result = result;
+			return cont(t_L(t), T_RUNNING, cont_arg);
+		} else {
+			lua_pushinteger(t_L(t), result);
+			return 1;
+		}
+	}
+
+	// setup submission queue and/or spawn a worker thread, if needed
+	int err = s_asyncwork_prepare(t->s);
+	if (err)
+		return err;
+
+	// enqueue work request
+	req->flags |= (u16)(cont != NULL) * AsyncWorkFlag_HAS_CONT;
+	bool ok = chan_write(t->s->asyncwork_sq, 0, req);
+	if UNLIKELY (!ok)
+		return -ENOMEM;
+	t_retain(t); // work's ref, released by s_asyncwork_process_completions
+	trace_sched(T_ID_F " asyncwork op=%u SQ append", t_id(t), req->op);
+
+	// suspend task
+	t->resume_nres = 0;
+	return t_suspend(t, T_WAIT_ASYNC, cont_arg, (TaskContinuation)cont);
+}
+
+
+static i64 asyncwork_do_nanosleep(const AsyncWorkReq* req) {
+	u64 nsec = req->arg;
+	struct timespec ts = {
+		.tv_sec = nsec / 1000000000,
+		.tv_nsec = nsec % 1000000000,
+	};
+	struct timespec ts_rem = {};
+	while (nanosleep(&ts, &ts) == -1) {
+		if (errno != EINTR)
+			return -errno;
+		if (ts_rem.tv_sec == 0 && ts_rem.tv_nsec < 100)
+			break;
+		dlog("nanosleep interrupted; continuing");
+	}
+	return 0;
+}
+
+static int l_syscall_nanosleep(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	u64 nsec = luaL_checkinteger(L, 1);
+	AsyncWorkReq req = {
+		.op = AsyncWorkOp_NANOSLEEP,
+		.tid = t->tid,
+		.arg = nsec,
+	};
+	return t_asyncwork_req(t, &req, NULL, NULL);
+}
+
+
+typedef struct AddrInfoReq {
+	u16                       port;
+	const char*               hostname;
+	struct addrinfo           hints;
+	struct addrinfo* nullable res;
+} AddrInfoReq;
+
+
+static i64 asyncwork_do_addrinfo(const AsyncWorkReq* req) {
+	AddrInfoReq* aireq = (AddrInfoReq*)(uintptr)req->arg;
+
+	char service[8];
+	sprintf(service, "%u", aireq->port);
+	trace_sched("getaddrinfo BEGIN hostname=\"%s\" port=%s", aireq->hostname, service);
+
+	return getaddrinfo(aireq->hostname, service, &aireq->hints, &aireq->res);
+}
+
+static void l_syscall_addrinfo_cont_mkres(lua_State* L, AddrInfoReq* aireq) {
+	int index = 1;
+	char addr_str[INET6_ADDRSTRLEN];
+
+	#define KV_I(k, v) ( lua_pushstring(L, k), lua_pushinteger(L, v), lua_settable(L, -3) )
+	#define KV_S(k, v) ( lua_pushstring(L, k), lua_pushstring(L, v), lua_settable(L, -3) )
+
+	lua_createtable(L, 0, 0);
+
+	for (struct addrinfo *rp = aireq->res; rp != NULL; rp = rp->ai_next) {
+		lua_createtable(L, 0, 5); // Table with 5 fields
+		KV_I("family", rp->ai_family);
+		KV_I("socktype", rp->ai_socktype);
+		KV_I("protocol", rp->ai_protocol);
+		if (rp->ai_family == AF_INET) {
+			struct sockaddr_in *ipv4 = (struct sockaddr_in *)rp->ai_addr;
+			KV_I("port", ntohs(ipv4->sin_port));
+			if (inet_ntop(AF_INET, &(ipv4->sin_addr), addr_str, INET_ADDRSTRLEN) != NULL)
+				KV_S("addr", addr_str);
+		} else if (rp->ai_family == AF_INET6) {
+			struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)rp->ai_addr;
+			KV_I("port", ntohs(ipv6->sin6_port));
+			if (inet_ntop(AF_INET6, &(ipv6->sin6_addr), addr_str, INET6_ADDRSTRLEN) != NULL)
+				KV_S("addr", addr_str);
+		}
+
+		// Add the address entry table to the main array at the current index
+		lua_rawseti(L, -2, index++);
+	}
+
+	#undef KV_I
+	#undef KV_S
+}
+
+static int l_syscall_addrinfo_cont(lua_State* L, int ltstatus, void* nullable arg) {
+	T* t = L_t(L);
+	AddrInfoReq* aireq = arg;
+
+	int res = (int)t->info.wait_async.result;
+	trace_sched("getaddrinfo FINISH => %d (%s)", res, res == 0 ? "" : gai_strerror(res));
+	int nret = 1;
+	if (res != 0) {
+		lua_pushnil(L);
+		lua_pushstring(L, gai_strerror(res));
+		nret++;
+	} else {
+		l_syscall_addrinfo_cont_mkres(L, aireq);
+		// family, socktype, protocol, port, addr
+	}
+
+	if (aireq->res)
+		freeaddrinfo(aireq->res);
+	free(aireq);
+
+	return nret;
+}
+
+// syscall_addrinfo(hostname str, port=0, protocol=0, family=0, socktype=0, flags=0 uint)
+// -> (addresses [{family=int, socktype=int, protocol=int, port=uint, addr=str}])
+// -> (addresses nil, errmsg str)
+static int l_syscall_addrinfo(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+
+	const char* hostname = luaL_checkstring(L, 1);
+	if (!hostname)
+		return 0;
+
+	int ai_protocol = 0; // IPPROTO_ (e.g. IPPROTO_TCP, IPPROTO_UDP, etc)
+	int ai_family = AF_UNSPEC; // IPv4 or IPv6
+	int ai_socktype = 0; // SOCK_STREAM, SOCK_DGRAM, or 0 for any
+	int ai_flags = AI_NUMERICSERV;
+	u16 port = 0;
+	int isnum, v;
+	u64 v64;
+
+	if (( v64 = lua_tointegerx(L, 2, &isnum), isnum )) {
+		if (v64 > U16_MAX)
+			return luaL_error(L, "port number too large: %d", v64);
+		port = (u16)v64;
+	}
+	if ((v = lua_tointegerx(L, 3, &isnum)), isnum) ai_protocol = v;
+	if ((v = lua_tointegerx(L, 4, &isnum)), isnum) ai_family = (v == 0) ? AF_UNSPEC : v;
+	if ((v = lua_tointegerx(L, 5, &isnum)), isnum) ai_socktype = v;
+	if ((v = lua_tointegerx(L, 6, &isnum)), isnum) ai_flags |= v;
+
+	AddrInfoReq* aireq = calloc(1, sizeof(AddrInfoReq));
+	if (!aireq)
+		return l_errno_error(L, ENOMEM);
+	aireq->port = (u16)port;
+	aireq->hostname = hostname;
+	aireq->hints.ai_family = ai_family;
+	aireq->hints.ai_socktype = ai_socktype; // Datagram socket
+	aireq->hints.ai_flags = ai_flags;
+	aireq->hints.ai_protocol = ai_protocol;
+
+	AsyncWorkReq req = {
+		.op = AsyncWorkOp_ADDRINFO,
+		.tid = t->tid,
+		.arg = (uintptr)aireq,
+	};
+	return t_asyncwork_req(t, &req, aireq, l_syscall_addrinfo_cont);
+}
+
+
+static i64 asyncwork_do(const AsyncWorkReq* req) {
+	switch ((enum AsyncWorkOp)req->op) {
+	case AsyncWorkOp_NOP:       return 0; break;
+	case AsyncWorkOp_NANOSLEEP: return asyncwork_do_nanosleep(req);
+	case AsyncWorkOp_ADDRINFO:  return asyncwork_do_addrinfo(req);
+	}
+	assertf(0, "op=%u", req->op);
+	unreachable();
 }
 
 
@@ -2705,7 +2932,7 @@ static int l_connect_cont(lua_State* L, __attribute__((unused)) int ltstatus, IO
 	T* t = L_t(L);
 	trace_sched(T_ID_F, t_id(t));
 
-	dlog("d events=%s nread=%lld nwrite=%lld",
+	dlog("d events=%s nread=%ld nwrite=%ld",
 	     d->events == 'r'+'w' ? "rw" : d->events == 'r' ? "r" : d->events == 'w' ? "w" : "0",
 	     d->nread, d->nwrite);
 
@@ -3165,91 +3392,6 @@ static int l_taskblock_end(lua_State* L) {
 }
 
 
-
-
-static int s_asyncwork_sq_create(S* s) {
-	trace_sched("create asyncwork SQ & CQ");
-	u32 cap = 64;
-
-	Chan* sq = chan_open(cap, sizeof(AsyncWorkReq));
-	if (!sq)
-		return -ENOMEM;
-
-	Chan* cq = chan_open(cap, sizeof(AsyncWorkRes));
-	if (!cq) {
-		chan_close(sq);
-		return -ENOMEM;
-	}
-
-	s->asyncwork_sq = sq;
-	s->asyncwork_cq = cq;
-
-	return 0;
-}
-
-
-static int s_asyncwork_prepare(S* s) {
-	u32 nreqs = atomic_fetch_add_explicit(&s->asyncwork_nreqs, 1, memory_order_acq_rel);
-	trace_sched("[asyncwork] nreqs, nworkers = %u, %u", nreqs+1, s->asyncwork_nworkers);
-	if LIKELY(s->asyncwork_sq != NULL && nreqs < s->asyncwork_nworkers)
-		return 0;
-	if (s->asyncwork_sq == NULL) {
-		int err = s_asyncwork_sq_create(s);
-		if (err)
-			return err;
-	}
-	return s_asyncwork_spawn_worker(s);
-}
-
-
-static i64 l_xxx_blocking_syscall_work(AsyncWorkReq* req) {
-	dlog("l_xxx_blocking_syscall_work: sleep");
-	struct timespec ts = { .tv_nsec = 100*1000*1000 };
-    nanosleep(&ts, NULL);
-	// sleep(1);
-	dlog("l_xxx_blocking_syscall_work: sleep done");
-	return 123;
-}
-
-
-static int l_xxx_blocking_syscall(lua_State* L) {
-	T* t = REQUIRE_TASK(L);
-	trace_sched(T_ID_F " l_xxx_blocking_syscall", t_id(t));
-
-	if (0) { // XXX disabled for development of thread workers
-	// if t is the only task running on S's thread we can just block,
-	// bypassing worker threads
-	if (t->s->nlive == 1 && t->ntimers == 0) {
-		dlog("TODO: syscall simple path");
-		lua_pushinteger(L, l_xxx_blocking_syscall_work(&(AsyncWorkReq){}));
-		return 1;
-	}
-	}
-
-	// setup submission queue and/or spawn a worker thread, if needed
-	int err = s_asyncwork_prepare(t->s);
-	if (err)
-		return l_errno_error(L, -err);
-
-	// enqueue work request
-	ChanTx tx = chan_write_begin(t->s->asyncwork_sq, 0);
-	assert(tx.entry != NULL);
-	AsyncWorkReq* req = tx.entry;
-	req->f = l_xxx_blocking_syscall_work;
-	req->t = t;
-	t_retain(t); // work's ref, released by s_asyncwork_complete
-	chan_write_commit(t->s->asyncwork_sq, tx);
-	trace_sched(T_ID_F " TSQ write_commit", t_id(t));
-
-	// to check if a worker is closed:
-	// atomic_load_explicit(&w->status, memory_order_acquire) == Worker_CLOSED;
-
-	// suspend task
-	t->resume_nres = 0;
-	return t_suspend(t, T_WAIT_ASYNC, NULL, NULL);
-}
-
-
 static int l_monotime(lua_State* L) {
 	lua_pushinteger(L, DTimeNow());
 	return 1;
@@ -3282,10 +3424,13 @@ static const luaL_Reg dew_lib[] = {
 	{"recv", l_recv},
 	{"send", l_send},
 
+	// potentially long-time blocking syscalls, performed in worker thread pool
+	{"syscall_nanosleep", l_syscall_nanosleep},
+	{"syscall_addrinfo", l_syscall_addrinfo},
+
 	// WIP
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
-	{"xxx_blocking_syscall", l_xxx_blocking_syscall},
 
 	// wasm experiment
 	#ifdef __wasm__
@@ -3332,17 +3477,24 @@ int luaopen_runtime(lua_State* L) {
 	#define _(NAME) \
 		lua_pushinteger(L, NAME); \
 		lua_setfield(L, -2, #NAME);
-	// protocol families
-	_(PF_LOCAL)  // Host-internal protocols, formerly called PF_UNIX
-	_(PF_INET)   // Internet version 4 protocols
-	_(PF_INET6)  // Internet version 6 protocols
-	_(PF_ROUTE)  // Internal Routing protocol
-	_(PF_VSOCK)  // VM Sockets protocols
+	// address families
+	_(AF_LOCAL)  // Host-internal protocols, formerly called PF_UNIX
+	_(AF_INET)   // Internet version 4 protocols
+	_(AF_INET6)  // Internet version 6 protocols
+	_(AF_ROUTE)  // Internal Routing protocol
+	_(AF_VSOCK)  // VM Sockets protocols
+	// protocols
+	_(IPPROTO_IP)
+	_(IPPROTO_ICMP)
+	_(IPPROTO_TCP)
+	_(IPPROTO_UDP)
+	_(IPPROTO_IPV6)
+	_(IPPROTO_ROUTING)
+	_(IPPROTO_RAW)
 	// socket types
 	_(SOCK_STREAM)
 	_(SOCK_DGRAM)
 	_(SOCK_RAW)
-	// address families
 	#undef _
 
 	// export ERR_ constants

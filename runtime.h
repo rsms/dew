@@ -144,6 +144,9 @@ struct T {
 		struct { // T_WAIT_WORKER
 			u32 next_tid; // link to other waiting task in 'waiters' list
 		} wait_worker;
+		struct { // T_WAIT_ASYNC
+			i64 result;
+		} wait_async;
 		struct { // T_DEAD
 			u8 how; // TDied_ constant
 			// note: must not overlay wait_task.wait_tid
@@ -159,16 +162,27 @@ enum { // S.notes
 	S_NOTE_ASYNCWORK = 1u<<1, // a worker completed AsyncWorkReq
 };
 
-typedef i64(*AsyncWorkF)(AsyncWorkReq* req);
+typedef u16 AsyncWorkOp;
+enum AsyncWorkOp {
+	AsyncWorkOp_NOP = 0,
+	AsyncWorkOp_NANOSLEEP = 1,
+	AsyncWorkOp_ADDRINFO = 2,
+};
+
+#define AsyncWorkFlag_HAS_CONT ((u16)1 << 0) // has continuation
 
 struct AsyncWorkReq {
-	AsyncWorkF f; // note: invalid after work completes
-	T*         t; // task waiting for this work
+	u16 op;    // operation to perform
+	u16 flags; //
+	u32 tid;   // task waiting for this work
+	u64 arg;   // input argument
 };
 
 typedef struct AsyncWorkRes {
-	i64 result;
-	T*  t; // task waiting for this work
+	u16 op;     // operation to perform
+	u16 flags;  //
+	u32 tid;    // task waiting for this work
+	i64 result; // output result
 } AsyncWorkRes;
 
 struct S {
