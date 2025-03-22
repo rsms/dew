@@ -334,6 +334,7 @@ void _vlogmsg(int level, const char* fmt, va_list args);
 _Noreturn void _panic(
 	const char* file, int line, const char* fun, const char* fmt, ...) ATTR_FORMAT(printf, 4, 5);
 #define panic(fmt, args...) _panic(__FILE__, __LINE__, __FUNCTION__, fmt, ##args)
+#define panic_oom() panic("failed to allocate memory")
 
 
 static inline WARN_UNUSED_RESULT bool __must_check_unlikely(bool unlikely) {

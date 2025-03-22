@@ -162,23 +162,14 @@ enum { // S.notes
 typedef i64(*AsyncWorkF)(AsyncWorkReq* req);
 
 struct AsyncWorkReq {
-	AsyncWorkF f;      // note: invalid after work completes
-	T*         t;      // task waiting for this work
+	AsyncWorkF f; // note: invalid after work completes
+	T*         t; // task waiting for this work
 };
 
 typedef struct AsyncWorkRes {
-	u32 tid;
-	u32 _unused;
 	i64 result;
+	T*  t; // task waiting for this work
 } AsyncWorkRes;
-
-typedef struct AsyncWorkCQ { // linked with corresponding TSQ
-	_Atomic(u32) w;
-	u32          r;
-	u32          cap;
-	u32          mask;
-	AsyncWorkRes entries[];
-} AsyncWorkCQ;
 
 struct S {
 	lua_State*    L;         // base Lua environment
@@ -201,10 +192,10 @@ struct S {
 	Worker* nullable workers; // list
 
 	// asyncwork threads
-	u32                   asyncwork_nworkers; // number of live workers (monotonic)
-	_Atomic(u32)          asyncwork_nreqs;    // number of pending work requests
-	Chan* nullable        asyncwork_sq;       // submission queue
-	AsyncWorkCQ* nullable asyncwork_cq;       // completion queue
+	u32            asyncwork_nworkers; // number of live workers (monotonic)
+	_Atomic(u32)   asyncwork_nreqs;    // number of pending work requests
+	Chan* nullable asyncwork_sq;       // submission queue
+	Chan* nullable asyncwork_cq;       // completion queue
 };
 
 enum WorkerStatus {

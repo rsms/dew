@@ -126,9 +126,12 @@ dev-web:
 	'$(MAKE) DEBUG=1 TARGET=web'
 
 test:
-	$(MAKE) TEST=1 EMBED_SRC=0 run_tests run_dew_selftest run_runtime_tests
+	$(MAKE) TEST=1 EMBED_SRC=0 \
+		run_tests \
+		run_dew_selftest \
+		run_runtime_tests
 
-runtime_tests:
+test-runtime:
 	$(MAKE) TEST=1 EMBED_SRC=0 run_runtime_tests
 
 run_dew_selftest: $(BUILDDIR)/dew
@@ -290,4 +293,4 @@ _deps/download/llvm-%:
 
 MAKEFLAGS += --no-print-directory
 .PHONY: all clean dev _dev dev-web
-.PHONY: test run_tests run_dew_selftest runtime_tests run_runtime_tests
+.PHONY: test run_tests run_dew_selftest test-runtime run_runtime_tests

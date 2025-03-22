@@ -1683,7 +1683,7 @@ static void worker_wake_waiters(Worker* w) {
 			ok = s_runq_put(s, waiting_t);
 		}
 		if UNLIKELY(!ok)
-			dlog("failed to allocate memory");
+			panic_oom();
 
 		tid = waiting_t->info.wait_worker.next_tid;
 	}
@@ -2008,7 +2008,8 @@ static void s_reap_workers(S* s) {
 }
 
 
-static void s_asyncwork_complete(S* s) {
+/*static void s_asyncwork_complete_v1(S* s) {
+	atomic_thread_fence(memory_order_acquire);
 	u32 w = atomic_load_explicit(&s->asyncwork_cq->w, memory_order_acquire);
 	u32 r = s->asyncwork_cq->r;
 	for (; r < w; r++) {
@@ -2022,6 +2023,33 @@ static void s_asyncwork_complete(S* s) {
 		t_release(t);
 	}
 	s->asyncwork_cq->r = r;
+}*/
+
+
+static void s_asyncwork_process_completions(S* s) {
+	// There's a natural race condition with asyncwork completions where delivering
+	// S_NOTE_ASYNCWORK to wake up a runloop races with delivery of AsyncWorkRes on the
+	// completion queue.
+	//
+	// N completions may lead <=N S_NOTE_ASYNCWORK deliveries because notes are delivered not in
+	// a queue but as a signal to wake up S's runloop. I.e. many logical notes may result in just
+	// one runloop wakeup; one call to s_check_notes.
+	//
+	// Because of this, we sometimes process many completions in this loop and sometimes no
+	// completions at all (when we processed them in a previous loop.) Since NOTEs are always
+	// causally delivered after writing to the CQ, completions can never "appear" _after_ a
+	// NOTE, only _before_ a NOTE (i.e. when we process more than one completion in one note.)
+	AsyncWorkRes res;
+	for (;;) {
+		if (!chan_read(s->asyncwork_cq, CHAN_TRY, &res))
+			break;
+		trace_sched("wake " T_ID_F " waiting on asyncwork", t_id(res.t));
+		lua_pushinteger(t_L(res.t), res.result);
+		res.t->resume_nres = 1;
+		if UNLIKELY(!s_runq_put(s, res.t))
+			panic_oom();
+		t_release(res.t);
+	}
 }
 
 
@@ -2030,7 +2058,7 @@ static void s_check_notes(S* s, u8 notes) {
 		s_reap_workers(s);
 
 	if (notes & S_NOTE_ASYNCWORK)
-		s_asyncwork_complete(s);
+		s_asyncwork_process_completions(s);
 
 	// Clear notes bits.
 	// We are racing with worker threads here, so use a CAS but don't loop to retry since
@@ -2079,15 +2107,13 @@ static int s_finalize(S* s) {
 	if UNLIKELY(s->workers) {
 		trace_worker("shutting down workers");
 
+		// shutdown asyncwork channels as worker may be blocked on sq
+		if (s->asyncwork_sq != NULL)
+			chan_shutdown(s->asyncwork_sq);
+
 		// close all workers
-		for (Worker* w = s->workers; w; w = w->next) {
-			if (w->wkind == WorkerKind_ASYNC) {
-				// signal shutdown in case worker is blocked on sq
-				assert(s->asyncwork_sq != NULL);
-				chan_shutdown(s->asyncwork_sq);
-			}
+		for (Worker* w = s->workers; w; w = w->next)
 			worker_close(w);
-		}
 
 		for (Worker* w = s->workers; w;) {
 			int err = pthread_join(w->thread, NULL);
@@ -2104,8 +2130,11 @@ static int s_finalize(S* s) {
 			exit(s->exiterr);
 		}
 
-		if (s->asyncwork_sq)
+		if (s->asyncwork_sq) {
 			chan_close(s->asyncwork_sq);
+			assert(s->asyncwork_cq != NULL);
+			chan_close(s->asyncwork_cq);
+		}
 	}
 
 	trace_sched("finalized " S_ID_F, s_id(s));
@@ -2350,14 +2379,17 @@ static void s_notify(S* s, u8 addl_notes) {
 
 
 static void asyncworker_complete(AWorker* aw, i64 result) {
+	dlog("—— CQ PUSH %lld", result);
 	S* s = aw->w.s;
-	u32 w = atomic_fetch_add_explicit(&s->asyncwork_cq->w, 1, memory_order_acq_rel);
-	atomic_fetch_sub_explicit(&s->asyncwork_nreqs, 1, memory_order_acq_rel);
 
-	AsyncWorkRes* res = &s->asyncwork_cq->entries[w & s->asyncwork_cq->mask];
-	res->tid = aw->req.t->tid;
+	ChanTx tx = chan_write_begin(s->asyncwork_cq, 0);
+	assertf(tx.entry != NULL, "chan_write(cq) failed");
+	AsyncWorkRes* res = tx.entry;
 	res->result = result;
+	res->t = aw->req.t;
+	chan_write_commit(s->asyncwork_cq, tx);
 
+	trace_sched(T_ID_F " TCQ write_commit", t_id(res->t));
 	aw->req_is_active = 0;
 }
 
@@ -2444,7 +2476,7 @@ static void asyncworker_main(AWorker* aw) {
 		// pick up a work request
 		// Note: This can't be interrupted by pthread_cancel; work_is_active checks are safe
 		trace_worker("TSQ read...");
-		if UNLIKELY(!chan_read(aw->w.s->asyncwork_sq, &aw->req)) {
+		if UNLIKELY(!chan_read(aw->w.s->asyncwork_sq, 0, &aw->req)) {
 			// asyncwork_sq closed
 			break;
 		}
@@ -3136,28 +3168,23 @@ static int l_taskblock_end(lua_State* L) {
 
 
 static int s_asyncwork_sq_create(S* s) {
-	trace_sched("create asyncwork_sq");
-	u32 cap = 256;
+	trace_sched("create asyncwork SQ & CQ");
+	u32 cap = 64;
 
 	Chan* sq = chan_open(cap, sizeof(AsyncWorkReq));
 	if (!sq)
 		return -ENOMEM;
 
-	cap = MAX(cap, chan_cap(sq));
-	AsyncWorkCQ* cq = malloc(sizeof(AsyncWorkCQ) + sizeof(AsyncWorkRes)*cap);
+	Chan* cq = chan_open(cap, sizeof(AsyncWorkRes));
 	if (!cq) {
 		chan_close(sq);
 		return -ENOMEM;
 	}
-	cq->r = 0;
-	cq->cap = cap;
-	cq->mask = chan_cap(sq);
-	atomic_store_explicit(&cq->w, 0, memory_order_relaxed);
 
 	s->asyncwork_sq = sq;
 	s->asyncwork_cq = cq;
 
-	return s_asyncwork_spawn_worker(s);
+	return 0;
 }
 
 
@@ -3166,8 +3193,11 @@ static int s_asyncwork_prepare(S* s) {
 	trace_sched("[asyncwork] nreqs, nworkers = %u, %u", nreqs+1, s->asyncwork_nworkers);
 	if LIKELY(s->asyncwork_sq != NULL && nreqs < s->asyncwork_nworkers)
 		return 0;
-	if (s->asyncwork_sq == NULL)
-		return s_asyncwork_sq_create(s);
+	if (s->asyncwork_sq == NULL) {
+		int err = s_asyncwork_sq_create(s);
+		if (err)
+			return err;
+	}
 	return s_asyncwork_spawn_worker(s);
 }
 
@@ -3202,7 +3232,7 @@ static int l_xxx_blocking_syscall(lua_State* L) {
 		return l_errno_error(L, -err);
 
 	// enqueue work request
-	ChanTx tx = chan_write_begin(t->s->asyncwork_sq);
+	ChanTx tx = chan_write_begin(t->s->asyncwork_sq, 0);
 	assert(tx.entry != NULL);
 	AsyncWorkReq* req = tx.entry;
 	req->f = l_xxx_blocking_syscall_work;
