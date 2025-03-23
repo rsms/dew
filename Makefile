@@ -1,7 +1,7 @@
 NATIVE_SYS   := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))
 NATIVE_ARCH  := $(subst aarch64,arm64,$(shell uname -m))
 TARGET       := $(NATIVE_SYS)
-BUILDDIR     ?= o.$(TARGET)$(if $(filter $(DEBUG),1),.debug,)$(if $(filter $(TEST),1),.test,)
+BUILDDIR     ?= o.$(TARGET)$(if $(filter $(DEBUG),1),.debug,)$(if $(filter $(TEST),1),.test,)$(if $(filter $(BENCHMARK),1),.bench,)
 Q             = $(if $(filter 1,$(V)),,@)
 QLOG          = $(if $(filter 1,$(V)),@#,@echo)
 EMBED_SRC    := 1
@@ -129,10 +129,15 @@ test:
 	$(MAKE) TEST=1 EMBED_SRC=0 \
 		run_tests \
 		run_dew_selftest \
-		run_runtime_tests
+		run-test-runtime
 
 test-runtime:
-	$(MAKE) TEST=1 EMBED_SRC=0 run_runtime_tests
+	$(MAKE) TEST=1 EMBED_SRC=0 run-test-runtime
+
+benchmark: benchmark-runtime
+
+benchmark-runtime:
+	$(MAKE) BENCHMARK=1 EMBED_SRC=0 run-benchmark-runtime
 
 run_dew_selftest: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew --selftest$(if $(filter 1,$(V)),=v,)
@@ -140,8 +145,8 @@ run_dew_selftest: $(BUILDDIR)/dew
 run_tests: $(TEST_PROGS)
 	$(Q)$(foreach f,$^,echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(f).log)"; $(f) $(if $(filter 1,$(V)),,>$(f).log 2>&1 || { echo "$(f): FAILED"; cat $(f).log; exit 1; }) && ) true
 
-run_runtime_tests: RUNTIME_TESTS := $(filter-out %benchmark.lua,$(wildcard tests/rt/*.lua))
-run_runtime_tests: $(BUILDDIR)/dew $(RUNTIME_TESTS)
+run-test-runtime: RUNTIME_TESTS := $(filter-out %benchmark.lua,$(wildcard tests/rt/*.lua))
+run-test-runtime: $(BUILDDIR)/dew $(RUNTIME_TESTS)
 	$(Q)_FC=0; $(foreach f,$(RUNTIME_TESTS),\
 	      $(if $(filter 1,$(V)),echo "RUN   $(f)";,) \
 	      if ! DEW_RUNTIME_TEST=1 DEW_MAIN_SCRIPT=$(f) $< \
@@ -155,9 +160,11 @@ run_runtime_tests: $(BUILDDIR)/dew $(RUNTIME_TESTS)
 	    if [ $$_FC -eq 0 ]; then echo "all tests PASS"; \
 	    else echo "$$_FC test(s) FAILED">&2; exit 1; fi
 
-run_runtime_tests_v1: $(BUILDDIR)/dew
-	$(Q)$(foreach f,$(RUNTIME_TESTS),echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(BUILDDIR)/$(notdir $(f)).log)"; DEW_RUNTIME_TEST=1 DEW_MAIN_SCRIPT=$(f) $<$(if $(filter 1,$(V)),,>$(BUILDDIR)/$(notdir $(f)).log 2>&1 || { echo "$(f): FAILED"; cat $(BUILDDIR)/$(notdir $(f)).log; exit 1; }) && ) true
-
+run-benchmark-runtime: RUNTIME_TESTS := $(wildcard tests/rt/*benchmark.lua)
+run-benchmark-runtime: $(BUILDDIR)/dew $(RUNTIME_TESTS)
+	$(foreach f,$(RUNTIME_TESTS),\
+	    DEW_RUNTIME_TEST=1 DEW_MAIN_SCRIPT=$(f) $< && \
+	) true
 
 $(BUILDDIR)/chan_test.opt: CFLAGS += -O2 -DNDEBUG -fno-sanitize=address,undefined
 $(BUILDDIR)/chan_test $(BUILDDIR)/chan_test.opt: chan_test.c tsem.c panic.c logmsg.c
@@ -307,4 +314,5 @@ _deps/download/llvm-%:
 
 MAKEFLAGS += --no-print-directory
 .PHONY: all clean dev _dev dev-web
-.PHONY: test run_tests run_dew_selftest test-runtime run_runtime_tests
+.PHONY: test run_tests run_dew_selftest test-runtime run-test-runtime
+.PHONY: benchmark benchmark-runtime run-benchmark-runtime
