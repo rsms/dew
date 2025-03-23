@@ -1,43 +1,112 @@
-NATIVE_SYS   := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))
-NATIVE_ARCH  := $(subst aarch64,arm64,$(shell uname -m))
-TARGET       := $(NATIVE_SYS)
-BUILDDIR     ?= o.$(TARGET)$(if $(filter $(DEBUG),1),.debug,)$(if $(filter $(TEST),1),.test,)$(if $(filter $(BENCHMARK),1),.bench,)
-Q             = $(if $(filter 1,$(V)),,@)
-QLOG          = $(if $(filter 1,$(V)),@#,@echo)
-EMBED_SRC    := 1
-OBJDIR       := $(BUILDDIR)/obj
-DEW_SRCS     := dew.c panic.c logmsg.c array.c fifo.c tsem.c chan.c pool.c time.c \
-                runtime.c lib_bignum.c bn.c
-TEST_PROGS   := $(BUILDDIR)/chan_test $(BUILDDIR)/chan_test.opt
-LUA_SRCS     := lapi.c lcode.c lctype.c ldebug.c ldo.c ldump.c lfunc.c lgc.c llex.c lmem.c \
-                lobject.c lopcodes.c lparser.c lstate.c lstring.c ltable.c ltm.c lundump.c lvm.c \
-                lzio.c lauxlib.c lbaselib.c lcorolib.c ldblib.c liolib.c lmathlib.c loadlib.c \
-                loslib.c lstrlib.c ltablib.c lutf8lib.c linit.c
-LUA_SRCS     := $(sort $(addprefix lua/src/,$(LUA_SRCS)))
-DEW_JSSRCS   := $(wildcard web/*.ts web/index.html)
-CFLAGS       := -std=c17 -g -fdebug-compilation-dir=/x/ \
-                -Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
-                -Werror=incompatible-pointer-types \
-                -Werror=pointer-integer-compare \
-                -Werror=int-conversion \
-                -Ilua/src
-DEW_CFLAGS   := -D__dew__=1 $(if $(filter $(EMBED_SRC),1),-DDEW_EMBED_SRC=1 -I$(BUILDDIR),)
-LDFLAGS      :=
-LUA_CFLAGS   :=
-LUA          := o.$(NATIVE_SYS)/lua
-LUAC         := o.$(NATIVE_SYS)/luac
-ALL          := $(BUILDDIR)/dew
-ORIGPATH     := ${PATH}
+ifx  = $(if $(filter $($(1)),1),$(2),$(3))
+ifs  = $(if $(filter $($(1)),$(2)),$(3),$(4))
+Q    = $(if $(filter 1,$(V)),,@)
+QLOG = $(if $(filter 1,$(V)),@#,@echo)
+
+NATIVE_SYS  := $(subst Linux,linux,$(subst Darwin,darwin,$(shell uname -s)))
+NATIVE_ARCH := $(subst aarch64,arm64,$(shell uname -m))
+TARGET      := $(NATIVE_SYS)
+
+BUILDDIR := o/$(TARGET)$(call ifx,DEBUG,.debug)$(call ifx,TEST,.test)$(call ifx,BENCHMARK,.bench)
+OBJDIR   := $(BUILDDIR)/obj
+
+DEW_SRCS := \
+	src/dew.c \
+	src/panic.c \
+	src/logmsg.c \
+	$(call ifx,DEBUG,  src/dlog_lua_stack.c) \
+	src/runtime/runtime.c \
+	src/runtime/lutil.c \
+	src/runtime/array.c \
+	src/runtime/buf.c \
+	src/runtime/fifo.c \
+	src/runtime/pool.c \
+	src/runtime/time.c \
+	src/runtime/timer.c \
+	src/runtime/intconv.c \
+	src/runtime/intscan.c \
+	src/runtime/intfmt.c \
+	src/runtime/inbox.c \
+	src/runtime/chan.c \
+	$(call ifs,TARGET,web,, src/runtime/tsem.c) \
+	src/runtime/iopoll.c \
+	$(call ifs,TARGET,darwin, src/runtime/iopoll_darwin.c) \
+	$(call ifs,TARGET,linux,  src/runtime/iopoll_linux.c) \
+	$(call ifs,TARGET,web,    src/runtime/iopoll_wasm.c  src/runtime/wasm.c) \
+
+# order matters; "included" through embedding in the order listed here
+DEW_LSRCS := \
+	src/util.lua \
+	src/unit.lua \
+	src/diag.lua \
+	src/srcpos.lua \
+	src/tokenize.lua \
+	src/id.lua \
+	src/ast.lua \
+	src/parse.lua \
+	src/resolve.lua \
+	src/codegen.lua
+
+DEW_JSSRCS := $(wildcard web/*.ts web/index.html)
+
+LUA_SRCS := \
+	src/lua/lapi.c \
+	src/lua/lauxlib.c \
+	src/lua/lbaselib.c \
+	src/lua/lcode.c \
+	src/lua/lcorolib.c \
+	src/lua/lctype.c \
+	src/lua/ldblib.c \
+	src/lua/ldebug.c \
+	src/lua/ldo.c \
+	src/lua/ldump.c \
+	src/lua/lfunc.c \
+	src/lua/lgc.c \
+	src/lua/linit.c \
+	src/lua/liolib.c \
+	src/lua/llex.c \
+	src/lua/lmathlib.c \
+	src/lua/lmem.c \
+	src/lua/loadlib.c \
+	src/lua/lobject.c \
+	src/lua/lopcodes.c \
+	src/lua/loslib.c \
+	src/lua/lparser.c \
+	src/lua/lstate.c \
+	src/lua/lstring.c \
+	src/lua/lstrlib.c \
+	src/lua/ltable.c \
+	src/lua/ltablib.c \
+	src/lua/ltm.c \
+	src/lua/lundump.c \
+	src/lua/lutf8lib.c \
+	src/lua/lvm.c \
+	src/lua/lzio.c \
+
+CFLAGS := \
+	-std=c17 -g -fdebug-compilation-dir=/x/ \
+	-Wall -Wextra -Werror=format -Wno-unused -Wno-unused-parameter \
+	-Werror=incompatible-pointer-types \
+	-Werror=pointer-integer-compare \
+	-Werror=int-conversion \
+	-Isrc/lua \
+
+EMBED_SRC   := 1
+DEW_CFLAGS  := -D__dew__=1 $(call ifx,EMBED_SRC,-DDEW_EMBED_SRC=1 -I$(BUILDDIR))
+TEST_CFLAGS := -D__dew__=1
+LDFLAGS     :=
+LUA_CFLAGS  :=
+LUA         := o/$(NATIVE_SYS)/lua
+LUAC        := o/$(NATIVE_SYS)/luac
+ALL         := $(BUILDDIR)/dew
+ORIGPATH    := ${PATH}
 
 ifeq ($(TARGET),darwin)
-	DEW_SRCS += iopoll_darwin.c
 	LUA_CFLAGS += -DLUA_USE_MACOSX
 else ifeq ($(TARGET),linux)
-	DEW_SRCS += iopoll_linux.c
 	LUA_CFLAGS += -DLUA_USE_LINUX
 	LDFLAGS += -Wl,-E -ldl
 else ifeq ($(TARGET),web)
-	DEW_SRCS += wasm.c iopoll_wasm.c
 	ALL := $(BUILDDIR)/dew.wasm $(BUILDDIR)/dew.js $(BUILDDIR)/index.html
 	CFLAGS += --target=wasm32-playbit -D_WASI_EMULATED_SIGNAL -D_WASI_EMULATED_PROCESS_CLOCKS
 	CFLAGS += -fvisibility=hidden
@@ -86,7 +155,6 @@ else
 endif
 
 ifeq ($(DEBUG),1)
-	DEW_SRCS += dlog_lua_stack.c
 	DEW_CFLAGS += -DDEBUG=1
 	ifneq ($(TARGET),web)
 		CFLAGS += -fsanitize=address,undefined
@@ -116,13 +184,13 @@ clean:
 	rm -rf o.*
 
 dev:
-	autorun *.c *.h *.lua tests/rt/*.* lua/src/*.c examples/*.dew \
+	autorun *.c *.h *.lua tests/rt/*.* src/lua/*.c examples/*.dew \
 	-- '$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
 _dev: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew examples/dev.dew --debug-tokens --debug-parse --debug-resolve --debug-codegen
 
 dev-web:
-	autorun *.c *.h *.lua lua/src/*.c examples/*.dew web/*.* -- \
+	autorun *.c *.h *.lua src/lua/*.c examples/*.dew web/*.* -- \
 	'$(MAKE) DEBUG=1 TARGET=web'
 
 test:
@@ -141,6 +209,10 @@ benchmark-runtime:
 
 run_dew_selftest: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew --selftest$(if $(filter 1,$(V)),=v,)
+
+TEST_PROGS := \
+	$(BUILDDIR)/src/runtime/chan_test \
+	$(BUILDDIR)/src/runtime/chan_test.opt
 
 run_tests: $(TEST_PROGS)
 	$(Q)$(foreach f,$^,echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(f).log)"; $(f) $(if $(filter 1,$(V)),,>$(f).log 2>&1 || { echo "$(f): FAILED"; cat $(f).log; exit 1; }) && ) true
@@ -166,29 +238,23 @@ run-benchmark-runtime: $(BUILDDIR)/dew $(RUNTIME_TESTS)
 	    DEW_RUNTIME_TEST=1 DEW_MAIN_SCRIPT=$(f) $< && \
 	) true
 
-$(BUILDDIR)/chan_test.opt: CFLAGS += -O2 -DNDEBUG -fno-sanitize=address,undefined
-$(BUILDDIR)/chan_test $(BUILDDIR)/chan_test.opt: chan_test.c tsem.c panic.c logmsg.c
+$(BUILDDIR)/src/runtime/chan_test.opt: CFLAGS += -O2 -DNDEBUG -fno-sanitize=address,undefined
+$(BUILDDIR)/src/runtime/chan_test $(BUILDDIR)/src/runtime/chan_test.opt: \
+		src/runtime/chan_test.c \
+		src/runtime/tsem.c \
+		src/runtime/time.c \
+		src/panic.c \
+		src/logmsg.c
 	$(QLOG) "CC+LD $@"
 	$(Q)mkdir -p $(@D)
-	$(Q)$(CC) $(CFLAGS) $(LDFLAGS) $^ -o $@
+	$(Q)$(CC) $(CFLAGS) $(TEST_CFLAGS) $(LDFLAGS) $^ -o $@
 
 $(BUILDDIR)/dew: $(DEW_OBJS) $(LUADEW_OBJS)
 	$(QLOG) "LINK  $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)$(CC) -o $@ $^ $(LDFLAGS)
 
-DEW_LSRCS := \
-	util.lua \
-	unit.lua \
-	diag.lua \
-	srcpos.lua \
-	tokenize.lua \
-	id.lua \
-	ast.lua \
-	parse.lua \
-	resolve.lua \
-	codegen.lua
-$(BUILDDIR)/dew.lua: $(DEW_LSRCS) dew.lua
+$(BUILDDIR)/dew.lua: $(DEW_LSRCS) src/dew.lua
 	$(QLOG) "GEN   $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)rm -f $@
@@ -215,19 +281,19 @@ $(BUILDDIR)/dew.wasm: $(BUILDDIR)/dew.1.wasm
 	$(QLOG) "WOPT  $@"
 	$(Q)wasm-opt $(WOPTFLAGS) $< -o $@
 
-$(BUILDDIR)/dew.js: web/dew.ts $(ESBUILD) $(DEW_JSSRCS)
+$(BUILDDIR)/dew.js: src/web/dew.ts $(ESBUILD) $(DEW_JSSRCS)
 	$(QLOG) "ESBLD $@"
 	$(Q)$(ESBUILD) --bundle $(JSFLAGS) --outfile=$@ $<
 
-$(BUILDDIR)/index.html: web/index.html
+$(BUILDDIR)/index.html: src/web/index.html
 	$(QLOG) "COPY  $@"
 	$(Q)mkdir -p $(@D)
 	$(Q)cp $< $@
 
 # tools that run on build host (NATIVE)
 ifeq ($(NATIVE_SYS),$(TARGET))
-$(LUA):  lua/src/lua.c
-$(LUAC): lua/src/luac.c
+$(LUA):  src/lua/lua.c
+$(LUAC): src/lua/luac.c
 $(LUA) $(LUAC): $(LUAEXE_OBJS)
 	$(QLOG) "LINK  $@"
 	$(Q)mkdir -p $(@D)
@@ -238,7 +304,7 @@ $(LUA) $(LUAC):
 endif
 
 ifeq ($(EMBED_SRC),1)
-$(OBJDIR)/dew.c.o: $(BUILDDIR)/dew.lua.h
+$(OBJDIR)/src/dew.c.o: $(BUILDDIR)/dew.lua.h
 endif
 
 $(DEW_OBJS):    override CFLAGS := $(CFLAGS) $(DEW_CFLAGS)
@@ -248,7 +314,7 @@ $(LUAEXE_OBJS): override CFLAGS := $(CFLAGS) $(LUA_CFLAGS)
 ifeq ($(TARGET),web)
 $(OBJS): _deps/llvm/bin/clang
 # # use c++ exceptions instead of longjmp:
-# $(OBJDIR)/lua/src/ldo.c.o: lua/src/ldo.c
+# $(OBJDIR)/src/lua/ldo.c.o: src/lua/ldo.c
 # 	$(QLOG) "CXX   $<"
 # 	$(Q)$(CXX) -MP -MMD $(CFLAGS) $(CXXFLAGS) -std=c++17 -xc++ -c -o "$@" $<
 endif
@@ -272,9 +338,9 @@ $(DIRST):
 -include $(wildcard $(OBJS:.o=.d))
 
 # tooling for web
-web/node_modules/.bin/esbuild: web/package-lock.json
+web/node_modules/.bin/esbuild: src/web/package-lock.json
 	touch $@
-web/package-lock.json: web/package.json
+web/package-lock.json: src/web/package.json
 	cd web && npm install
 	touch $@
 
