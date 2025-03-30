@@ -376,6 +376,9 @@ static inline WARN_UNUSED_RESULT bool __must_check_unlikely(bool unlikely) {
 #ifdef DEBUG
 void dlog_lua_val(lua_State* L, int val_idx);
 void dlog_lua_stackf(lua_State* L, const char* fmt, ...);
+#else
+#define dlog_lua_val(...) ((void)0)
+#define dlog_lua_stackf(...) ((void)0)
 #endif
 
 
