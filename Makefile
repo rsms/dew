@@ -27,6 +27,8 @@ DEW_SRCS := \
 	src/runtime/intscan.c \
 	src/runtime/intfmt.c \
 	src/runtime/inbox.c \
+	src/runtime/structclone.c \
+	src/runtime/string_repr.c \
 	src/runtime/chan.c \
 	$(call ifs,TARGET,web,, src/runtime/tsem.c) \
 	src/runtime/iopoll.c \
@@ -184,10 +186,10 @@ clean:
 	rm -rf o.*
 
 dev:
-	autorun *.c *.h *.lua tests/rt/*.* src/lua/*.c examples/*.dew \
-	-- '$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
+	autorun src/*.* src/runtime/*.* tests/rt/*.* src/lua/*.* examples/*.dew -- \
+		'$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
 _dev: $(BUILDDIR)/dew
-	$(BUILDDIR)/dew examples/dev.dew --debug-tokens --debug-parse --debug-resolve --debug-codegen
+	$(BUILDDIR)/dew --debug-tokens --debug-parse --debug-resolve --debug-codegen
 
 dev-web:
 	autorun *.c *.h *.lua src/lua/*.c examples/*.dew web/*.* -- \

@@ -6,10 +6,8 @@
 #include "intconv.h"
 #include "intscan.h"
 #include "intfmt.h"
-
-#if DEW_ENABLE_WORKERS
-	#include "worker.h"
-#endif
+#include "structclone.h"
+#include "worker.h"
 
 #define _POSIX_C_SOURCE 200809L
 #define _DARWIN_C_SOURCE
@@ -58,7 +56,7 @@
 static_assert(sizeof(T) == LUA_EXTRASPACE, "");
 
 
-static u8 g_reftabkey;            // table where objects with compex lifetime are stored, to avoid GC
+static u8 g_reftabkey;            // table of objects with compex lifetime, to avoid GC
 static u8 g_timerobj_luatabkey;   // Timer object prototype
 static u8 g_uworkerobj_luatabkey; // Worker object prototype
 
@@ -371,25 +369,16 @@ static T* nullable l_timer_done(Timer* timer, void* arg) {
 	// dlog("*** l_timer_done %p ***", timer);
 	T* t = arg;
 	// deliver timer message to task's inbox
-	InboxMsg* msg = inbox_add(&t->inbox);
+	const u32 maxcap = 0xffff;
+	InboxMsg* msg = inbox_add(&t->inbox, maxcap);
 	if LIKELY(msg != NULL) {
 		memset(msg, 0, sizeof(*msg));
 		msg->type = InboxMsgType_TIMER;
-		return t; // wake t
+	} else {
+		// Inbox is full (very full!) Drop timer with a warning.
+		logwarn("T%u inbox is full; dropping timer message", t->tid);
 	}
-
-	// Inbox is full.
-	//
-	// In the case of a task calling send(), it should block until there's space in the
-	// receiver's inbox.
-	//
-	// But in the case of a timer delivering a message ... how do we handle this safely?
-	// We can't really block since that would block the entire scheduler...
-	// Maybe when the timer starts we can somehow pre-allocate an inbox message.
-	// For example, the Inbox could have a field 'npending' which is checked by
-	// inbox_add when considering if the inbox is full or not.
-	dlog("TODO: task inbox is full when timer rang");
-	return NULL;
+	return t; // wake t
 }
 
 
@@ -591,7 +580,12 @@ inline static T* s_task(S* s, u32 tid) {
 }
 
 
+static i32 s_runq_find(const S* s, const T* t);
+
+
 static bool s_runq_put(S* s, T* t) {
+	assertf(t->status != T_DEAD, T_ID_F, t_id(t));
+	assertf(s_runq_find(s, t) == -1, T_ID_F " already in runq", t_id(t));
 	t->status = T_READY;
 	const u32 runq_cap_limit = U32_MAX;
 	T** tp = (T**)fifo_push((FIFO**)&s->runq, sizeof(*s->runq->entries), runq_cap_limit);
@@ -605,8 +599,11 @@ static bool s_runq_put(S* s, T* t) {
 
 static bool s_runq_put_runnext(S* s, T* t) {
 	trace_runq("runq put runnext = " T_ID_F, t_id(t));
+	assertf(t->status != T_DEAD, T_ID_F, t_id(t));
+	assertf(s_runq_find(s, t) == -1, T_ID_F " already in runq", t_id(t));
 	if UNLIKELY(s->runnext) {
 		// kick out previous runnext to runq
+		assertf(s->runnext != t, T_ID_F " already runnext", t_id(t));
 		trace_runq("runq kick out runnext " T_ID_F " to runq", t_id(s->runnext));
 		if UNLIKELY(!s_runq_put(s, s->runnext))
 			return false;
@@ -879,6 +876,7 @@ void t_gc(lua_State* L, T* t) {
 
 static void t_release_to_gc(T* t) {
 	trace_sched(T_ID_F " release to GC", t_id(t));
+	assert(t->status == T_DEAD);
 	// remove GC ref to allow task (Lua thread) to be garbage collected
 	lua_State* TL = t_L(t);
 	lua_State* SL = t->s->L;
@@ -992,6 +990,16 @@ static UWorker* s_worker(S* s) {
 }
 
 
+UNUSED static const char* TDied_str(enum TDied died_how) {
+	switch (died_how) {
+	case TDied_ERR:   return "ERR";
+	case TDied_CLEAN: return "CLEAN";
+	case TDied_STOP:  return "STOP";
+	}
+	return "?";
+};
+
+
 static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 	S* s = t->s;
 
@@ -1001,7 +1009,7 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 
 	// Note: t_stop updates t->status before calling t_finalize. For that reason we can't trust
 	// the current value of t->status in here but must use prev_tstatus.
-	trace_sched(T_ID_F " exited (died_how=%d)", t_id(t), died_how);
+	trace_sched(T_ID_F " exited (died_how=%s)", t_id(t), TDied_str(died_how));
 	if UNLIKELY(died_how == TDied_ERR) {
 		// if this is the main task, set s->exiterr
 		if (t->tid == 1)
@@ -1018,6 +1026,9 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 				if (atomic_load_explicit(&w->w.waiters, memory_order_acquire)) {
 					free(w->errdesc); // just in case...
 					w->errdesc = t_report_error_buf(t);
+					#if DEBUG
+					t_report_error(t, "[DEBUG] Uncaught error in worker");
+					#endif
 				} else {
 					t_report_error(t, "Uncaught error in worker");
 				}
@@ -1279,7 +1290,68 @@ static void s_reap_workers(S* s) {
 }
 
 
-static void s_asyncwork_process_completions(S* s) {
+static void t_worker_msg_stow(T* t, InboxMsg* msg) {
+	lua_State* dst_L = t_L(t);
+
+	// Store message payload in a table.
+	// This way the message payload gets GC'd when the destination task is GC'd,
+	// regardless of message delivery.
+	lua_createtable(dst_L, msg->nres, 0);
+
+	// first value is the sender task (Lua "thread")
+	lua_pushnil(dst_L);         // TODO: push sender worker onto its own stack
+	lua_rawseti(dst_L, -2, 1);  // Store in table at index 1
+
+	for (int i = 2; i <= msg->nres; i++) {
+        lua_pushinteger(dst_L, 123); // TODO
+        lua_rawseti(dst_L, -2, i);   // Store in table at index (i-1)
+	}
+
+	msg->msg.ref = luaL_ref(dst_L, LUA_REGISTRYINDEX);
+}
+
+
+static void s_recv_worker_msg(S* s, AsyncWorkRes* res) {
+	// Deliver message from worker to this S's main task.
+	// Inbox is practically unbounded in this case. The only other option is to drop the message.
+	const u32 maxcap = U32_MAX;
+
+	T* t = (s->nlive > 0) ? s_task(s, 1) : NULL; // main task
+	if (!t || t->status == T_DEAD) {
+		logwarn("ignoring message from worker received during shutdown");
+		goto end;
+	}
+
+	InboxMsg* msg = inbox_add(&t->inbox, maxcap);
+	if UNLIKELY(msg == NULL) {
+		logwarn("T%u inbox is full; dropping message", t->tid);
+		goto end;
+	}
+
+	memset(msg, 0, sizeof(*msg));
+	msg->type = InboxMsgType_MSG;
+	if (t->status == T_WAIT_SEND)
+		trace_sched("wake " T_ID_F " waiting on send", t_id(t));
+
+	// TODO: see l_msg_stow, how it stores message values for the receiver
+
+	// if the destination task is not currently waiting in a call to recv(),
+	// the message will be delivered later.
+	if (t->status != T_WAIT_RECV) {
+		trace_sched("deliver buffered msg to " T_ID_F, t_id(t));
+		dlog("TODO: stow message");
+		t_worker_msg_stow(t, msg);
+	} else {
+		trace_sched("wake " T_ID_F " waiting on recv", t_id(t));
+		s_runq_put_runnext(s, t);
+	}
+
+end: {}
+	//dlog("TODO: dispose of structured-clone msg");
+}
+
+
+static void s_asyncwork_read_cq(S* s) {
 	// There's a natural race condition with asyncwork completions where delivering
 	// S_NOTE_ASYNCWORK to wake up a runloop races with delivery of AsyncWorkRes on the
 	// completion queue.
@@ -1296,6 +1368,12 @@ static void s_asyncwork_process_completions(S* s) {
 	for (;;) {
 		if (!chan_read(s->asyncwork_cq, CHAN_TRY, &res))
 			break;
+
+		if (res.op == AsyncWorkOp_WORKER_MSG) {
+			s_recv_worker_msg(s, &res);
+			continue;
+		}
+
 		T* t = s_task(s, res.tid);
 		trace_sched("wake " T_ID_F " waiting on asyncwork", t_id(t));
 		if (res.flags & AsyncWorkFlag_HAS_CONT) {
@@ -1316,7 +1394,7 @@ static void s_check_notes(S* s, u8 notes) {
 		s_reap_workers(s);
 
 	if (notes & S_NOTE_ASYNCWORK)
-		s_asyncwork_process_completions(s);
+		s_asyncwork_read_cq(s);
 
 	// Clear notes bits.
 	// We are racing with worker threads here, so use a CAS but don't loop to retry since
@@ -1368,6 +1446,8 @@ static int s_finalize(S* s) {
 		// shutdown asyncwork channels as worker may be blocked on sq
 		if (s->asyncwork_sq != NULL)
 			chan_shutdown(s->asyncwork_sq);
+		if (s->asyncwork_cq != NULL)
+			chan_shutdown(s->asyncwork_cq);
 
 		// close all workers
 		for (Worker* w = s->workers; w; w = w->next)
@@ -1388,11 +1468,10 @@ static int s_finalize(S* s) {
 			exit(s->exiterr);
 		}
 
-		if (s->asyncwork_sq) {
+		if (s->asyncwork_sq)
 			chan_close(s->asyncwork_sq);
-			assert(s->asyncwork_cq != NULL);
+		if (s->asyncwork_cq)
 			chan_close(s->asyncwork_cq);
-		}
 	}
 
 	trace_sched("finalized " S_ID_F, s_id(s));
@@ -1467,7 +1546,7 @@ static int s_find_runnable(S* s, T** tp) {
 	}
 
 	// check timers & runq again
-	TAIL_CALL s_find_runnable(s, tp);
+	return_tail s_find_runnable(s, tp);
 }
 
 
@@ -1559,8 +1638,10 @@ int luaopen_runtime(lua_State* L);
 
 static void worker_free(Worker* w) {
 	trace_worker("free");
-	if (w->wkind == WorkerKind_USER)
+	if (w->wkind == WorkerKind_USER) {
 		free(((UWorker*)w)->errdesc);
+		((UWorker*)w)->errdesc = NULL;
+	}
 	free(w);
 }
 
@@ -1612,7 +1693,7 @@ static bool worker_cas_status(Worker* w, u8 next_status) {
 	for (;;) {
 		if (status == Worker_CLOSED)
 			return false;
-		if (atomic_compare_exchange_strong_explicit(
+		if (atomic_compare_exchange_weak_explicit(
 				&w->status, &status, next_status, memory_order_acq_rel, memory_order_relaxed))
 		{
 			return true;
@@ -1626,7 +1707,7 @@ static void s_notify(S* s, u8 addl_notes) {
 	u8 notes = atomic_load_explicit(&s->notes, memory_order_acquire);
 	for (;;) {
 		u8 newnotes = notes | addl_notes;
-		if (atomic_compare_exchange_strong_explicit(
+		if (atomic_compare_exchange_weak_explicit(
 				&s->notes, &notes, newnotes, memory_order_acq_rel, memory_order_relaxed))
 		{
 			break;
@@ -1724,6 +1805,30 @@ static void uworker_main(UWorker* w) {
 }
 
 
+#define ASYNCWORK_SQ_CAP 64
+#define ASYNCWORK_CQ_CAP ASYNCWORK_SQ_CAP
+
+
+static int s_asyncwork_cq_setup(S* s) {
+	trace_sched("creating asyncwork CQ with cap=%d", ASYNCWORK_CQ_CAP);
+	Chan* cq = chan_open(ASYNCWORK_CQ_CAP, sizeof(AsyncWorkRes));
+	if (!cq)
+		return -ENOMEM;
+	s->asyncwork_cq = cq;
+	return 0;
+}
+
+
+static int s_asyncwork_sq_setup(S* s) {
+	trace_sched("creating asyncwork SQ with cap=%d", ASYNCWORK_SQ_CAP);
+	Chan* sq = chan_open(ASYNCWORK_SQ_CAP, sizeof(AsyncWorkReq));
+	if (!sq)
+		return -ENOMEM;
+	s->asyncwork_sq = sq;
+	return 0;
+}
+
+
 static i64 asyncwork_do(const AsyncWorkReq* req);
 
 
@@ -1804,14 +1909,22 @@ static int uworker_open(UWorker** uwp, S* s, void* mainfun_lcode, u32 mainfun_lc
 	UWorker* uw = calloc(1, sizeof(UWorker));
 	if (!uw)
 		return -ENOMEM;
+
 	int err = worker_open(&uw->w, s, WorkerKind_USER);
 	if (err) {
 		free(uw);
 		return err;
 	}
+
 	uw->mainfun_lcode_len = mainfun_lcode_len;
 	uw->mainfun_lcode = mainfun_lcode;
 	uw->s.isworker = true; // note: uw->s is the worker's S, not the spawner S 's'
+
+	if (( err = s_asyncwork_cq_setup(&uw->s) )) {
+		free(uw);
+		return err;
+	}
+
 	*uwp = uw;
 	return worker_start((Worker*)uw);
 }
@@ -1896,37 +2009,16 @@ static int s_asyncwork_spawn_worker(S* s) {
 }
 
 
-static int s_asyncwork_setup(S* s) {
-	trace_sched("creating asyncwork SQ & CQ");
-	u32 cap = 64;
-
-	Chan* sq = chan_open(cap, sizeof(AsyncWorkReq));
-	if (!sq)
-		return -ENOMEM;
-
-	Chan* cq = chan_open(cap, sizeof(AsyncWorkRes));
-	if (!cq) {
-		chan_close(sq);
-		return -ENOMEM;
-	}
-
-	s->asyncwork_sq = sq;
-	s->asyncwork_cq = cq;
-
-	return 0;
-}
-
-
 static int s_asyncwork_prepare(S* s) {
 	u32 nreqs = atomic_fetch_add_explicit(&s->asyncwork_nreqs, 1, memory_order_acq_rel);
 	trace_sched("[asyncwork] nreqs, nworkers = %u, %u", nreqs+1, s->asyncwork_nworkers);
 	if LIKELY(s->asyncwork_sq != NULL && nreqs < s->asyncwork_nworkers)
 		return 0;
-	if (s->asyncwork_sq == NULL) {
-		int err = s_asyncwork_setup(s);
-		if (err)
-			return err;
-	}
+	int err;
+	if (s->asyncwork_sq == NULL && (err = s_asyncwork_sq_setup(s)))
+		return err;
+	if (s->asyncwork_cq == NULL && (err = s_asyncwork_cq_setup(s)))
+		return err;
 	return s_asyncwork_spawn_worker(s);
 }
 
@@ -1957,7 +2049,7 @@ static int t_asyncwork_req(
 	bool ok = chan_write(t->s->asyncwork_sq, 0, req);
 	if UNLIKELY (!ok)
 		return -ENOMEM;
-	t_retain(t); // work's ref, released by s_asyncwork_process_completions
+	t_retain(t); // work's ref, released by s_asyncwork_read_cq
 	trace_sched(T_ID_F " asyncwork op=%u SQ append", t_id(t), req->op);
 
 	// suspend task
@@ -2119,9 +2211,10 @@ static int l_syscall_addrinfo(lua_State* L) {
 
 static i64 asyncwork_do(const AsyncWorkReq* req) {
 	switch ((enum AsyncWorkOp)req->op) {
-	case AsyncWorkOp_NOP:       return 0; break;
-	case AsyncWorkOp_NANOSLEEP: return asyncwork_do_nanosleep(req);
-	case AsyncWorkOp_ADDRINFO:  return asyncwork_do_addrinfo(req);
+	case AsyncWorkOp_NOP:        return 0; break;
+	case AsyncWorkOp_NANOSLEEP:  return asyncwork_do_nanosleep(req);
+	case AsyncWorkOp_ADDRINFO:   return asyncwork_do_addrinfo(req);
+	case AsyncWorkOp_WORKER_MSG: assertf(0, "invalid WORKER_MSG"); break;
 	}
 	assertf(0, "op=%u", req->op);
 	unreachable();
@@ -2280,6 +2373,8 @@ static int l_read_cont(lua_State* L, __attribute__((unused)) int ltstatus, IODes
 	}
 
 	Buf* buf = l_buf_check(L, 2);
+	if (!buf)
+		return 0;
 
 	#if 1 // version of the code that resizes buffer if needed
 		// TODO: check to see if there's a 3rd argument with explicit read limit
@@ -2435,8 +2530,14 @@ static int l_recv(lua_State* L) {
 
 	// check for deadlock
 	S* s = t->s;
-	if UNLIKELY(s->runnext == NULL && s->runq->fifo.head == s->runq->fifo.tail) {
-		// empty runq
+	bool empty_runq = s->runnext == NULL && s->runq->fifo.head == s->runq->fifo.tail;
+	if UNLIKELY(
+		s->runnext == NULL && s->runq->fifo.head == s->runq->fifo.tail && // empty runq
+		empty_runq && s->nlive == 1 && // only task running
+		t->ntimers == 0 && // no timers
+		s->workers == NULL && // no workers
+		(!s->isworker || t->tid != 1) // t is not the main task of a worker
+	) {
 		if (s->nlive == 1 && t->ntimers == 0) {
 			// T is the only live task and no timers are active
 			return luaL_error(t_L(t), "deadlock detected: recv would never return");
@@ -2448,18 +2549,19 @@ static int l_recv(lua_State* L) {
 }
 
 
-static int l_send1(lua_State* L, T* t, T* dst_t);
+static int l_send_task1(lua_State* L, T* t, T* dst_t);
 
 
-static int l_send_cont(lua_State* L, int ltstatus, void* arg) {
+static int l_send_task_cont(lua_State* L, int ltstatus, void* arg) {
 	T* dst_t = arg;
-	return l_send1(L, L_t(L), dst_t);
+	return l_send_task1(L, L_t(L), dst_t);
 }
 
 
-static int l_send1(lua_State* L, T* t, T* dst_t) {
+static int l_send_task1(lua_State* L, T* t, T* dst_t) {
 	// place message in receiver's inbox
-	InboxMsg* msg = inbox_add(&dst_t->inbox);
+	const u32 maxcap = 64;
+	InboxMsg* msg = inbox_add(&dst_t->inbox, maxcap);
 	if UNLIKELY(msg == NULL) {
 		// receiver inbox is full; wait until there's space
 		trace_sched("send later to " T_ID_F " (inbox full)", t_id(dst_t));
@@ -2473,7 +2575,7 @@ static int l_send1(lua_State* L, T* t, T* dst_t) {
 		t->resume_nres = 0;
 
 		// wait until there's space in the inbox and try again
-		return t_suspend(t, T_WAIT_SEND, dst_t, l_send_cont);
+		return t_suspend(t, T_WAIT_SEND, dst_t, l_send_task_cont);
 	}
 	memset(msg, 0, sizeof(*msg));
 	msg->type = InboxMsgType_MSG;
@@ -2525,13 +2627,81 @@ static int l_send1(lua_State* L, T* t, T* dst_t) {
 }
 
 
-// fun send(Task destination, msg... any)
-static int l_send(lua_State* L) {
+static int l_send_task(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 	T* dst_t = l_check_task(L, 1);
 	if (!dst_t)
 		return 0;
-	return l_send1(L, t, dst_t);
+	return l_send_task1(L, t, dst_t);
+}
+
+
+static int l_xxx_structclone_encode(lua_State* L) {
+	// create buffer (lifetime managed by GC)
+	// dlog_lua_stackf(L, "stack before creating buffer");
+	Buf* buf = l_buf_createx(L, 512);
+	if UNLIKELY(!buf)
+		return l_errno_error(L, ENOMEM);
+	// move buffer to bottom of stack since structclone_encode works from top to bottom of stack
+	lua_rotate(L, 1, 1);
+	// dlog_lua_stackf(L, "stack after creating buffer");
+
+	int startarg = 2;
+	int nargs = lua_gettop(L) - 1; // -1: not including buf
+	int err = structclone_encode(L, buf, startarg, nargs);
+	if UNLIKELY(err)
+		return 0;
+
+	dlog_lua_stackf(L, "stack when returning");
+	return 1;
+}
+
+
+static int l_xxx_structclone_decode(lua_State* L) {
+	Buf* buf = l_buf_check(L, 1);
+	if (!buf)
+		return 0;
+	return structclone_decode(L, buf->bytes, buf->len);
+}
+
+
+static int l_send_worker(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+	UWorkerObj* obj = l_uobj_check(L, 1, &g_uworkerobj_luatabkey, "Task or Worker");
+	if (!obj)
+		return 0;
+	UWorker* uw = obj->uw;
+
+	// structurally clone the arguments
+	int arg_start = 2; // because arg 1 is the worker
+	int arg_end = lua_gettop(L) + 1;
+	Buf buf = {};
+	int err = structclone_encode(L, &buf, arg_start, arg_end);
+	if (err)
+		return l_errno_error(L, -err);
+
+	// put message on target worker's CQ
+	ChanTx tx = chan_write_begin(uw->s.asyncwork_cq, 0);
+	assertf(tx.entry != NULL, "chan_write(cq) failed");
+	AsyncWorkRes* res = tx.entry;
+	res->op = AsyncWorkOp_WORKER_MSG;
+	res->msg.a = 1;
+	res->msg.b = 2;
+	res->msg.c = 3;
+	chan_write_commit(uw->s.asyncwork_cq, tx);
+
+	// notify the worker's scheduler that there's stuff in asyncwork_cq
+	s_notify(&uw->s, S_NOTE_ASYNCWORK);
+
+	return 0;
+}
+
+
+// fun send(Task|Worker destination, msg... any)
+static int l_send(lua_State* L) {
+	if (lua_isthread(L, 1))
+		return l_send_task(L);
+	return l_send_worker(L);
 }
 
 
@@ -2611,6 +2781,7 @@ static int l_await_worker_cont1(lua_State* L, UWorker* uw) {
 static int l_await_worker_cont(lua_State* L, int ltstatus, void* arg) {
 	return l_await_worker_cont1(L, arg);
 }
+
 
 
 // fun await(w Worker) (ok bool, err string)
@@ -2697,6 +2868,8 @@ static const luaL_Reg dew_lib[] = {
 	// WIP
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
+	{"xxx_structclone_encode", l_xxx_structclone_encode},
+	{"xxx_structclone_decode", l_xxx_structclone_decode},
 
 	// wasm experiment
 	#ifdef __wasm__

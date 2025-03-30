@@ -34,7 +34,8 @@ struct Inbox {
     InboxMsg entries[];
 };
 
-InboxMsg* nullable inbox_add(Inbox** inboxp);
+// maxcap: messages we can send() without blocking. Returns NULL if inbox is full.
+InboxMsg* nullable inbox_add(Inbox** inboxp, u32 maxcap);
 
 inline static InboxMsg* nullable inbox_pop(Inbox* inbox) {
     return fifo_pop(&inbox->fifo, sizeof(*inbox->entries));

@@ -13,6 +13,7 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <string.h>
+#include <stdio.h>
 
 #include "lua.h"
 
@@ -1461,3 +1462,30 @@ LUA_API void lua_upvaluejoin (lua_State *L, int fidx1, int n1,
 }
 
 
+LUA_API lua_Unsigned dew_lua_arraylen(lua_State *L, int idx) {
+  const TValue *o = index2value(L, idx);
+  if (ttistable(o)) {
+    Table *t = hvalue(o);
+    // Observations:
+    //   {5, "six"}             isrealasize=1, alimit=2, lsizenode=0
+    //   {y = 5, x = "six"}     isrealasize=1, alimit=0, lsizenode=1
+    //   {[1] = 5, x = "six"}   isrealasize=1, alimit=0, lsizenode=1
+    //   {[1] = 5, [2] = "six"} isrealasize=1, alimit=0, lsizenode=1
+    //   {5, [2] = "six"}       isrealasize=1, alimit=1, lsizenode=0
+    //   {5, [1] = "six"}       isrealasize=1, alimit=1, lsizenode=0
+    //   {}                     isrealasize=1, alimit=0, lsizenode=0, array=0x0
+    // printf("isrealasize=%d, alimit=%u, lsizenode=%u, array=%p, node=%p\n",
+    //        isrealasize(t), t->alimit, t->lsizenode, t->array, t->node);
+
+    // lsizenode is log2 of size of 'node' array (0 for "arrays")
+    // Note: this logic only holds for the Lua code Dew generates.
+    // I.e. either strictly arrays '{1, "two"}' or dicts '{x=1, y="two"}', it does not work
+    // correctly for mixed Lua tables like '{1, [2]="two"}'
+    if (t->lsizenode == 0) {
+      if (isrealasize(t))
+        return t->alimit;
+      return lua_rawlen(L, idx);
+    }
+  }
+  return 0xffffffff;
+}

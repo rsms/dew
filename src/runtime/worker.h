@@ -21,6 +21,7 @@ enum AsyncWorkOp {
     AsyncWorkOp_NOP = 0,
     AsyncWorkOp_NANOSLEEP = 1,
     AsyncWorkOp_ADDRINFO = 2,
+    AsyncWorkOp_WORKER_MSG = 0x1000, // message sent to the worker's main task from another worker
 };
 
 #define AsyncWorkFlag_HAS_CONT ((u16)1 << 0) // has continuation
@@ -33,10 +34,19 @@ struct AsyncWorkReq {
 };
 
 typedef struct AsyncWorkRes {
-    u16 op;     // operation to perform
-    u16 flags;  //
-    u32 tid;    // task waiting for this work
-    i64 result; // output result
+    u16 op;     // operation performed
+    union {
+        struct { // op != AsyncWorkOp_WORKER_MSG
+            u16 flags;  //
+            u32 tid;    // task waiting for this work
+            i64 result; // output result
+        } __attribute__((packed));
+        struct { // op == AsyncWorkOp_WORKER_MSG
+            u16 a;
+            u32 b;
+            u64 c;
+        } __attribute__((packed)) msg;
+    };
 } AsyncWorkRes;
 
 enum WorkerStatus {

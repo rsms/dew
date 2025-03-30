@@ -1,5 +1,6 @@
 #include "buf.h"
 #include "lutil.h"
+#include "string_repr.h"
 
 
 static u8 g_buf_luatabkey; // Buf object prototype
@@ -13,7 +14,7 @@ int buf_free(Buf* buf) {
 }
 
 
-static bool buf_resize(Buf* buf, usize newcap) {
+bool buf_resize(Buf* buf, usize newcap) {
     if (newcap > 0 && newcap < USIZE_MAX - sizeof(void*))
         newcap = ALIGN2(newcap, sizeof(void*));
 
@@ -114,6 +115,22 @@ int l_buf_gc(lua_State* L) {
 }
 
 
+Buf* nullable l_buf_createx(lua_State* L, u64 cap) {
+    int nuvalue = 0;
+    // See comment in l_iodesc_create.
+    // dlog("allocating buffer with cap %lu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
+    Buf* buf = lua_newuserdatauv(L, sizeof(Buf) + (usize)cap, nuvalue);
+    if (!buf)
+        return NULL;
+    buf->cap = (usize)cap;
+    buf->len = 0;
+    buf->bytes = (void*)buf + sizeof(Buf);
+    lua_rawgetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
+    lua_setmetatable(L, -2);
+    return buf;
+}
+
+
 // fun buf_create(cap u64)
 int l_buf_create(lua_State* L) {
     u64 cap = lua_tointegerx(L, 1, NULL);
@@ -124,18 +141,9 @@ int l_buf_create(lua_State* L) {
     } else {
         cap = ALIGN2(cap, sizeof(void*));
     }
-    // dlog("allocating buffer with cap %lu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
-
-    // see comment in l_iodesc_create
-    int nuvalue = 0;
-    Buf* b = lua_newuserdatauv(L, sizeof(Buf) + (usize)cap, nuvalue);
-    b->cap = (usize)cap;
-    b->len = 0;
-    b->bytes = (void*)b + sizeof(Buf);
-    lua_rawgetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
-    lua_setmetatable(L, -2);
-
-    return 1;
+    if (l_buf_createx(L, cap))
+        return 1;
+    return l_errno_error(L, ENOMEM);
 }
 
 
@@ -156,11 +164,58 @@ int l_buf_resize(lua_State* L) {
 }
 
 
+#define ELLIPSIS     "…"
+#define ELLIPSIS_LEN strlen(ELLIPSIS)
+
+
 int l_buf_str(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
-    // TODO: optional second argument for how to encode the data, e.g. hex, base64
-    lua_pushlstring(L, (char*)buf->bytes, buf->len);
-    return 1;
+    if (!buf)
+        return 0;
+    // TODO: optional second argument for how to encode the data, e.g. verbatim, hex, base64
+
+    const usize maxlen = 1024;
+    usize len = MIN(buf->len, maxlen);
+    // lua_pushlstring(L, (char*)buf->bytes, len); return 1; // raw
+
+    // allocate destination buffer that's 2x the size of the input
+    usize dstcap = len * 2;
+    usize dstcap_extra = (usize)(len < buf->len) * ELLIPSIS_LEN;
+    char* dst = malloc(dstcap + dstcap_extra);
+    if (dst == NULL)
+        return l_errno_error(L, ENOMEM);
+
+    for (;;) {
+        // usize len2 = string_hex(dst, dstcap, buf->bytes, len); // hex
+        usize len2 = string_repr(dst, dstcap, buf->bytes, len); // repr
+
+        // check for error
+        if (len2 == 0) {
+            free(dst);
+            return 0;
+        }
+
+        // check if output fit in dst
+        if (len2 <= dstcap) {
+            if (buf->len > maxlen) {
+                memcpy(&dst[len2], ELLIPSIS, ELLIPSIS_LEN);
+                len2 += ELLIPSIS_LEN;
+            }
+            lua_pushlstring(L, dst, len2);
+            free(dst);
+            return 1;
+        }
+
+        // grow dst
+        dlog("grow");
+        dstcap = len2 + 1;
+        char* dst2 = realloc(dst, dstcap + dstcap_extra);
+        if (dst2 == NULL) {
+            free(dst);
+            return l_errno_error(L, ENOMEM);
+        }
+        dst = dst2;
+    }
 }
 
 
@@ -168,5 +223,7 @@ void luaopen_buf(lua_State* L) {
     luaL_newmetatable(L, "Buf");
     lua_pushcfunction(L, l_buf_gc);
     lua_setfield(L, -2, "__gc");
+    lua_pushcfunction(L, l_buf_str);
+    lua_setfield(L, -2, "__tostring");
     lua_rawsetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
 }

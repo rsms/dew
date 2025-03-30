@@ -171,25 +171,7 @@ function main(args)
 end
 
 
--- Runtime tests: (run manually by uncommenting)
--- require("tests/rt/yield")
--- require("tests/rt/sleep")
--- require("tests/rt/timer")
--- require("tests/rt/repeating-timer")
--- require("tests/rt/stop-children-on-parent-exit")
--- require("tests/rt/deadlock")
--- require("tests/rt/worker")
--- require("tests/rt/worker-error")
--- require("tests/rt/await-task")
--- require("tests/rt/send-recv")
--- require("tests/rt/tcp-echo")
--- require("tests/rt/blocking-syscall")
--- require("tests/rt/getaddrinfo")
-
--- Runtime tests requiring additional manual setup:
--- require("tests/rt/socket-read")
-
--- Runtime benchmarks: (run manually by uncommenting)
--- require("tests/rt/send-recv-benchmark")
+-- Runtime dev
+-- require("tests/rt/worker-send-recv")
 
 main(arg)

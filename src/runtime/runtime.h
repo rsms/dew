@@ -13,10 +13,8 @@ typedef struct S    S; // scheduler (M+P in Go lingo)
 typedef struct T    T; // task
 typedef struct RunQ RunQ;
 
-// forward declaration since S uses this type
-#if DEW_ENABLE_WORKERS
-    typedef struct Worker Worker;
-#endif
+// Worker forward declaration since S uses Worker
+typedef struct Worker Worker;
 
 struct RunQ {
 	FIFO fifo;
@@ -102,8 +100,6 @@ struct S {
 	TimerPQ   timers;            // priority queue (heap) of TimerInfo entries
 	TimerInfo timers_storage[8]; // initial storage for 'timers' array
 
-	#if DEW_ENABLE_WORKERS
-
 	// workers spawned by this S
 	Worker* nullable workers; // list
 
@@ -111,9 +107,7 @@ struct S {
 	u32            asyncwork_nworkers; // number of live workers (monotonic)
 	_Atomic(u32)   asyncwork_nreqs;    // number of pending work requests
 	Chan* nullable asyncwork_sq;       // submission queue
-	Chan* nullable asyncwork_cq;       // completion queue
-
-	#endif // DEW_ENABLE_WORKERS
+	Chan* nullable asyncwork_cq;       // completion queue, also used for cross-worker send/recv
 };
 
 

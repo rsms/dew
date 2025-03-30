@@ -113,7 +113,7 @@ typedef double        float64;
 #else
 	#define MUSTTAIL
 #endif
-#define TAIL_CALL MUSTTAIL return
+#define return_tail MUSTTAIL return
 
 #if __has_attribute(format)
 	#define ATTR_FORMAT(archetype, fmtarg, checkarg) \
@@ -138,6 +138,10 @@ typedef double        float64;
 #define API_END \
 	_Pragma("clang diagnostic pop") \
 	_Pragma("clang assume_nonnull end")
+
+// DEW_PLUS_ONE can be used to define count of enums, e.g.
+// enum { FOO_COUNT = (0lu FOR_EACH_FOO(DEW_PLUS_ONE)) };
+#define DEW_PLUS_ONE(...) + 1lu
 
 #ifndef countof
 	#define countof(x) \
@@ -322,15 +326,6 @@ typedef double        float64;
 	#define assertnotnull(expr) ({ expr; })
 #endif
 
-
-#ifndef DEW_ENABLE_WORKERS
-	#ifdef __wasm__
-		#define DEW_ENABLE_WORKERS 0
-	#else
-		#define DEW_ENABLE_WORKERS 1
-	#endif
-#endif
-
 API_BEGIN
 
 extern const char* g_prog; // dew.c
@@ -379,6 +374,7 @@ static inline WARN_UNUSED_RESULT bool __must_check_unlikely(bool unlikely) {
 
 
 #ifdef DEBUG
+void dlog_lua_val(lua_State* L, int val_idx);
 void dlog_lua_stackf(lua_State* L, const char* fmt, ...);
 #endif
 
