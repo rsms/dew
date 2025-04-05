@@ -168,6 +168,15 @@ int l_buf_resize(lua_State* L) {
 #define ELLIPSIS_LEN strlen(ELLIPSIS)
 
 
+int l_buf_len(lua_State* L) {
+    Buf* buf = l_buf_check(L, 1);
+    if (!buf)
+        return 0;
+    lua_pushinteger(L, buf->len);
+    return 1;
+}
+
+
 int l_buf_str(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     if (!buf)
@@ -221,9 +230,15 @@ int l_buf_str(lua_State* L) {
 
 void luaopen_buf(lua_State* L) {
     luaL_newmetatable(L, "Buf");
+
     lua_pushcfunction(L, l_buf_gc);
     lua_setfield(L, -2, "__gc");
+
     lua_pushcfunction(L, l_buf_str);
     lua_setfield(L, -2, "__tostring");
+
+    lua_pushcfunction(L, l_buf_len);
+    lua_setfield(L, -2, "__len");
+
     lua_rawsetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
 }

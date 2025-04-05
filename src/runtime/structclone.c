@@ -216,7 +216,7 @@ static bool encode_ref(lua_State* L, Encoder* enc, int idx) {
         // allocate ref index
         // store offset and index as value in table
         refno = enc->nrefs++;
-        reftuple = ENC_REFTUPLE(offset, refno);
+        reftuple = ENC_REFTUPLE(offset, refno + 1);
 
         sc_trace("materializing ref#%u at offset %lu: %s", refno, offset, fmtlval(L, idx));
         sc_trace("  reftuple 0x%016lx (%lu, %lu)",
@@ -229,7 +229,7 @@ static bool encode_ref(lua_State* L, Encoder* enc, int idx) {
         // sc_trace("set reftab[%s] = %s", fmtlval(L, -2), fmtlval(L, -1));
         lua_rawset(L, REFTAB_IDX); // reftab[key] = value
     } else {
-        refno = ENC_REFTUPLE_REFNO(reftuple);
+        refno = ENC_REFTUPLE_REFNO(reftuple) - 1;
         sc_trace("found ref#%u with target offset %lu: %s", refno, offset, fmtlval(L, idx));
     }
 
@@ -492,6 +492,8 @@ static void encode_table(lua_State* L, Encoder* enc, int vi) {
     if UNLIKELY(!buf_reserve(enc->buf, 16))
         return enc_error_nomem(L, enc), ((void)0);
 
+    // encode_array
+
     u32 count = dew_lua_arraylen(L, -1);
     if (count == U32_MAX)
         return encode_dict(L, enc, vi);
@@ -509,6 +511,7 @@ static void encode_table(lua_State* L, Encoder* enc, int vi) {
         lua_pop(L, 1);
     }
 }
+
 
 static void decode_array(lua_State* L, Decoder* dec) {
     usize bufavail = dec->bufend - dec->buf;
@@ -528,6 +531,34 @@ static void decode_array(lua_State* L, Decoder* dec) {
     for (u32 i = 1; i <= count && dec->err_no == 0 && dec->buf < dec->bufend; i++) {
         assert(dec->buf < dec->bufend);
         lua_pushinteger(L, i); // key
+        decode_value(L, dec); // value
+        lua_rawset(L, -3); // table[key] = value
+        assert(dec->buf <= dec->bufend);
+    }
+
+    if UNLIKELY(dec->buf > dec->bufend)
+        codec_error(L, dec, EOVERFLOW, "BUG in structured clone decoder (buffer overrun)");
+}
+
+
+static void decode_dict(lua_State* L, Decoder* dec) {
+    usize bufavail = dec->bufend - dec->buf;
+    if UNLIKELY(bufavail < 5)
+        return dec_error_short(L, dec);
+
+    u32 count;
+    memcpy(&count, dec->buf + 1, sizeof(count));
+
+    lua_createtable(L, 0, (int)MIN(count, (u32)I32_MAX));
+
+    if (*dec->buf & SCTagValHasRef)
+        dec_ref_register(L, dec);
+
+    dec->buf += 1 + sizeof(count); // tag + count
+
+    for (u32 i = 1; i <= count && dec->err_no == 0 && dec->buf < dec->bufend; i++) {
+        assert(dec->buf < dec->bufend);
+        decode_value(L, dec); // key
         decode_value(L, dec); // value
         lua_rawset(L, -3); // table[key] = value
         assert(dec->buf <= dec->bufend);
@@ -575,7 +606,7 @@ static void decode_value(lua_State* L, Decoder* dec) {
         case SCTag_STR1:
         case SCTag_STR4:       return_tail decode_str(L, dec);
         case SCTag_ARRAY:      return_tail decode_array(L, dec);
-        case SCTag_DICT:       dlog("TODO: decode DICT"); lua_pushnil(L); dec->buf = dec->bufend; return;
+        case SCTag_DICT:       return_tail decode_dict(L, dec);
         case SCTag_FUN:        dlog("TODO: decode FUN");  lua_pushnil(L); dec->buf = dec->bufend; return;
         case SCTag_REFZ:       return_tail decode_refz(L, dec);
         case SCTag_REF:        return_tail decode_ref(L, dec);
@@ -607,8 +638,11 @@ static void encode_refmap(lua_State* L, Encoder* enc) {
     lua_pushnil(L); // dummy key for lua_next to lua_pop(L, 1)
     u32 i = 0;
     while (lua_next(L, /*table idx*/-2) != 0) {
-        reftab[i++] = lua_tointeger(L, -1);
-        assert(i <= enc->nrefs);
+        u64 reftuple = lua_tointeger(L, -1);
+        if (ENC_REFTUPLE_REFNO(reftuple)) {
+            assertf(i < enc->nrefs, "%u < %u (0x%lx)", i, enc->nrefs, reftuple);
+            reftab[i++] = reftuple;
+        }
         lua_pop(L, 1);
         // note: lua_next will do lua_pop(L, 1)
     }
@@ -642,12 +676,12 @@ static void encode_refmap(lua_State* L, Encoder* enc) {
     if LIKELY(COMPACT_REFMAP && enc->nrefs <= 256) {
         // small table, 1 byte per refno
         for (u32 i = 0; i < enc->nrefs; i++)
-            refmap[i] = ENC_REFTUPLE_REFNO(reftab[i]);
+            refmap[i] = ENC_REFTUPLE_REFNO(reftab[i]) - 1;
     } else {
         // large table, 4 bytes per refno
         for (u32 i = 0; i < enc->nrefs; i++) {
-            u32 n = ENC_REFTUPLE_REFNO(reftab[i]);
-            memcpy(refmap, &n, sizeof(u32));
+            u32 refno = ENC_REFTUPLE_REFNO(reftab[i]) - 1;
+            memcpy(refmap, &refno, sizeof(u32));
             refmap += sizeof(u32);
         }
     }

@@ -13,7 +13,8 @@ __rt.main(function()
     local a1 = {"A", "B", long_string1, long_string1, long_string2, long_string2}
     -- a1[#a1 + 1] = long_string1
     a1[#a1 + 1] = a1
-    -- print("#a1", #a1)
+    a1[#a1 + 1] = {x=1, y=3, z=4, [long_string1]=5}
+    -- a1[#a1 + 1] = "really long string that will not be referenced"
     local buf = __rt.xxx_structclone_encode(a1, long_string1)
     -- local buf = __rt.xxx_structclone_encode(a1, 9, a1)
 
@@ -29,7 +30,7 @@ __rt.main(function()
     -- local buf = __rt.xxx_structclone_encode({5, "six", {7}})
     -- local buf = __rt.xxx_structclone_encode({x = 5, y = "six"})
     -- local buf = __rt.xxx_structclone_encode(1, 2.3, "four", {5, "six"})
-    print("xxx_structclone_encode =>\n  \"" .. tostring(buf) .. '"')
+    print("xxx_structclone_encode =>\n  (" .. #buf .. " B) \"" .. tostring(buf) .. '"')
     -- print("xxx_structclone_decode =>", __rt.xxx_structclone_decode(buf))
     local res = table.pack(__rt.xxx_structclone_decode(buf))
     print("xxx_structclone_decode =>", res)
