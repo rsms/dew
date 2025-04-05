@@ -2638,21 +2638,18 @@ static int l_send_task(lua_State* L) {
 
 static int l_xxx_structclone_encode(lua_State* L) {
 	// create buffer (lifetime managed by GC)
-	// dlog_lua_stackf(L, "stack before creating buffer");
 	Buf* buf = l_buf_createx(L, 512);
 	if UNLIKELY(!buf)
 		return l_errno_error(L, ENOMEM);
-	// move buffer to bottom of stack since structclone_encode works from top to bottom of stack
-	lua_rotate(L, 1, 1);
-	// dlog_lua_stackf(L, "stack after creating buffer");
 
-	int startarg = 2;
+	// move buffer to bottom of stack since structclone_encode works on the top N stack values
+	lua_rotate(L, 1, 1);
+
 	int nargs = lua_gettop(L) - 1; // -1: not including buf
-	int err = structclone_encode(L, buf, startarg, nargs);
+	int err = structclone_encode(L, buf, nargs);
 	if UNLIKELY(err)
 		return 0;
 
-	dlog_lua_stackf(L, "stack when returning");
 	return 1;
 }
 
@@ -2661,6 +2658,7 @@ static int l_xxx_structclone_decode(lua_State* L) {
 	Buf* buf = l_buf_check(L, 1);
 	if (!buf)
 		return 0;
+	lua_pop(L, 1); // remove buffer from stack
 	return structclone_decode(L, buf->bytes, buf->len);
 }
 
@@ -2673,10 +2671,9 @@ static int l_send_worker(lua_State* L) {
 	UWorker* uw = obj->uw;
 
 	// structurally clone the arguments
-	int arg_start = 2; // because arg 1 is the worker
-	int arg_end = lua_gettop(L) + 1;
+	int nargs = lua_gettop(L) - 1; // -1: not including worker
 	Buf buf = {};
-	int err = structclone_encode(L, &buf, arg_start, arg_end);
+	int err = structclone_encode(L, &buf, nargs);
 	if (err)
 		return l_errno_error(L, -err);
 

@@ -14,24 +14,26 @@ DEW_SRCS := \
 	src/dew.c \
 	src/panic.c \
 	src/logmsg.c \
-	$(call ifx,DEBUG,  src/dlog_lua_stack.c) \
-	src/runtime/runtime.c \
-	src/runtime/lutil.c \
+	src/hexdump.c \
+	src/snprintf_lval.c \
 	src/runtime/array.c \
 	src/runtime/buf.c \
+	src/runtime/chan.c \
 	src/runtime/fifo.c \
+	src/runtime/inbox.c \
+	src/runtime/intconv.c \
+	src/runtime/intfmt.c \
+	src/runtime/intscan.c \
+	src/runtime/iopoll.c \
+	src/runtime/lutil.c \
 	src/runtime/pool.c \
+	src/runtime/qsort.c \
+	src/runtime/runtime.c \
+	src/runtime/string_repr.c \
+	src/runtime/structclone.c \
 	src/runtime/time.c \
 	src/runtime/timer.c \
-	src/runtime/intconv.c \
-	src/runtime/intscan.c \
-	src/runtime/intfmt.c \
-	src/runtime/inbox.c \
-	src/runtime/structclone.c \
-	src/runtime/string_repr.c \
-	src/runtime/chan.c \
 	$(call ifs,TARGET,web,, src/runtime/tsem.c) \
-	src/runtime/iopoll.c \
 	$(call ifs,TARGET,darwin, src/runtime/iopoll_darwin.c) \
 	$(call ifs,TARGET,linux,  src/runtime/iopoll_linux.c) \
 	$(call ifs,TARGET,web,    src/runtime/iopoll_wasm.c  src/runtime/wasm.c) \

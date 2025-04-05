@@ -4,7 +4,7 @@
 #include "buf.h"
 API_BEGIN
 
-int structclone_encode(lua_State* L, Buf* buf, int startarg, int nargs);
+int structclone_encode(lua_State* L, Buf* buf, int nargs);
 int structclone_decode(lua_State* L, const void* buf, usize buflen);
 
 API_END

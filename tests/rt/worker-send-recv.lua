@@ -1,27 +1,4 @@
-function print_table(tbl, indent)
-    indent = indent or 0
-    local indent_str = string.rep("  ", indent)
-    if type(tbl) ~= "table" then
-        print(indent_str .. tostring(tbl))
-        return
-    end
-    -- print(indent_str .. "{")
-    print("{")
-    local keys = {}
-    for k in pairs(tbl) do table.insert(keys, k) end
-    table.sort(keys)
-    for _, k in ipairs(keys) do
-        local key = tostring(k)
-        local v = tbl[k]
-        io.write(indent_str .. "  [" .. key .. "] = ")
-        if type(v) == "table" then
-            print_table(v, indent + 1)
-        else
-            print(tostring(v))
-        end
-    end
-    print(indent_str .. "}")
-end
+require("../../src/util") -- print_table
 
 __rt.main(function()
     -- local buf = __rt.xxx_structclone_encode(nil, true, 1, 2.3, "four", "long string")
@@ -31,8 +8,14 @@ __rt.main(function()
     -- local buf = __rt.xxx_structclone_encode(a1)
 
     -- local a1 = {"A", "B", {22, 222}, 3}
-    local a1 = {"A", "B", 3}
-    local buf = __rt.xxx_structclone_encode(a1)
+    local long_string1 = "really long string that will be referenced 1"
+    local long_string2 = "really long string that will be referenced 2"
+    local a1 = {"A", "B", long_string1, long_string1, long_string2, long_string2}
+    -- a1[#a1 + 1] = long_string1
+    a1[#a1 + 1] = a1
+    -- print("#a1", #a1)
+    local buf = __rt.xxx_structclone_encode(a1, long_string1)
+    -- local buf = __rt.xxx_structclone_encode(a1, 9, a1)
 
     -- local a1 = {"a1"}
     -- local a2 = {"a2"}
@@ -46,9 +29,28 @@ __rt.main(function()
     -- local buf = __rt.xxx_structclone_encode({5, "six", {7}})
     -- local buf = __rt.xxx_structclone_encode({x = 5, y = "six"})
     -- local buf = __rt.xxx_structclone_encode(1, 2.3, "four", {5, "six"})
-    print("xxx_structclone_encode =>", buf)
+    print("xxx_structclone_encode =>\n  \"" .. tostring(buf) .. '"')
     -- print("xxx_structclone_decode =>", __rt.xxx_structclone_decode(buf))
-    print_table(__rt.xxx_structclone_decode(buf))
+    local res = table.pack(__rt.xxx_structclone_decode(buf))
+    print("xxx_structclone_decode =>", res)
+
+    local seen = {}
+    for i, item in ipairs(res) do
+        if type(item) == "table" then
+            local eq = seen[item]
+            if eq ~= nil then
+                print("#" .. i .. " =", "#" .. eq)
+            else
+                seen[item] = i
+                print("#" .. i .. " =")
+                print_table(item, 1)
+            end
+        else
+            print("#" .. i .. " =", type(item), item)
+        end
+    end
+    -- t[#t + 1] = 4
+    -- print_table(t)
 
     -- print("xxx_structclone_encode =>",
     --       __rt.xxx_structclone_encode(function() return 1, 2.3, "four", {5, "six"} end))

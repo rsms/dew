@@ -253,6 +253,17 @@ LUA_API void lua_rotate (lua_State *L, int idx, int n) {
 }
 
 
+// [dew]
+LUA_API void lua_reverse (lua_State *L, int idx) {
+  StkId p, t;
+  lua_lock(L);
+  t = L->top.p - 1;  /* end of stack segment being rotated */
+  p = index2stack(L, idx);  /* start of segment */
+  reverse(L, p, t);  /* reverse the entire segment */
+  lua_unlock(L);
+}
+
+
 LUA_API void lua_copy (lua_State *L, int fromidx, int toidx) {
   TValue *fr, *to;
   lua_lock(L);
@@ -1481,11 +1492,8 @@ LUA_API lua_Unsigned dew_lua_arraylen(lua_State *L, int idx) {
     // Note: this logic only holds for the Lua code Dew generates.
     // I.e. either strictly arrays '{1, "two"}' or dicts '{x=1, y="two"}', it does not work
     // correctly for mixed Lua tables like '{1, [2]="two"}'
-    if (t->lsizenode == 0) {
-      if (isrealasize(t))
-        return t->alimit;
+    if (t->lsizenode == 0)
       return lua_rawlen(L, idx);
-    }
   }
   return 0xffffffff;
 }
