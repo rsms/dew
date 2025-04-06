@@ -1679,13 +1679,6 @@ static int l_uworkerobj_gc(lua_State* L) {
 }
 
 
-static const char* uworker_load_reader(lua_State* L, void* ud, usize* lenp) {
-	UWorker* w = ud;
-	*lenp = w->mainfun_lcode_len;
-	return w->mainfun_lcode;
-}
-
-
 // worker_cas_status attempts to set w->status to next_status.
 // Returns false if another thread set CLOSED "already" (it's a race.)
 static bool worker_cas_status(Worker* w, u8 next_status) {
@@ -1765,6 +1758,13 @@ static void worker_thread_exit(Worker** wp) {
 	}
 
 	worker_release(w);
+}
+
+
+static const char* uworker_load_reader(lua_State* L, void* ud, usize* lenp) {
+	UWorker* w = ud;
+	*lenp = w->mainfun_lcode_len;
+	return w->mainfun_lcode;
 }
 
 
@@ -2636,25 +2636,34 @@ static int l_send_task(lua_State* L) {
 }
 
 
-static int l_xxx_structclone_encode(lua_State* L) {
+static int l_structclone_encode(lua_State* L) {
+	u64 flags = luaL_checkinteger(L, 1);
+
 	// create buffer (lifetime managed by GC)
 	Buf* buf = l_buf_createx(L, 512);
 	if UNLIKELY(!buf)
 		return l_errno_error(L, ENOMEM);
 
-	// move buffer to bottom of stack since structclone_encode works on the top N stack values
-	lua_rotate(L, 1, 1);
+	// replace the flags argument on stack with the buffer
+	lua_replace(L, 1);
 
-	int nargs = lua_gettop(L) - 1; // -1: not including buf
-	int err = structclone_encode(L, buf, nargs);
+	// L's stack should now look like this:
+	//   buffer (userdata)
+	//   arg1
+	//   arg2
+	//   argN
+
+	int nargs = lua_gettop(L) - 1; // -1: not including buf nor flags
+	int err = structclone_encode(L, buf, flags, nargs);
 	if UNLIKELY(err)
 		return 0;
 
+	// return buffer
 	return 1;
 }
 
 
-static int l_xxx_structclone_decode(lua_State* L) {
+static int l_structclone_decode(lua_State* L) {
 	Buf* buf = l_buf_check(L, 1);
 	if (!buf)
 		return 0;
@@ -2673,7 +2682,7 @@ static int l_send_worker(lua_State* L) {
 	// structurally clone the arguments
 	int nargs = lua_gettop(L) - 1; // -1: not including worker
 	Buf buf = {};
-	int err = structclone_encode(L, &buf, nargs);
+	int err = structclone_encode(L, &buf, 0, nargs);
 	if (err)
 		return l_errno_error(L, -err);
 
@@ -2865,8 +2874,8 @@ static const luaL_Reg dew_lib[] = {
 	// WIP
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
-	{"xxx_structclone_encode", l_xxx_structclone_encode},
-	{"xxx_structclone_decode", l_xxx_structclone_decode},
+	{"structclone_encode", l_structclone_encode},
+	{"structclone_decode", l_structclone_decode},
 
 	// wasm experiment
 	#ifdef __wasm__

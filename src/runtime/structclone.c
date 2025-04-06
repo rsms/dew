@@ -274,7 +274,7 @@ static bool enc_ref_intern(lua_State* L, Encoder* enc, int idx) {
 
     // Add object: reftab[key] = value.
     // Push ref as value and object as key onto stack.
-    sc_trace("registering ref at offset %lu: %s", reftuple & ~((u64)1<<40), fmtlval(L, idx));
+    sc_trace("registering ref at offset %lu: %s", reftuple, fmtlval(L, idx));
     lua_pushvalue(L, idx); // key
     lua_pushinteger(L, reftuple); // value
     lua_rawset(L, REFTAB_IDX); // reftab[key] = value
@@ -291,8 +291,8 @@ inline static const u8* decode_compact_refmap(Decoder* dec) {
 }
 
 static void decode_refx(lua_State* L, Decoder* dec, u32 refno) {
-    // dlog_lua_stackf(L, "stack when looking up ref#%u", refno);
     lua_pushinteger(L, refno + 1); // +1 because lua arrays are 1-based
+    // dlog_lua_stackf(L, "stack when looking up ref#%u", refno);
     int vtype = lua_rawget(L, REFTAB_IDX);
     if UNLIKELY(vtype == LUA_TNIL) {
         lua_pop(L, 1); // remove nil from stack
@@ -490,7 +490,7 @@ static void encode_table(lua_State* L, Encoder* enc, int vi) {
         return;
 
     if UNLIKELY(!buf_reserve(enc->buf, 16))
-        return enc_error_nomem(L, enc), ((void)0);
+        return enc_error_nomem(L, enc);
 
     // encode_array
 
@@ -570,8 +570,59 @@ static void decode_dict(lua_State* L, Decoder* dec) {
 
 
 static void encode_fun(lua_State* L, Encoder* enc, int vi) {
-    enc_append_byte(L, enc, SCTag_FUN);
-    codec_error(L, enc, ENOSYS, "TODO: encode function");
+    if (!enc_ref_intern(L, enc, vi))
+        return;
+
+    if UNLIKELY(!buf_reserve(enc->buf, 16))
+        return enc_error_nomem(L, enc);
+
+    // 1 byte tag + 4 bytes len
+    u32 bufstart = enc->buf->len;
+    enc->buf->bytes[bufstart++] = SCTag_FUN;
+    enc->buf->len += 1 + sizeof(u32);
+
+    bool strip_debuginfo = false;
+    int err = buf_append_luafun(enc->buf, L, strip_debuginfo);
+    if UNLIKELY(err)
+        return codec_error(L, enc, -err, "Failed to encode function");
+
+    usize len = enc->buf->len - (bufstart + 4);
+    if UNLIKELY(len > U32_MAX)
+        return codec_error(L, enc, -err, "Function too large");
+    u32 len32 = (u32)len;
+    sc_trace("encoded function in %u B (+5 B header)", len32);
+    memcpy(&enc->buf->bytes[bufstart], &len32, sizeof(u32));
+}
+
+
+static const char* decode_fun_reader(lua_State* L, void* ud, usize* lenp) {
+    u32 len = ((uintptr*)ud)[1];
+    *lenp = ((uintptr*)ud)[1];
+    return (char*)((uintptr*)ud)[0];
+}
+
+static void decode_fun(lua_State* L, Decoder* dec) {
+    usize bufavail = dec->bufend - dec->buf;
+    if UNLIKELY(bufavail < 5)
+        return dec_error_short(L, dec);
+
+    u32 len;
+    memcpy(&len, dec->buf + 1, sizeof(len));
+
+    if UNLIKELY(bufavail < 5 + len)
+        return dec_error_short(L, dec);
+
+    dec->buf += 5;
+
+    uintptr v[2] = { (uintptr)dec->buf, len };
+    int status = lua_load(L, decode_fun_reader, v, "?", "b");
+    if UNLIKELY (status != LUA_OK)
+        return dec_error_bad(L, dec);
+
+    if (*dec->buf & SCTagValHasRef)
+        dec_ref_register(L, dec);
+
+    dec->buf += len;
 }
 
 
@@ -607,7 +658,7 @@ static void decode_value(lua_State* L, Decoder* dec) {
         case SCTag_STR4:       return_tail decode_str(L, dec);
         case SCTag_ARRAY:      return_tail decode_array(L, dec);
         case SCTag_DICT:       return_tail decode_dict(L, dec);
-        case SCTag_FUN:        dlog("TODO: decode FUN");  lua_pushnil(L); dec->buf = dec->bufend; return;
+        case SCTag_FUN:        return_tail decode_fun(L, dec);
         case SCTag_REFZ:       return_tail decode_refz(L, dec);
         case SCTag_REF:        return_tail decode_ref(L, dec);
         case SCTag_HEADER:     break; // TODO: stop gracefully if this is encountered at top level
@@ -656,7 +707,7 @@ static void encode_refmap(lua_State* L, Encoder* enc) {
                  (COMPACT_REFMAP && enc->nrefs <= 256) ? "u8" : "u32", enc->nrefs);
         for (u32 i = 0; i < enc->nrefs; i++) {
             sc_trace("  #%-3u => ref#%-3lu (offset %lu)",
-                     i, ENC_REFTUPLE_REFNO(reftab[i]), ENC_REFTUPLE_OFFSET(reftab[i]));
+                     i, ENC_REFTUPLE_REFNO(reftab[i]) - 1, ENC_REFTUPLE_OFFSET(reftab[i]));
         }
     #endif
 
@@ -732,7 +783,7 @@ static void decode_refmap(lua_State* L, Decoder* dec) {
 }
 
 
-int structclone_encode(lua_State* L, Buf* buf, int nargs) {
+int structclone_encode(lua_State* L, Buf* buf, u64 flags, int nargs) {
     Encoder enc = { .buf = buf, .buf_startoffs = buf->len };
 
     #if 0
@@ -751,8 +802,7 @@ int structclone_encode(lua_State* L, Buf* buf, int nargs) {
     buf->len += 4; // reserve space for header; 1 byte tag, 3 bytes nrefs
 
     // reverse values, which arrive in stack order, so that we
-    lua_reverse(L, lua_gettop(L) - nargs + 1);
-    // dlog_lua_stackf(L, "stack when starting encode");
+    lua_reverse(L, (lua_gettop(L) - nargs) + 1);
 
     // encode values
     while (nargs-- > 0 && enc.err_no == 0) {

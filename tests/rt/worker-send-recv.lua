@@ -1,11 +1,11 @@
 require("../../src/util") -- print_table
 
 __rt.main(function()
-    -- local buf = __rt.xxx_structclone_encode(nil, true, 1, 2.3, "four", "long string")
-    -- local buf = __rt.xxx_structclone_encode(nil, true, 1, 2.3, "four", "long string", {5, "six"})
+    -- local buf = __rt.structclone_encode(nil, true, 1, 2.3, "four", "long string")
+    -- local buf = __rt.structclone_encode(nil, true, 1, 2.3, "four", "long string", {5, "six"})
 
     -- local a1 = {"a1", 2, 3, 4}
-    -- local buf = __rt.xxx_structclone_encode(a1)
+    -- local buf = __rt.structclone_encode(a1)
 
     -- local a1 = {"A", "B", {22, 222}, 3}
     local long_string1 = "really long string that will be referenced 1"
@@ -14,26 +14,32 @@ __rt.main(function()
     -- a1[#a1 + 1] = long_string1
     a1[#a1 + 1] = a1
     a1[#a1 + 1] = {x=1, y=3, z=4, [long_string1]=5}
+    local function mul(x, y)
+        local outer = a1 -- will become nil
+        return x * y
+    end
+    a1[#a1 + 1] = mul
+    a1[#a1 + 1] = mul
     -- a1[#a1 + 1] = "really long string that will not be referenced"
-    local buf = __rt.xxx_structclone_encode(a1, long_string1)
-    -- local buf = __rt.xxx_structclone_encode(a1, 9, a1)
+    local buf = __rt.structclone_encode(0, a1, long_string1)
+    -- local buf = __rt.structclone_encode(a1, 9, a1)
 
     -- local a1 = {"a1"}
     -- local a2 = {"a2"}
-    -- local buf = __rt.xxx_structclone_encode(a1, a2, a1)
+    -- local buf = __rt.structclone_encode(a1, a2, a1)
 
     -- local a1 = {"a1"}
     -- local a2 = {"a2", a1, 3, 4}
     -- a1[#a1 + 1] = a2
-    -- local buf = __rt.xxx_structclone_encode(a1)
+    -- local buf = __rt.structclone_encode(a1)
 
-    -- local buf = __rt.xxx_structclone_encode({5, "six", {7}})
-    -- local buf = __rt.xxx_structclone_encode({x = 5, y = "six"})
-    -- local buf = __rt.xxx_structclone_encode(1, 2.3, "four", {5, "six"})
-    print("xxx_structclone_encode =>\n  (" .. #buf .. " B) \"" .. tostring(buf) .. '"')
-    -- print("xxx_structclone_decode =>", __rt.xxx_structclone_decode(buf))
-    local res = table.pack(__rt.xxx_structclone_decode(buf))
-    print("xxx_structclone_decode =>", res)
+    -- local buf = __rt.structclone_encode({5, "six", {7}})
+    -- local buf = __rt.structclone_encode({x = 5, y = "six"})
+    -- local buf = __rt.structclone_encode(1, 2.3, "four", {5, "six"})
+    print("structclone_encode =>\n  (" .. #buf .. " B) \"" .. tostring(buf) .. '"')
+    -- print("structclone_decode =>", __rt.structclone_decode(buf))
+    local res = table.pack(__rt.structclone_decode(buf))
+    print("structclone_decode =>", res)
 
     local seen = {}
     for i, item in ipairs(res) do
@@ -53,14 +59,14 @@ __rt.main(function()
     -- t[#t + 1] = 4
     -- print_table(t)
 
-    -- print("xxx_structclone_encode =>",
-    --       __rt.xxx_structclone_encode(function() return 1, 2.3, "four", {5, "six"} end))
-    --       -- __rt.xxx_structclone_encode())
-    --       -- __rt.xxx_structclone_encode(1, 2, 3))
-    --       -- __rt.xxx_structclone_encode(1, 2.3, "four", {5, "six"}))
+    -- print("structclone_encode =>",
+    --       __rt.structclone_encode(function() return 1, 2.3, "four", {5, "six"} end))
+    --       -- __rt.structclone_encode())
+    --       -- __rt.structclone_encode(1, 2, 3))
+    --       -- __rt.structclone_encode(1, 2.3, "four", {5, "six"}))
     print("DONE")
-    -- local f = __rt.xxx_structclone_encode(1, 2.3, "four", {5, "six"})
-    -- print("xxx_structclone_encode =>", f)
+    -- local f = __rt.structclone_encode(1, 2.3, "four", {5, "six"})
+    -- print("structclone_encode =>", f)
     -- print("() =>", f())
 
     -- local W1 = __rt.spawn_worker(function()
