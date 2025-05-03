@@ -86,6 +86,7 @@ struct UWorker { // wkind == WorkerKind_USER
             // When a worker has exited, this holds the description of an error
             // which caused the worker to exit, or NULL if no error or if there are no waiters.
             // Memory is free'd by worker_free.
+            u32            errdesc_invalid; // 0 if errdesc is valid
             char* nullable errdesc;
         };
     };
@@ -107,5 +108,12 @@ struct AWorker { // wkind == WorkerKind_ASYNC
         AsyncWorkReq req;           // work currently being processed
     };
 };
+
+// UWorkerUVal is a Lua-managed (GC'd) wrapper around a internally managed Worker.
+// This allows a timer to be referenced by userland independently of its state.
+typedef struct UWorkerUVal {
+    UVal     uval;
+    UWorker* uw;
+} UWorkerUVal;
 
 API_END

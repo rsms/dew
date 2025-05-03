@@ -39,8 +39,8 @@ static bool pool_grow(Pool** pp, u32 newcap, usize elemsize) {
 	} else {
 		// new freebm overlap with existing entries, so we need to move the entries up
 		// before we set all bits to 1 in the new freebm chunk
-		void* oldfreebm = (void*)p->freebm + ((usize)oldcap >> 3);
-		void* newfreebm = (void*)p->freebm + ((usize)newcap >> 3);
+		void* oldfreebm = (u8*)p->freebm + ((usize)oldcap >> 3);
+		void* newfreebm = (u8*)p->freebm + ((usize)newcap >> 3);
 		memmove(newfreebm, oldfreebm, p->maxidx * elemsize);
 		*(u64*)oldfreebm = ~(u64)0; // set all bits to 1 (all slots are free);
 	}

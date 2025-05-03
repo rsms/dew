@@ -2,6 +2,7 @@
 #include "../dew.h"
 #include "array.h"
 #include "time.h"
+#include "uval.h"
 API_BEGIN
 
 typedef struct Timer     Timer;
@@ -18,6 +19,13 @@ struct Timer {
     void* nullable arg;    // passed to f
     TimerF         f;      // f can return non-NULL to have a T woken up
 };
+
+// TimerUVal is a Lua-managed (GC'd) wrapper around a internally managed Timer.
+// This allows a timer to be referenced by userland independently of its state.
+typedef struct TimerUVal {
+    UVal   uval;
+    Timer* timer;
+} TimerUVal;
 
 struct TimerInfo {
     Timer* timer;

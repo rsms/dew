@@ -34,7 +34,7 @@ inline static bool pool_entry_isfree(const Pool* p, u32 idx) {
 }
 
 inline static void* pool_entries(const Pool* p) {
-    return (void*)p->freebm + (p->cap >> 3); // + cap/bytes_per_freebm
+    return (u8*)p->freebm + (p->cap >> 3); // + cap/bytes_per_freebm
 }
 
 inline static void* pool_entry(const Pool* p, u32 idx, usize elemsize) {

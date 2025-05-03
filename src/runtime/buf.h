@@ -1,9 +1,11 @@
 // growable array usable via buf_* Lua functions
 #pragma once
 #include "../dew.h"
+#include "uval.h"
 API_BEGIN
 
 typedef struct Buf {
+    UVal         uval;
     usize        cap, len;
     u8* nullable bytes;
 } Buf;

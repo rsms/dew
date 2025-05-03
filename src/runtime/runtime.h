@@ -122,8 +122,8 @@ struct S {
 
 // L_t returns Lua state of task, while L_t returns task of Lua state.
 // T is stored in the LUA_EXTRASPACE in the head of Lua managed lua_State
-inline static lua_State* t_L(const T* t) { return (void*)t + sizeof(*t); }
-inline static T* L_t(lua_State* L) { return (void*)L - sizeof(T); }
+inline static lua_State* t_L(const T* t) { return (lua_State*)((u8*)t + sizeof(*t)); }
+inline static T* L_t(lua_State* L) { return (T*)((u8*)L - sizeof(T)); }
 
 
 S* nullable s_get_thread_local();

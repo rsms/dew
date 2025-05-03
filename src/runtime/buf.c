@@ -8,7 +8,7 @@ static u8 g_buf_luatabkey; // Buf object prototype
 
 int buf_free(Buf* buf) {
     // if 'bytes' does not point into embedded memory, free it
-    if (buf->bytes != (void*)buf + sizeof(*buf))
+    if (buf->bytes != (u8*)buf + sizeof(*buf))
         free(buf->bytes);
     return 0;
 }
@@ -28,7 +28,7 @@ bool buf_resize(Buf* buf, usize newcap) {
     // dlog("buf_resize %zu -> %zu", buf->cap, newcap);
 
     void* newbytes;
-    if (buf->bytes == (void*)buf + sizeof(*buf)) {
+    if (buf->bytes == (u8*)buf + sizeof(*buf)) {
         // current buffer data is embedded
         if (newcap < buf->cap) {
             // can't shrink embedded buffer, however we update cap & len to uphold the promise
@@ -105,7 +105,7 @@ int buf_append_luafun(Buf* buf, lua_State* L, bool strip_debuginfo) {
 
 
 Buf* nullable l_buf_check(lua_State* L, int idx) {
-    return l_uobj_check(L, idx, &g_buf_luatabkey, "Buf");
+    return uval_check(L, idx, UValType_Buf, "Buf");
 }
 
 
@@ -119,12 +119,12 @@ Buf* nullable l_buf_createx(lua_State* L, u64 cap) {
     int nuvalue = 0;
     // See comment in l_iodesc_create.
     // dlog("allocating buffer with cap %lu (total %zu B)", cap, sizeof(Buf) + (usize)cap);
-    Buf* buf = lua_newuserdatauv(L, sizeof(Buf) + (usize)cap, nuvalue);
+    Buf* buf = uval_new(L, UValType_Buf, sizeof(Buf) + (usize)cap, nuvalue);
     if (!buf)
         return NULL;
     buf->cap = (usize)cap;
     buf->len = 0;
-    buf->bytes = (void*)buf + sizeof(Buf);
+    buf->bytes = (u8*)buf + sizeof(Buf);
     lua_rawgetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
     lua_setmetatable(L, -2);
     return buf;
@@ -177,6 +177,30 @@ int l_buf_len(lua_State* L) {
 }
 
 
+int l_buf_eq(lua_State* L) {
+    Buf* a = l_buf_check(L, 1);
+    Buf* b = l_buf_check(L, 2);
+    if (!a || !b)
+        return 0;
+    lua_pushboolean(L, a->len == b->len && memcmp(a->bytes, b->bytes, a->len) == 0);
+    return 1;
+}
+
+
+int l_buf_compare(lua_State* L) {
+    Buf* a = l_buf_check(L, 1);
+    Buf* b = l_buf_check(L, 2);
+    if (!a || !b)
+        return 0;
+    usize min_len = (a->len < b->len) ? a->len : b->len;
+    i64 result = memcmp(a->bytes, b->bytes, min_len);
+    if (result == 0)
+        result = ((i64)a->len - (i64)b->len);
+    lua_pushinteger(L, result);
+    return 1;
+}
+
+
 int l_buf_str(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     if (!buf)
@@ -187,8 +211,8 @@ int l_buf_str(lua_State* L) {
     usize len = MIN(buf->len, maxlen);
     // lua_pushlstring(L, (char*)buf->bytes, len); return 1; // raw
 
-    // allocate destination buffer that's 2x the size of the input
-    usize dstcap = len * 2;
+    // allocate destination buffer that's 2x the size of the input, +1 byte for NUL
+    usize dstcap = len*2 + 1;
     usize dstcap_extra = (usize)(len < buf->len) * ELLIPSIS_LEN;
     char* dst = malloc(dstcap + dstcap_extra);
     if (dst == NULL)
@@ -205,7 +229,7 @@ int l_buf_str(lua_State* L) {
         }
 
         // check if output fit in dst
-        if (len2 <= dstcap) {
+        if (len2 < dstcap) {
             if (buf->len > maxlen) {
                 memcpy(&dst[len2], ELLIPSIS, ELLIPSIS_LEN);
                 len2 += ELLIPSIS_LEN;
@@ -216,7 +240,6 @@ int l_buf_str(lua_State* L) {
         }
 
         // grow dst
-        dlog("grow");
         dstcap = len2 + 1;
         char* dst2 = realloc(dst, dstcap + dstcap_extra);
         if (dst2 == NULL) {
@@ -239,6 +262,17 @@ void luaopen_buf(lua_State* L) {
 
     lua_pushcfunction(L, l_buf_len);
     lua_setfield(L, -2, "__len");
+
+    lua_pushcfunction(L, l_buf_eq);
+    lua_setfield(L, -2, "__eq");
+
+    // Setup __index table to allow accessing "methods"
+    lua_pushvalue(L, -1);  // Duplicate metatable
+    lua_setfield(L, -2, "__index");  // metatable.__index = metatable
+
+
+    lua_pushcfunction(L, l_buf_compare);
+    lua_setfield(L, -2, "compare");
 
     lua_rawsetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
 }

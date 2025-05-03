@@ -17,6 +17,7 @@ DEW_SRCS := \
 	src/hexdump.c \
 	src/snprintf_lval.c \
 	src/runtime/array.c \
+	src/runtime/uval.c \
 	src/runtime/buf.c \
 	src/runtime/chan.c \
 	src/runtime/fifo.c \

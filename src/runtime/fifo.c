@@ -53,7 +53,7 @@ static int _fifo_grow(FIFO** qp, usize elemsize, u32 maxcap) {
 	if (q->head > q->tail) {
 		u32 tailcount = q->cap - q->head;
 		u32 new_head = q->head + (newcap - q->cap);
-		void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
+		void* entries = (u8*)q + ALIGN2(sizeof(*q), elemsize);
 		void* dst = entries + (usize)new_head*elemsize;
 		void* src = entries + (usize)q->head*elemsize;
 		memmove(dst, src, tailcount*elemsize);
@@ -76,7 +76,7 @@ void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap) {
 		q = *qp;
 		newtail = (q->tail + 1) % q->cap;
 	}
-	void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
+	void* entries = (u8*)q + ALIGN2(sizeof(*q), elemsize);
 	void* entry = entries + (usize)q->tail*elemsize;
 	q->tail = newtail;
 	return entry;
@@ -86,7 +86,7 @@ void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap) {
 void* nullable fifo_pop(FIFO* q, usize elemsize) {
 	if (q->head == q->tail) // empty
 		return NULL;
-	void* entries = (void*)q + ALIGN2(sizeof(*q), elemsize);
+	void* entries = (u8*)q + ALIGN2(sizeof(*q), elemsize);
 	void* entry = entries + (usize)q->head*elemsize;
 	q->head = (q->head + 1) % q->cap;
 	return entry;

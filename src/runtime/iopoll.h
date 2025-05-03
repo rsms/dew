@@ -1,6 +1,7 @@
 // platform specific I/O facility
 #pragma once
 #include "../dew.h"
+#include "uval.h"
 #include "time.h"
 API_BEGIN
 
@@ -17,11 +18,11 @@ struct IOPoll {
 };
 
 struct IODesc {
-    T* nullable t;      // task to wake up on events
-    i32         fd;     // -1 if unused
-    u16         seq;    // sequence for detecting use after close
+    UVal        uval;
     u8          events; // 'r', 'w' or 'r'+'w' (114, 119 or 233)
-    u8          _unused;
+    u16         seq;    // sequence for detecting use after close
+    i32         fd;     // -1 if unused
+    T* nullable t;      // task to wake up on events
     i64         nread;  // bytes available to read, or -errno on error
     i64         nwrite; // bytes available to write, or -errno on error
 };

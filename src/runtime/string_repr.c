@@ -9,6 +9,9 @@ usize string_hex(char* dst, usize dstcap, const u8* src, usize srclen) {
         dst[i*2]     = hexchars[b >> 4];
         dst[i*2 + 1] = hexchars[b & 0xf];
     }
+    // NUL terminate if there's room
+    if (dstcap > srclen*2)
+        dst[srclen*2] = 0;
     return srclen * 2;
 }
 
@@ -28,7 +31,7 @@ usize string_repr(char* dst, usize dstcap, const void* src, usize srclen) {
 
     for (usize i = 0; i < srclen; i++) {
         u8 c = *(u8*)src++;
-        //dlog("[%zu/%zu] 0x%02x '%c'", i, srclen, c, isprint(c) ? c : ' ');
+        // dlog("[%zu/%zu] 0x%02x", i, srclen, c);
         switch (c) {
             // \xHH
             case '\1'...'\x08':
@@ -54,7 +57,7 @@ usize string_repr(char* dst, usize dstcap, const void* src, usize srclen) {
             case '\t'...'\x0D':
             case '\\':
             case '"':
-            case '\0': {
+            case 0: {
                 static const char t[] = {'t','n','v','f','r'};
                 if (LIKELY( p + 1 < lastp )) {
                     p[0] = '\\';

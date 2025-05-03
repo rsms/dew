@@ -2,7 +2,7 @@
 
 
 void array_free(struct Array* a) {
-	if (a->v != (void*)a+sizeof(*a))
+	if (a->v != (u8*)a+sizeof(*a))
 		free(a->v);
 }
 
@@ -15,7 +15,7 @@ static void* nullable _array_resize(struct Array* a, u32 elemsize, u32 newcap) {
 			return NULL;
 		// dlog("resize array %p: %zu -> %zu B", a, (usize)elemsize*a->cap, newsize);
 		void* newv;
-		if (a->v == (void*)a+sizeof(*a)) { // embedded
+		if (a->v == (u8*)a+sizeof(*a)) { // embedded
 			newv = malloc(newsize);
 			if (newv)
 				memcpy(newv, a->v, (usize)elemsize * a->len);

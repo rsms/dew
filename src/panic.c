@@ -24,7 +24,7 @@ void _panic(const char* file, int line, const char* fun, const char* fmt, ...) {
 	fprintf(fp, " in %s at %s:%d\n", fun, file, line);
 
 	#ifdef HAS_BACKTRACE
-		void* buf[32];
+		void* buf[128];
 		int framecount = backtrace(buf, countof(buf));
 		if (framecount > 1) {
 			char** strs = backtrace_symbols(buf, framecount);

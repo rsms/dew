@@ -172,6 +172,7 @@ end
 
 
 -- Runtime dev
+-- require("tests/rt/structclone")
 -- require("tests/rt/worker-send-recv")
 
 main(arg)

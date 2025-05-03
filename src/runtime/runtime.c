@@ -41,11 +41,11 @@
 #ifdef TRACE_SCHED_WORKER
 	#define trace_worker(fmt, ...) ( \
 		tls_s_id && tls_w_id ? dlog("\e[1;32m%-15.15s W%-2u│\e[0m S%-2u " fmt, \
-		                            __FUNCTION__, tls_w_id, tls_s_id, ##__VA_ARGS__) : \
+									__FUNCTION__, tls_w_id, tls_s_id, ##__VA_ARGS__) : \
 		tls_w_id ?             dlog("\e[1;32m%-15.15s W%-2u│\e[0m " fmt, \
-		                            __FUNCTION__, tls_w_id, ##__VA_ARGS__) : \
-		                       dlog("\e[1;32m%-15.15s S%-2u│\e[0m " fmt, \
-		                            __FUNCTION__, tls_s_id, ##__VA_ARGS__) \
+									__FUNCTION__, tls_w_id, ##__VA_ARGS__) : \
+							   dlog("\e[1;32m%-15.15s S%-2u│\e[0m " fmt, \
+									__FUNCTION__, tls_s_id, ##__VA_ARGS__) \
 	)
 #else
 	#define trace_worker(fmt, ...) ((void)0)
@@ -56,9 +56,9 @@
 static_assert(sizeof(T) == LUA_EXTRASPACE, "");
 
 
-static u8 g_reftabkey;            // table of objects with compex lifetime, to avoid GC
-static u8 g_timerobj_luatabkey;   // Timer object prototype
-static u8 g_uworkerobj_luatabkey; // Worker object prototype
+static u8 g_reftabkey;              // table of objects with compex lifetime, to avoid GC
+static u8 g_timerobj_luatabkey;     // Timer object prototype
+static u8 g_uworker_uval_luatabkey; // Worker object prototype
 
 // tls_s holds S for the current thread
 static _Thread_local S* tls_s = NULL;
@@ -115,12 +115,12 @@ static int l_errstr(lua_State* L) {
 // This is similar to lua_xmove but copies instead of moves.
 // Note: src & dst must belong to the same OS thread (not different Workers.)
 static void l_copy_values(lua_State* src, lua_State* dst, int n) {
-    assertf(lua_gettop(src) >= n, "src has at least n values at indices 1 .. n");
-    // make copies of the arguments onto the top of src stack
-    for (int i = 1; i <= n; i++)
-        lua_pushvalue(src, i);
-    // move them to dst
-    lua_xmove(src, dst, n);
+	assertf(lua_gettop(src) >= n, "src has at least n values at indices 1 .. n");
+	// make copies of the arguments onto the top of src stack
+	for (int i = 1; i <= n; i++)
+		lua_pushvalue(src, i);
+	// move them to dst
+	lua_xmove(src, dst, n);
 }
 
 
@@ -254,7 +254,7 @@ S* s_get_thread_local() {
 
 inline static int t_suspend(T* t, u8 tstatus, void* nullable arg, TaskContinuation nullable cont) {
 	assertf(tstatus != T_READY || tstatus != T_RUNNING || tstatus != T_DEAD,
-	        "%s", t_status_str(tstatus));
+			"%s", t_status_str(tstatus));
 	trace_sched(T_ID_F " %s", t_id(t), t_status_str(tstatus));
 	t->status = tstatus;
 	return lua_yieldk(t_L(t), 0, (intptr_t)arg, (int(*)(lua_State*,int,u64))cont);
@@ -345,20 +345,8 @@ static T* nullable s_timers_check(S* s) {
 }
 
 
-// TimerObj is a Lua-managed (GC'd) wrapper around a internally managed Timer.
-// This allows a timer to be referenced by userland independently of its state.
-typedef struct TimerObj {
-	Timer* timer;
-} TimerObj;
-
-
-static TimerObj* nullable l_timerobj_check(lua_State* L, int idx) {
-	return l_uobj_check(L, idx, &g_timerobj_luatabkey, "Timer");
-}
-
-
 static int l_timerobj_gc(lua_State* L) {
-	TimerObj* obj = lua_touserdata(L, 1);
+	TimerUVal* obj = lua_touserdata(L, 1);
 	// dlog("*** l_timerobj_gc %p ***", obj->timer);
 	timer_release(obj->timer);
 	return 0;
@@ -432,7 +420,7 @@ static int l_timer_start(lua_State* L) {
 	}
 
 	// create ref
-	TimerObj* obj = lua_newuserdatauv(L, sizeof(TimerObj), 0);
+	TimerUVal* obj = uval_new(L, UValType_Timer, sizeof(TimerUVal), 0);
 	if UNLIKELY(!obj) {
 		timers_remove(&t->s->timers, timer);
 		free(timer);
@@ -440,6 +428,7 @@ static int l_timer_start(lua_State* L) {
 		return 0;
 	}
 	timer->nrefs++;
+	obj->uval.type = UValType_Timer;
 	obj->timer = timer;
 	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_timerobj_luatabkey);
 	lua_setmetatable(L, -2);
@@ -452,7 +441,7 @@ static int l_timer_start(lua_State* L) {
 // fun timer_update(timer Timer, when Time, period, leeway TimeDuration)
 static int l_timer_update(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	TimerObj* obj = l_timerobj_check(L, 1);
+	TimerUVal* obj = uval_check(L, 1, UValType_Timer, "Timer");
 	DTime when = luaL_checkinteger(L, 2);
 	DTimeDuration period = luaL_checkinteger(L, 3);
 	DTimeDuration leeway = luaL_checkinteger(L, 4);
@@ -495,10 +484,10 @@ static int l_timer_update(lua_State* L) {
 // fun timer_stop(timer Timer)
 static int l_timer_stop(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	TimerObj* obj = l_timerobj_check(L, 1);
+	TimerUVal* obj = uval_check(L, 1, UValType_Timer, "Timer");
 
-	if (obj->timer->when == (DTime)-1)
-		return 0; // already expired
+	if (!obj || obj->timer->when == (DTime)-1)
+		return 0; // not a timer or already expired
 
 	timers_remove(&t->s->timers, obj->timer);
 	timer_release(obj->timer); // release our internal reference
@@ -533,8 +522,8 @@ static int l_sleep(lua_State* L) {
 		trace_sched(T_ID_F " sleep %.3f ms", t_id(t), (double)delay / D_TIME_MILLISECOND);
 	} else {
 		trace_sched(T_ID_F " sleep %.3f ms (%.3f ms leeway)", t_id(t),
-		            (double)delay / D_TIME_MILLISECOND,
-		            (double)leeway / D_TIME_MILLISECOND);
+					(double)delay / D_TIME_MILLISECOND,
+					(double)leeway / D_TIME_MILLISECOND);
 	}
 
 	// increment task's "live timers" counter
@@ -764,7 +753,7 @@ static const char* l_fmt_error(lua_State* L) {
 	const char* msg = lua_tostring(L, -1);
 	if (msg == NULL) { /* is error object not a string? */
 		if (luaL_callmeta(L, 1, "__tostring") &&  /* does it have a metamethod */
-		    lua_type(L, -1) == LUA_TSTRING)       /* that produces a string? */
+			lua_type(L, -1) == LUA_TSTRING)       /* that produces a string? */
 		{
 			/* that is the message */
 		} else {
@@ -963,7 +952,7 @@ static void t_wake_waiters(T* t, u32 waiters) {
 		T* waiting_t = s_task(s, tid);
 
 		assert(waiting_t->status == T_WAIT_TASK ||
-		       waiting_t->status == T_WAIT_SEND);
+			   waiting_t->status == T_WAIT_SEND);
 
 		trace_sched("wake " T_ID_F " waiting on " T_ID_F, t_id(waiting_t), t_id(t));
 
@@ -986,7 +975,7 @@ static void t_wake_waiters(T* t, u32 waiters) {
 
 static UWorker* s_worker(S* s) {
 	assert(s->isworker);
-	return (void*)s - offsetof(UWorker, s);
+	return (UWorker*)((u8*)s - offsetof(UWorker, s));
 }
 
 
@@ -1024,7 +1013,9 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 				// main task of a worker; only report error if no task is waiting for worker
 				UWorker* w = s_worker(s);
 				if (atomic_load_explicit(&w->w.waiters, memory_order_acquire)) {
-					free(w->errdesc); // just in case...
+					if (!w->errdesc_invalid)
+						free(w->errdesc); // just in case...
+					w->errdesc_invalid = 0;
 					w->errdesc = t_report_error_buf(t);
 					#if DEBUG
 					t_report_error(t, "[DEBUG] Uncaught error in worker");
@@ -1048,7 +1039,7 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 	// decrement "live tasks" counter
 	if (s->nlive == 0) {
 		dlog("error: s->nlive==0 while task " T_ID_F " is still alive in " S_ID_F,
-		     t_id(t), s_id(t->s));
+			 t_id(t), s_id(t->s));
 		assert(s->nlive > 0);
 	}
 	s->nlive--;
@@ -1180,7 +1171,8 @@ static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 	T* t = L_t(NL);
 	memset(t, 0, sizeof(*t));
 	t->s = s;
-	if (parent) t->parent = parent->tid;
+	if (parent)
+		t->parent = parent->tid;
 	t->nrefs = 1; // S's "live" reference
 	t->resume_nres = nargs;
 
@@ -1303,8 +1295,8 @@ static void t_worker_msg_stow(T* t, InboxMsg* msg) {
 	lua_rawseti(dst_L, -2, 1);  // Store in table at index 1
 
 	for (int i = 2; i <= msg->nres; i++) {
-        lua_pushinteger(dst_L, 123); // TODO
-        lua_rawseti(dst_L, -2, i);   // Store in table at index (i-1)
+		lua_pushinteger(dst_L, 123); // TODO
+		lua_rawseti(dst_L, -2, i);   // Store in table at index (i-1)
 	}
 
 	msg->msg.ref = luaL_ref(dst_L, LUA_REGISTRYINDEX);
@@ -1429,7 +1421,7 @@ static int s_finalize(S* s) {
 	// stop main task
 	if (s->nlive > 0) {
 		assertf(!pool_entry_isfree(s->tasks, 1),
-		        "main task is DEAD but other tasks are still alive");
+				"main task is DEAD but other tasks are still alive");
 		t_stop(NULL, s_task(s, 1));
 	}
 
@@ -1624,21 +1616,13 @@ static int l_main(lua_State* L) {
 }
 
 
-// UWorkerObj is a Lua-managed (GC'd) wrapper around a internally managed Worker.
-// This allows a timer to be referenced by userland independently of its state.
-typedef struct UWorkerObj { UWorker* uw; } UWorkerObj;
-
-static UWorkerObj* nullable l_uworkerobj_check(lua_State* L, int idx) {
-	return l_uobj_check(L, idx, &g_uworkerobj_luatabkey, "Worker");
-}
-
-
 int luaopen_runtime(lua_State* L);
 
 
 static void worker_free(Worker* w) {
-	trace_worker("free");
-	if (w->wkind == WorkerKind_USER) {
+	trace_worker("free Worker %p", w);
+	if (w->wkind == WorkerKind_USER && !((UWorker*)w)->errdesc_invalid) {
+		trace_worker("free UWorker.errdesc %p", ((UWorker*)w)->errdesc);
 		free(((UWorker*)w)->errdesc);
 		((UWorker*)w)->errdesc = NULL;
 	}
@@ -1670,11 +1654,11 @@ static bool worker_add_waiter(Worker* w, T* waiter_task) {
 }
 
 
-static int l_uworkerobj_gc(lua_State* L) {
-	UWorkerObj* obj = lua_touserdata(L, 1);
+static int l_uworker_uval_gc(lua_State* L) {
+	UWorkerUVal* uv = lua_touserdata(L, 1);
 	trace_worker("GC");
-	worker_close((Worker*)obj->uw);
-	worker_release((Worker*)obj->uw);
+	worker_close((Worker*)uv->uw);
+	worker_release((Worker*)uv->uw);
 	return 0;
 }
 
@@ -1790,8 +1774,8 @@ static void uworker_main(UWorker* w) {
 
 	// free memory back to malloc so we don't hold on to it "forever"
 	free(w->mainfun_lcode);
+	w->mainfun_lcode_len = 0; // sets errdesc_invalid=0
 	w->mainfun_lcode = NULL;
-	w->mainfun_lcode_len = 0;
 
 	// check if load succeeded
 	if UNLIKELY(status != LUA_OK) {
@@ -1977,15 +1961,15 @@ static int l_spawn_worker(lua_State* L) {
 	}
 
 	// allocate & return Worker object so that we know when the user is done with it (GC)
-	UWorkerObj* obj = lua_newuserdatauv(L, sizeof(UWorkerObj), 0);
-	if UNLIKELY(!obj) {
+	UWorkerUVal* uval = uval_new(L, UValType_UWorker, sizeof(UWorkerUVal), 0);
+	if UNLIKELY(!uval) {
 		worker_close((Worker*)uw);
 		worker_release((Worker*)uw);
 		return 0;
 	}
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_uworkerobj_luatabkey);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_uworker_uval_luatabkey);
 	lua_setmetatable(L, -2);
-	obj->uw = uw;
+	uval->uw = uw;
 
 	return 1;
 }
@@ -2120,14 +2104,14 @@ static void l_syscall_addrinfo_cont_mkres(lua_State* L, AddrInfoReq* aireq) {
 		KV_I("socktype", rp->ai_socktype);
 		KV_I("protocol", rp->ai_protocol);
 		if (rp->ai_family == AF_INET) {
-			struct sockaddr_in *ipv4 = (struct sockaddr_in *)rp->ai_addr;
-			KV_I("port", ntohs(ipv4->sin_port));
-			if (inet_ntop(AF_INET, &(ipv4->sin_addr), addr_str, INET_ADDRSTRLEN) != NULL)
+			struct sockaddr_in* sa = (struct sockaddr_in*)rp->ai_addr;
+			KV_I("port", ntohs(sa->sin_port));
+			if (inet_ntop(AF_INET, &(sa->sin_addr), addr_str, INET_ADDRSTRLEN) != NULL)
 				KV_S("addr", addr_str);
 		} else if (rp->ai_family == AF_INET6) {
-			struct sockaddr_in6 *ipv6 = (struct sockaddr_in6 *)rp->ai_addr;
-			KV_I("port", ntohs(ipv6->sin6_port));
-			if (inet_ntop(AF_INET6, &(ipv6->sin6_addr), addr_str, INET6_ADDRSTRLEN) != NULL)
+			struct sockaddr_in6* sa = (struct sockaddr_in6*)rp->ai_addr;
+			KV_I("port", ntohs(sa->sin6_port));
+			if (inet_ntop(AF_INET6, &(sa->sin6_addr), addr_str, INET6_ADDRSTRLEN) != NULL)
 				KV_S("addr", addr_str);
 		}
 
@@ -2292,8 +2276,8 @@ static int l_connect_cont(lua_State* L, __attribute__((unused)) int ltstatus, IO
 	trace_sched(T_ID_F, t_id(t));
 
 	dlog("d events=%s nread=%ld nwrite=%ld",
-	     d->events == 'r'+'w' ? "rw" : d->events == 'r' ? "r" : d->events == 'w' ? "w" : "0",
-	     d->nread, d->nwrite);
+		 d->events == 'r'+'w' ? "rw" : d->events == 'r' ? "r" : d->events == 'w' ? "w" : "0",
+		 d->nread, d->nwrite);
 
 	// check for connection failure on darwin, which sets EOF, which we propagate as r+w
 	#if defined(__APPLE__)
@@ -2442,9 +2426,9 @@ static int l_msg_stow(lua_State* src_L, lua_State* dst_L, InboxMsg* msg) {
 	lua_rawseti(dst_L, -2, 1);  // Store in table at index 1
 
 	for (int i = 2; i <= msg->nres; i++) {
-        lua_pushvalue(src_L, i);    // Get argument from its position in src_L ...
-        lua_xmove(src_L, dst_L, 1); // ... and move it to dst_L
-        lua_rawseti(dst_L, -2, i);  // Store in table at index (i-1)
+		lua_pushvalue(src_L, i);    // Get argument from its position in src_L ...
+		lua_xmove(src_L, dst_L, 1); // ... and move it to dst_L
+		lua_rawseti(dst_L, -2, i);  // Store in table at index (i-1)
 	}
 
 	#ifdef DEBUG
@@ -2471,7 +2455,7 @@ static int l_msg_unload(lua_State* dst_L, InboxMsg* msg) {
 	// Stack index 1 is occupied by msg->type, pushed by l_recv_deliver.
 	lua_rawgeti(dst_L, LUA_REGISTRYINDEX, msg->msg.ref); // Get the payload table
 	assertf(lua_type(dst_L, 2) == LUA_TTABLE,
-	        "%s", lua_typename(dst_L, lua_type(dst_L, 2)));
+			"%s", lua_typename(dst_L, lua_type(dst_L, 2)));
 	for (int i = 1; i <= msg->nres; i++) {
 		lua_rawgeti(dst_L, 2, i); // get value i from table
 		assert(!lua_isnoneornil(dst_L, -1));
@@ -2636,8 +2620,10 @@ static int l_send_task(lua_State* L) {
 }
 
 
+// fun structclone_encode(flags uint, transfer_list [any], value ...any) Buf
 static int l_structclone_encode(lua_State* L) {
 	u64 flags = luaL_checkinteger(L, 1);
+	// ignore arg 2 "transfer_list" for now, until it's supported
 
 	// create buffer (lifetime managed by GC)
 	Buf* buf = l_buf_createx(L, 512);
@@ -2649,16 +2635,24 @@ static int l_structclone_encode(lua_State* L) {
 
 	// L's stack should now look like this:
 	//   buffer (userdata)
+	//   transfer_list
 	//   arg1
 	//   arg2
 	//   argN
 
-	int nargs = lua_gettop(L) - 1; // -1: not including buf nor flags
+	// tell structclone_encode that there's a transfer_list (even if nil) on the stack
+	flags |= StructCloneEnc_TRANSFER_LIST;
+
+	int nargs = lua_gettop(L) - 2; // -2: not including buf or transfer_list
 	int err = structclone_encode(L, buf, flags, nargs);
 	if UNLIKELY(err)
 		return 0;
 
+	// pop transfer_list
+	lua_pop(L, 1);
+
 	// return buffer
+	dlog_lua_stackf(L, "ret");
 	return 1;
 }
 
@@ -2674,10 +2668,10 @@ static int l_structclone_decode(lua_State* L) {
 
 static int l_send_worker(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	UWorkerObj* obj = l_uobj_check(L, 1, &g_uworkerobj_luatabkey, "Task or Worker");
-	if (!obj)
+	UWorkerUVal* uval = uval_check(L, 1, UValType_UWorker, "Task or Worker");
+	if (!uval)
 		return 0;
-	UWorker* uw = obj->uw;
+	UWorker* uw = uval->uw;
 
 	// structurally clone the arguments
 	int nargs = lua_gettop(L) - 1; // -1: not including worker
@@ -2779,7 +2773,10 @@ static int l_await_worker_cont1(lua_State* L, UWorker* uw) {
 	}
 	// worker exited because of an error
 	lua_pushboolean(L, false);
-	lua_pushstring(L, (uw->errdesc && *uw->errdesc) ? uw->errdesc : "unknown error");
+	const char* errdesc = "unknown error";
+	if (!uw->errdesc_invalid && uw->errdesc && *uw->errdesc)
+		errdesc = uw->errdesc;
+	lua_pushstring(L, errdesc);
 	return 2;
 }
 
@@ -2789,15 +2786,14 @@ static int l_await_worker_cont(lua_State* L, int ltstatus, void* arg) {
 }
 
 
-
 // fun await(w Worker) (ok bool, err string)
 // Returns true if w exited cleanly or false if w exited because of an error.
 static int l_await_worker(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	UWorkerObj* obj = l_uobj_check(L, 1, &g_uworkerobj_luatabkey, "Task or Worker");
-	if (!obj)
+	UWorkerUVal* uval = uval_check(L, 1, UValType_UWorker, "Task or Worker");
+	if (!uval)
 		return 0;
-	UWorker* uw = obj->uw;
+	UWorker* uw = uval->uw;
 
 	// can't await the worker the calling task is running on
 	if UNLIKELY(t->s == &uw->s)
@@ -2841,12 +2837,44 @@ static int l_monotime(lua_State* L) {
 }
 
 
+// fun typename(v any) str
+static int l_typename(lua_State* L) {
+	int t = lua_type(L, 1);
+	if (t == LUA_TNUMBER) {
+		int isint;
+		i64 val = lua_tointegerx(L, 1, &isint);
+		lua_pushstring(L, isint ? "int" : "float");
+		return 1;
+	} else if (t == LUA_TTHREAD) {
+		// check if it's a task
+		lua_State* TL = assertnotnull(lua_tothread(L, 1));
+		T* t = L_t(TL);
+		if (t->s) {
+			lua_pushstring(L, "Task");
+			return 1;
+		}
+	} else if (t == LUA_TUSERDATA && lua_getmetatable(L, 1)) {
+		// use __name from metatable if available
+		lua_getfield(L, -1, "__name");
+		if (!lua_isnil(L, -1))
+			return 1;
+		lua_pop(L, 2); // pop nil and metatable
+	}
+	// fall back to Lua's builtin type(v) function
+	lua_getglobal(L, "type");
+	lua_pushvalue(L, 1);
+	lua_call(L, 1, 1);
+	return 1;
+}
+
+
 static const luaL_Reg dew_lib[] = {
 	{"intscan", l_intscan},
 	{"intfmt", l_intfmt},
 	{"intconv", l_intconv},
 	{"errstr", l_errstr},
 	{"monotime", l_monotime},
+	{"typename", l_typename},
 
 	// "new" runtime API
 	{"main", l_main},
@@ -2866,6 +2894,8 @@ static const luaL_Reg dew_lib[] = {
 	{"await", l_await},
 	{"recv", l_recv},
 	{"send", l_send},
+	{"structclone_encode", l_structclone_encode},
+	{"structclone_decode", l_structclone_decode},
 
 	// potentially long-time blocking syscalls, performed in worker thread pool
 	{"syscall_nanosleep", l_syscall_nanosleep},
@@ -2874,8 +2904,6 @@ static const luaL_Reg dew_lib[] = {
 	// WIP
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
-	{"structclone_encode", l_structclone_encode},
-	{"structclone_decode", l_structclone_decode},
 
 	// wasm experiment
 	#ifdef __wasm__
@@ -2892,6 +2920,13 @@ int luaopen_runtime(lua_State* L) {
 	g_L = L; // wasm experiment
 	#endif
 
+	// // Override the built-in type function
+	// lua_getglobal(L, "type");
+	// lua_pushvalue(L, -1);
+	// lua_setglobal(L, "_lua_type"); // save original function
+	// lua_pushcfunction(L, l_type);
+	// lua_setglobal(L, "type");
+
 	luaL_newlib(L, dew_lib);
 
 	luaopen_iopoll(L);
@@ -2905,9 +2940,9 @@ int luaopen_runtime(lua_State* L) {
 
 	// Worker
 	luaL_newmetatable(L, "Worker");
-	lua_pushcfunction(L, l_uworkerobj_gc);
+	lua_pushcfunction(L, l_uworker_uval_gc);
 	lua_setfield(L, -2, "__gc");
-	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_uworkerobj_luatabkey);
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_uworker_uval_luatabkey);
 
 	// export libc & syscall constants
 	#define _(NAME) \

@@ -773,6 +773,7 @@
 	// SIZEOF_DEW_T = sizeof(struct T)
 	// Note: sizeof(lua_State) = 200 (when sizeof(void*) = 8)
 
+	// LUA_KCONTEXT is the type of the context ('ctx') for continuation functions
 	#undef  LUA_KCONTEXT
 	#define LUA_KCONTEXT unsigned long
 
@@ -785,7 +786,7 @@
 	typedef struct lua_State lua_State;
 	typedef struct T T;
 	void t_gc(lua_State* L, T*);
-	#define luai_userstatefree(L, L1) t_gc((L), (T*)((void*)(L1) - SIZEOF_DEW_T))
+	#define luai_userstatefree(L, L1) t_gc((L), (T*)((unsigned char*)(L1) - SIZEOF_DEW_T))
 #else
 	#define LUA_EXTRASPACE		0
 #endif

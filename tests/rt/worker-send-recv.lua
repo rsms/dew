@@ -7,21 +7,23 @@ __rt.main(function()
     -- local a1 = {"a1", 2, 3, 4}
     -- local buf = __rt.structclone_encode(a1)
 
+    local buf1 = __rt.structclone_encode(0, "hello!")
+
     -- local a1 = {"A", "B", {22, 222}, 3}
     local long_string1 = "really long string that will be referenced 1"
     local long_string2 = "really long string that will be referenced 2"
     local a1 = {"A", "B", long_string1, long_string1, long_string2, long_string2}
-    -- a1[#a1 + 1] = long_string1
     a1[#a1 + 1] = a1
     a1[#a1 + 1] = {x=1, y=3, z=4, [long_string1]=5}
-    local function mul(x, y)
-        local outer = a1 -- will become nil
-        return x * y
-    end
-    a1[#a1 + 1] = mul
-    a1[#a1 + 1] = mul
+    -- local function mul(x, y)
+    --     local outer = a1 -- will become nil
+    --     return x * y
+    -- end
+    -- a1[#a1 + 1] = mul
+    -- a1[#a1 + 1] = buf1
     -- a1[#a1 + 1] = "really long string that will not be referenced"
-    local buf = __rt.structclone_encode(0, a1, long_string1)
+    local buf = __rt.structclone_encode(0, buf1, 31)
+    -- local buf = __rt.structclone_encode(0, a1, long_string1, buf1)
     -- local buf = __rt.structclone_encode(a1, 9, a1)
 
     -- local a1 = {"a1"}
@@ -53,9 +55,11 @@ __rt.main(function()
                 print_table(item, 1)
             end
         else
-            print("#" .. i .. " =", type(item), item)
+            print("#" .. i .. " =", __rt.typename(item), item)
         end
     end
+    -- print("worker:", __rt.typename(__rt.spawn_worker(function() end)))
+    -- print("task:", __rt.typename(__rt.spawn_task(function() end)))
     -- t[#t + 1] = 4
     -- print_table(t)
 

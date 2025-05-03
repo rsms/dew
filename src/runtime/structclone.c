@@ -4,26 +4,22 @@
 #include "../lua/llimits.h" // LUAI_MAXSHORTLEN
 
 enum SCTag {
-    SCTag_HEADER,
-
-    SCTag_NIL,
-    SCTag_BOOL_FALSE,
-    SCTag_BOOL_TRUE,
-    SCTag_INTZ, // small integer embedded in tag, where value fits in 8-SCTagTypeBits bits
-    SCTag_INT,  // 8-byte integer
-    SCTag_FLOAT,
-    SCTag_STR1, // short string with 1-byte size prefix; up to 255 B
-    SCTag_STR4, // long string with 4-byte size prefix; up to 4.0 GiB
-    SCTag_ARRAY,
-    SCTag_DICT,
-    SCTag_FUN,
-
-    SCTag_REFZ, // reference to an already-serialized value (embedded in tag)
-    SCTag_REF,  // reference to an already-serialized value (u24)
-
-    // SCTag_BUF, // transfer a buffer
-
-    SCTag_MAX = SCTag_REF
+    SCTag_HEADER = 0x0,
+    SCTag_NIL    = 0x1,
+    SCTag_BOOL   = 0x2, // first bit of tag val tells if its true or false
+    SCTag_INTZ   = 0x3, // small integer embedded in tag, where value fits in 8-SCTagTypeBits bits
+    SCTag_INT    = 0x4, // 8-byte integer
+    SCTag_FLOAT  = 0x5,
+    SCTag_STR1   = 0x6, // short string with 1-byte size prefix; up to 255 B
+    SCTag_STR4   = 0x7, // long string with 4-byte size prefix; up to 4.0 GiB
+    SCTag_ARRAY  = 0x8,
+    SCTag_DICT   = 0x9,
+    SCTag_FUN    = 0xA,
+    SCTag_UVAL   = 0xB,
+    SCTag_REFZ   = 0xC, // reference to an already-serialized value (embedded in tag)
+    SCTag_REF    = 0xD, // reference to an already-serialized value (u24)
+    // UNUSED    = 0xE,
+    SCTag_MAX    = SCTag_REF
 };
 
 #define CODEC_VERSION 1 // stream codec version
@@ -61,9 +57,6 @@ static_assert(SCTag_MAX <= SCTagTypeMax, "SCTagTypeBits too small for SCTag_MAX"
     #define sc_trace(fmt, ...) ((void)0)
 #endif
 
-// SC_PANIC_ON_ERROR: enable to panic() when an error occurs (for debugging)
-#define SC_PANIC_ON_ERROR 1
-
 
 typedef struct Encoder {
     Buf*  buf;
@@ -98,20 +91,20 @@ static void decode_value(lua_State* L, Decoder* dec);
 
 static const char* SCTagStr(u8 tag) {
     switch((enum SCTag)tag) {
-        case SCTag_HEADER:     return "HEADER";
-        case SCTag_NIL:        return "NIL";
-        case SCTag_BOOL_FALSE: return "BOOL_FALSE";
-        case SCTag_BOOL_TRUE:  return "BOOL_TRUE";
-        case SCTag_INTZ:       return "INTZ";
-        case SCTag_INT:        return "INT";
-        case SCTag_FLOAT:      return "FLOAT";
-        case SCTag_STR1:       return "STR1";
-        case SCTag_STR4:       return "STR4";
-        case SCTag_ARRAY:      return "ARRAY";
-        case SCTag_DICT:       return "DICT";
-        case SCTag_FUN:        return "FUN";
-        case SCTag_REFZ:       return "REFZ";
-        case SCTag_REF:        return "REF";
+        case SCTag_HEADER: return "HEADER";
+        case SCTag_NIL:    return "NIL";
+        case SCTag_BOOL:   return "BOOL";
+        case SCTag_INTZ:   return "INTZ";
+        case SCTag_INT:    return "INT";
+        case SCTag_FLOAT:  return "FLOAT";
+        case SCTag_STR1:   return "STR1";
+        case SCTag_STR4:   return "STR4";
+        case SCTag_ARRAY:  return "ARRAY";
+        case SCTag_DICT:   return "DICT";
+        case SCTag_FUN:    return "FUN";
+        case SCTag_UVAL:   return "UVAL";
+        case SCTag_REFZ:   return "REFZ";
+        case SCTag_REF:    return "REF";
     }
     static char buf[4];
     sprintf(buf, "?%02x", tag);
@@ -132,8 +125,8 @@ static void _codec_error(lua_State* L, int* err_no_dst, int err_no, const char* 
     lua_concat(L, 2);
     // dew API function will call lua_error(L)
 
-    #if SC_PANIC_ON_ERROR
-        panic("%s", lua_tostring(L, -1));
+    #if SC_TRACE
+        panic("[sc_trace] %s", lua_tostring(L, -1));
     #endif
 }
 
@@ -355,11 +348,13 @@ static void decode_nil(lua_State* L, Decoder* dec) {
 
 
 static void encode_bool(lua_State* L, Encoder* enc, int vi) {
-    enc_append_byte(L, enc, lua_toboolean(L, vi) ? SCTag_BOOL_TRUE : SCTag_BOOL_FALSE);
+    u8 b = (u8)SCTag_BOOL | ((u8)lua_toboolean(L, vi) << SCTagValShift);
+    enc_append_byte(L, enc, b);
 }
 
 static void decode_bool(lua_State* L, Decoder* dec) {
-    lua_pushboolean(L, dec->buf[0] == SCTag_BOOL_TRUE);
+    int v = (int)((u8)dec->buf[0] >> SCTagValShift);
+    lua_pushboolean(L, v);
     dec->buf++;
 }
 
@@ -536,8 +531,7 @@ static void decode_array(lua_State* L, Decoder* dec) {
         assert(dec->buf <= dec->bufend);
     }
 
-    if UNLIKELY(dec->buf > dec->bufend)
-        codec_error(L, dec, EOVERFLOW, "BUG in structured clone decoder (buffer overrun)");
+    assertf(dec->buf <= dec->bufend, "buffer overrun");
 }
 
 
@@ -564,8 +558,74 @@ static void decode_dict(lua_State* L, Decoder* dec) {
         assert(dec->buf <= dec->bufend);
     }
 
-    if UNLIKELY(dec->buf > dec->bufend)
-        codec_error(L, dec, EOVERFLOW, "BUG in structured clone decoder (buffer overrun)");
+    assertf(dec->buf <= dec->bufend, "buffer overrun");
+}
+
+
+static void encode_uval_buf(lua_State* L, Encoder* enc, int vi, Buf* buf) {
+    if (!enc_ref_intern(L, enc, vi))
+        return;
+
+    usize needbytes = 2 + sizeof(u64) + buf->len; // header + uval_type + buf.len + buf.bytes
+    if UNLIKELY(!buf_reserve(enc->buf, needbytes))
+        return enc_error_nomem(L, enc);
+
+    usize bufstart = enc->buf->len;
+    u8* dst = &enc->buf->bytes[enc->buf->len];
+    enc->buf->len += needbytes;
+
+    *dst++ = SCTag_UVAL;
+    *dst++ = buf->uval.type;
+    u64 len = buf->len;
+    memcpy(dst, &len, sizeof(u64)); dst += sizeof(u64);
+    memcpy(dst, buf->bytes, buf->len);
+}
+
+
+static void decode_uval_buf(lua_State* L, Decoder* dec) {
+    usize bufavail = dec->bufend - dec->buf;
+    if UNLIKELY(bufavail < sizeof(u64))
+        return dec_error_short(L, dec);
+    u64 len;
+    memcpy(&len, dec->buf, sizeof(u64)); dec->buf += sizeof(u64);
+    if UNLIKELY(bufavail - sizeof(u64) < len)
+        return dec_error_short(L, dec);
+
+    Buf* buf = l_buf_createx(L, len);
+    if UNLIKELY(!buf)
+        return dec_error_nomem(L, dec);
+    buf->len = (usize)len;
+    memcpy(buf->bytes, dec->buf, len);
+    dec->buf += len;
+
+    assertf(dec->buf <= dec->bufend, "buffer overrun");
+}
+
+
+static void encode_uval(lua_State* L, Encoder* enc, int vi) {
+    UVal* uval = assertnotnull(lua_touserdata(L, vi));
+    switch ((enum UValType)uval->type) {
+        case UValType_Buf:
+            return encode_uval_buf(L, enc, vi, (Buf*)uval);
+        case UValType_Timer:
+        case UValType_UWorker:
+        case UValType_IODesc:
+            return codec_error(L, enc, EINVAL,
+                               "Cannot clone value of type %s", uval_typename(L, vi));
+    }
+    return codec_error(L, enc, EINVAL, "Cannot clone value of type <userdata>");
+}
+
+
+static void decode_uval(lua_State* L, Decoder* dec) {
+    usize bufavail = dec->bufend - dec->buf;
+    if UNLIKELY(bufavail < 2) // header + uval_type
+        return dec_error_short(L, dec);
+    dec->buf++; // consume SCTag_UVAL
+    u8 uval_type = *dec->buf++;
+    if (uval_type == UValType_Buf)
+        return decode_uval_buf(L, dec);
+    dec_error_bad(L, dec);
 }
 
 
@@ -577,7 +637,7 @@ static void encode_fun(lua_State* L, Encoder* enc, int vi) {
         return enc_error_nomem(L, enc);
 
     // 1 byte tag + 4 bytes len
-    u32 bufstart = enc->buf->len;
+    usize bufstart = enc->buf->len;
     enc->buf->bytes[bufstart++] = SCTag_FUN;
     enc->buf->len += 1 + sizeof(u32);
 
@@ -636,8 +696,8 @@ static void encode_value(lua_State* L, Encoder* enc, int vi) {
         case LUA_TSTRING:   return_tail encode_str(L, enc, vi);
         case LUA_TTABLE:    return_tail encode_table(L, enc, vi);
         case LUA_TFUNCTION: return_tail encode_fun(L, enc, vi);
+        case LUA_TUSERDATA: return_tail encode_uval(L, enc, vi);
         // LUA_TLIGHTUSERDATA
-        // LUA_TUSERDATA
         // LUA_TTHREAD
     }
     codec_error(L, enc, EINVAL, "Usupported value of type %s", lua_typename(L, vt));
@@ -648,20 +708,20 @@ static void decode_value(lua_State* L, Decoder* dec) {
     assert(dec->buf < dec->bufend);
     sc_trace("decode %s", SCTagStr(dec->buf[0] & SCTagTypeMask));
     switch ((enum SCTag)dec->buf[0] & SCTagTypeMask) {
-        case SCTag_NIL:        return_tail decode_nil(L, dec);
-        case SCTag_BOOL_FALSE:
-        case SCTag_BOOL_TRUE:  return_tail decode_bool(L, dec);
-        case SCTag_INTZ:       return_tail decode_intz(L, dec);
-        case SCTag_INT:        return_tail decode_int(L, dec);
-        case SCTag_FLOAT:      return_tail decode_float(L, dec);
+        case SCTag_NIL:    return_tail decode_nil(L, dec);
+        case SCTag_BOOL:   return_tail decode_bool(L, dec);
+        case SCTag_INTZ:   return_tail decode_intz(L, dec);
+        case SCTag_INT:    return_tail decode_int(L, dec);
+        case SCTag_FLOAT:  return_tail decode_float(L, dec);
         case SCTag_STR1:
-        case SCTag_STR4:       return_tail decode_str(L, dec);
-        case SCTag_ARRAY:      return_tail decode_array(L, dec);
-        case SCTag_DICT:       return_tail decode_dict(L, dec);
-        case SCTag_FUN:        return_tail decode_fun(L, dec);
-        case SCTag_REFZ:       return_tail decode_refz(L, dec);
-        case SCTag_REF:        return_tail decode_ref(L, dec);
-        case SCTag_HEADER:     break; // TODO: stop gracefully if this is encountered at top level
+        case SCTag_STR4:   return_tail decode_str(L, dec);
+        case SCTag_ARRAY:  return_tail decode_array(L, dec);
+        case SCTag_DICT:   return_tail decode_dict(L, dec);
+        case SCTag_FUN:    return_tail decode_fun(L, dec);
+        case SCTag_UVAL:   return_tail decode_uval(L, dec);
+        case SCTag_REFZ:   return_tail decode_refz(L, dec);
+        case SCTag_REF:    return_tail decode_ref(L, dec);
+        case SCTag_HEADER: break; // TODO: stop gracefully if this is encountered at top level
     }
     dlog("unexpected byte 0x%02x at offset %zu", dec->buf[0], (usize)(dec->buf - dec->bufstart));
     codec_error(L, dec, EINVAL, "Invalid encoded data");
@@ -793,6 +853,8 @@ int structclone_encode(lua_State* L, Buf* buf, u64 flags, int nargs) {
         memset(p, 0xAA, 4*1024);
     #endif
 
+    // TODO: if flags&StructCloneEnc_TRANSFER_LIST, there's a transfer_list array at L[nargs-1]
+
     // reserve some reasonable amount of space up front
     if UNLIKELY(!buf_reserve(buf, 128)) {
         enc_error_nomem(L, &enc);
@@ -801,7 +863,7 @@ int structclone_encode(lua_State* L, Buf* buf, u64 flags, int nargs) {
 
     buf->len += 4; // reserve space for header; 1 byte tag, 3 bytes nrefs
 
-    // reverse values, which arrive in stack order, so that we
+    // reverse values, which arrive in stack order
     lua_reverse(L, (lua_gettop(L) - nargs) + 1);
 
     // encode values
