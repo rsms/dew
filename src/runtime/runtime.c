@@ -1770,7 +1770,7 @@ static void uworker_main(UWorker* w) {
 	pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, NULL);
 
 	// load Lua function from mainfun_lcode
-	int status = lua_load(L, uworker_load_reader, (void*)w, "<worker>", "bt");
+	int status = lua_load(L, uworker_load_reader, (void*)w, "=worker", "bt");
 
 	// free memory back to malloc so we don't hold on to it "forever"
 	free(w->mainfun_lcode);
@@ -2652,11 +2652,11 @@ static int l_structclone_encode(lua_State* L) {
 	lua_pop(L, 1);
 
 	// return buffer
-	dlog_lua_stackf(L, "ret");
 	return 1;
 }
 
 
+// fun structclone_decode(Buf encoded) ...any
 static int l_structclone_decode(lua_State* L) {
 	Buf* buf = l_buf_check(L, 1);
 	if (!buf)
@@ -2853,6 +2853,10 @@ static int l_typename(lua_State* L) {
 			lua_pushstring(L, "Task");
 			return 1;
 		}
+	} else if (t == LUA_TTABLE) {
+	    bool is_dict = dew_lua_arraylen(L, 1) == U32_MAX;
+		lua_pushstring(L, is_dict ? "dict" : "array");
+		return 1;
 	} else if (t == LUA_TUSERDATA && lua_getmetatable(L, 1)) {
 		// use __name from metatable if available
 		lua_getfield(L, -1, "__name");

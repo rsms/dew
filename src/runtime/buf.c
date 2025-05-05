@@ -177,7 +177,7 @@ int l_buf_len(lua_State* L) {
 }
 
 
-int l_buf_eq(lua_State* L) {
+int l_buf_equal(lua_State* L) {
     Buf* a = l_buf_check(L, 1);
     Buf* b = l_buf_check(L, 2);
     if (!a || !b)
@@ -263,16 +263,15 @@ void luaopen_buf(lua_State* L) {
     lua_pushcfunction(L, l_buf_len);
     lua_setfield(L, -2, "__len");
 
-    lua_pushcfunction(L, l_buf_eq);
-    lua_setfield(L, -2, "__eq");
-
     // Setup __index table to allow accessing "methods"
     lua_pushvalue(L, -1);  // Duplicate metatable
     lua_setfield(L, -2, "__index");  // metatable.__index = metatable
 
-
     lua_pushcfunction(L, l_buf_compare);
     lua_setfield(L, -2, "compare");
+
+    lua_pushcfunction(L, l_buf_equal);
+    lua_setfield(L, -2, "equal");
 
     lua_rawsetp(L, LUA_REGISTRYINDEX, &g_buf_luatabkey);
 }

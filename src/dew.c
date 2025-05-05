@@ -164,7 +164,7 @@ static int pmain(lua_State* L) {
 	// load dew Lua script
 	#ifdef DEW_EMBED_SRC
 		// int status = luaL_loadfile(L, "o.darwin.debug/dew.lua");
-		int status = lua_load(L, src_readchunk, (void*)kDewLuaData, "dew.lua", "bt");
+		int status = lua_load(L, src_readchunk, (void*)kDewLuaData, "=dew", "bt");
 	#else
 		const char* filename = getenv("DEW_MAIN_SCRIPT");
 		if (!filename || *filename == 0)
