@@ -10,6 +10,11 @@ typedef struct Buf {
     u8* nullable bytes;
 } Buf;
 
+typedef struct MiniBuf {
+    usize len;
+    u8    bytes[];
+} MiniBuf;
+
 // buf_free frees buf->bytes, unless 'bytes' points to (void*)buf+sizeof(Buf),
 // making it safe to call this function on plain buffers "in C" and those created by l_buf_createx.
 int buf_free(Buf* buf);

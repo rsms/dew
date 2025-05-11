@@ -11,8 +11,9 @@ typedef struct FIFO {
     //TYPE entries[];
 } FIFO;
 
-FIFO* nullable fifo_alloc(u32 cap, usize elemsize);
-void* nullable fifo_push(FIFO** qp, usize elemsize, u32 maxcap);
-void* nullable fifo_pop(FIFO* q, usize elemsize);
+FIFO* nullable     fifo_alloc(u32 cap, usize elemsize);
+inline static void fifo_free(FIFO* nullable q) { free(q); }
+void* nullable     fifo_push(FIFO** qp, usize elemsize, u32 maxcap);
+void* nullable     fifo_pop(FIFO* q, usize elemsize);
 
 API_END

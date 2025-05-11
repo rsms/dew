@@ -606,6 +606,7 @@ static void encode_uval(lua_State* L, Encoder* enc, int vi) {
             return encode_uval_buf(L, enc, vi, (Buf*)uval);
         case UValType_Timer:
         case UValType_UWorker:
+        case UValType_RemoteTask:
         case UValType_IODesc:
             return codec_error(L, enc, EINVAL,
                                "Cannot clone value of type %s", uval_typename(L, vi));
@@ -875,7 +876,8 @@ int structclone_encode(lua_State* L, Buf* buf, u64 flags, int nargs) {
     // TODO: if flags&StructCloneEnc_TRANSFER_LIST, there's a transfer_list array at L[nargs-1]
 
     // reserve some reasonable amount of space up front
-    if UNLIKELY(!buf_reserve(buf, 128)) {
+    // Note: 120 instead of 128 for scenarios of MiniBuf
+    if UNLIKELY(!buf_reserve(buf, 120)) {
         enc_error_nomem(L, &enc);
         return enc.err_no;
     }

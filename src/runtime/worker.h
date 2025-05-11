@@ -42,9 +42,10 @@ typedef struct AsyncWorkRes {
             i64 result; // output result
         } __attribute__((packed));
         struct { // op == AsyncWorkOp_WORKER_MSG
-            u16 a;
-            u32 b;
-            u64 c;
+            u16               sender_tid_gen;
+            u32               sender_tid;    // tid in namespace of receiving worker's parent S
+            UWorker* nullable sender_worker; // NULL if parent of current worker
+            MiniBuf*          buf;
         } __attribute__((packed)) msg;
     };
 } AsyncWorkRes;
@@ -61,20 +62,23 @@ enum WorkerKind {
 };
 
 struct Worker {
-    // state accessed only by parent thread
-    S*               s;    // S which spawned this worker
-    Worker* nullable next; // list link in S.workers
-
     // state accessed by both parent thread and worker thread
     u8           wkind;   // enum WorkerKind
     _Atomic(u8)  status;  // enum WorkerStatus
     _Atomic(u8)  nrefs;
     _Atomic(u32) waiters; // list of tasks (tid's) waiting for this worker (T.info.wait_task)
     OSThread     thread;
+
+    // state accessed only by parent thread
+    S*               s;    // S which spawned this worker
+    Worker* nullable next; // list link in S.workers
 };
 
 struct UWorker { // wkind == WorkerKind_USER
     Worker w;
+    u32    spawned_by_tid;
+    u16    spawned_by_tid_gen;
+    u16    _unused;
     union { // input & output data (as input for workeru_open, as output from worker exit.)
         struct { // input
             // mainfun_lcode contains Lua bytecode for the main function, used during setup.
@@ -110,7 +114,7 @@ struct AWorker { // wkind == WorkerKind_ASYNC
 };
 
 // UWorkerUVal is a Lua-managed (GC'd) wrapper around a internally managed Worker.
-// This allows a timer to be referenced by userland independently of its state.
+// This allows a worker to be referenced by userland independently of its state.
 typedef struct UWorkerUVal {
     UVal     uval;
     UWorker* uw;

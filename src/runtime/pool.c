@@ -36,6 +36,8 @@ static bool pool_grow(Pool** pp, u32 newcap, usize elemsize) {
 		// new allocation; set all freebm chunks' bits to 1 (all slots are free)
 		p->maxidx = 0;
 		memset(p->freebm, 0xff, (usize)newcap >> 3);
+		// zero entries data
+		memset(pool_entries(p), 0x00, (usize)newcap * elemsize);
 	} else {
 		// new freebm overlap with existing entries, so we need to move the entries up
 		// before we set all bits to 1 in the new freebm chunk
@@ -43,6 +45,8 @@ static bool pool_grow(Pool** pp, u32 newcap, usize elemsize) {
 		void* newfreebm = (u8*)p->freebm + ((usize)newcap >> 3);
 		memmove(newfreebm, oldfreebm, p->maxidx * elemsize);
 		*(u64*)oldfreebm = ~(u64)0; // set all bits to 1 (all slots are free);
+		// zero new entries data
+		memset(pool_entries(p) + oldcap*elemsize, 0x00, (usize)(newcap - oldcap) * elemsize);
 	}
 
 	return true;
@@ -119,16 +123,19 @@ void pool_entry_free(Pool* p, u32 idx) {
 		u64 chunk = p->freebm[chunk_idx];
 		if (chunk == 0) {
 			// chunk is full and next chunk is empty
+			// dlog(">> chunk %u is full and next chunk is empty", chunk_idx);
 			p->maxidx = (chunk_idx + 1) << 6;
 			break;
 		} else if (chunk != ~(u64)0) {
 			// chunk has at least one 0 bit.
 			// Find first 0 bit by first flipping all bits with xor,
 			// then use ffs to find the first 1 bit.
-			p->maxidx = dew_ffs(chunk ^ ~(u64)0);
+			// dlog(">> chunk %u has at least one 0 bit: 0x%lx", chunk_idx, chunk);
+			p->maxidx = dew_ffs(chunk) - 1;
 			break;
 		} else {
 			// chunk is completely free
+			// dlog(">> chunk %u is completely free", chunk_idx);
 			if (chunk_idx == 0) {
 				p->maxidx = 0;
 				break;
@@ -137,6 +144,8 @@ void pool_entry_free(Pool* p, u32 idx) {
 		}
 	}
 	#endif
+
+	// dlog("maxidx was freed; it's now: %u", p->maxidx);
 
 	// 3. Something in between: scan for entire free bit chunks.
 	//    Balanced trade off between accuracy and speed.

@@ -1,100 +1,40 @@
-require("../../src/util") -- print_table
-
 __rt.main(function()
-    -- local buf = __rt.structclone_encode(nil, true, 1, 2.3, "four", "long string")
-    -- local buf = __rt.structclone_encode(nil, true, 1, 2.3, "four", "long string", {5, "six"})
-
-    -- local a1 = {"a1", 2, 3, 4}
-    -- local buf = __rt.structclone_encode(a1)
-
-    local buf1 = __rt.structclone_encode(0, "hello!")
-
-    -- local a1 = {"A", "B", {22, 222}, 3}
-    local long_string1 = "really long string that will be referenced 1"
-    local long_string2 = "really long string that will be referenced 2"
-    local a1 = {"A", "B", long_string1, long_string1, long_string2, long_string2}
-    a1[#a1 + 1] = a1
-    a1[#a1 + 1] = {x=1, y=3, z=4, [long_string1]=5}
-    -- local function mul(x, y)
-    --     local outer = a1 -- will become nil
-    --     return x * y
-    -- end
-    -- a1[#a1 + 1] = mul
-    -- a1[#a1 + 1] = buf1
-    -- a1[#a1 + 1] = "really long string that will not be referenced"
-    local buf = __rt.structclone_encode(0, buf1, 31)
-    -- local buf = __rt.structclone_encode(0, a1, long_string1, buf1)
-    -- local buf = __rt.structclone_encode(a1, 9, a1)
-
-    -- local a1 = {"a1"}
-    -- local a2 = {"a2"}
-    -- local buf = __rt.structclone_encode(a1, a2, a1)
-
-    -- local a1 = {"a1"}
-    -- local a2 = {"a2", a1, 3, 4}
-    -- a1[#a1 + 1] = a2
-    -- local buf = __rt.structclone_encode(a1)
-
-    -- local buf = __rt.structclone_encode({5, "six", {7}})
-    -- local buf = __rt.structclone_encode({x = 5, y = "six"})
-    -- local buf = __rt.structclone_encode(1, 2.3, "four", {5, "six"})
-    print("structclone_encode =>\n  (" .. #buf .. " B) \"" .. tostring(buf) .. '"')
-    -- print("structclone_decode =>", __rt.structclone_decode(buf))
-    local res = table.pack(__rt.structclone_decode(buf))
-    print("structclone_decode =>", res)
-
-    local seen = {}
-    for i, item in ipairs(res) do
-        if type(item) == "table" then
-            local eq = seen[item]
-            if eq ~= nil then
-                print("#" .. i .. " =", "#" .. eq)
-            else
-                seen[item] = i
-                print("#" .. i .. " =")
-                print_table(item, 1)
-            end
-        else
-            print("#" .. i .. " =", __rt.typename(item), item)
+    local W1 = __rt.spawn_worker(function()
+        local i = 1
+        for i = 1, 3 do
+            print("W1: recv ...")
+            local typ, sender, val1, val2 = __rt.recv()
+            print("W1: recv =>", typ, sender, val1, val2)
+            assert(val1 == i*10)
+            assert(val2 == i*100)
+            i = i + 1
         end
-    end
-    -- print("worker:", __rt.typename(__rt.spawn_worker(function() end)))
-    -- print("task:", __rt.typename(__rt.spawn_task(function() end)))
-    -- t[#t + 1] = 4
-    -- print_table(t)
+        print("worker exiting")
+    end)
+    print("W1:", W1)
 
-    -- print("structclone_encode =>",
-    --       __rt.structclone_encode(function() return 1, 2.3, "four", {5, "six"} end))
-    --       -- __rt.structclone_encode())
-    --       -- __rt.structclone_encode(1, 2, 3))
-    --       -- __rt.structclone_encode(1, 2.3, "four", {5, "six"}))
-    print("DONE")
-    -- local f = __rt.structclone_encode(1, 2.3, "four", {5, "six"})
-    -- print("structclone_encode =>", f)
-    -- print("() =>", f())
-
-    -- local W1 = __rt.spawn_worker(function()
-    --  -- yield: enable to make it so that when we call send(),
-    --  -- the receiver has not yet called recv().
-    --  --__rt.yield() -- give control back to main task
-
-    --  local i = 1
-    --  for i = 1, 8 do
-    --      print("W1: recv ...")
-    --      local typ, sender, msg1, msg2 = __rt.recv()
-    --      print("W1: recv =>", typ, sender, msg1, msg2)
-    --      assert(msg1 == i*10)
-    --      assert(msg2 == i*100)
-    --      i = i + 1
-    --  end
-    --  print("worker exiting")
+    -- -- another worker capturing W1 (via closure upvalue) and sending to it
+    -- __rt.spawn_worker(function()
+    --     __rt.send(W1, 10, 100)
+    --     print("W2 exiting")
     -- end)
-    -- for i = 1, 8 do
-    --  print("T1: send(W1, " .. (i*10) .. ") ...")
-    --  print("T1: send(W1) =>", __rt.send(W1, i*10, i*100))
-    -- end
-    -- print("waiting for worker to exit")
-    -- local ok, err = __rt.await(W1)
-    -- print("worker exited:", ok, err)
-    -- if ok == 0 then error(err) end
+
+    -- W2 = worker_open("tcp:127.0.0.1:4242")
+
+    -- Make sure to test runtime logic specific to delivery for a task with RECV status
+    -- by sleeping 50ms to make sure worker main task is waiting on recv().
+    __rt.sleep(50000000, 0)
+
+    -- send messages to worker
+    for i = 1, 3 do
+        print("T1: send(W1, " .. (i*10) .. ") ...")
+        print("T1: send(W1) =>", __rt.send(W1, i*10, i*100))
+    end
+
+    print("waiting for worker to exit")
+    local ok, err = __rt.await(W1)
+    print("worker exited:", ok, err)
+    if not ok then
+        error(err)
+    end
 end)

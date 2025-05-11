@@ -222,7 +222,8 @@ TEST_PROGS := \
 run_tests: $(TEST_PROGS)
 	$(Q)$(foreach f,$^,echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(f).log)"; $(f) $(if $(filter 1,$(V)),,>$(f).log 2>&1 || { echo "$(f): FAILED"; cat $(f).log; exit 1; }) && ) true
 
-run-test-runtime: RUNTIME_TESTS := $(filter-out %benchmark.lua,$(wildcard tests/rt/*.lua))
+run-test-runtime: RUNTIME_TESTS := \
+	$(sort $(filter-out %/_testutil.lua %-benchmark.lua,$(wildcard tests/rt/*.lua)))
 run-test-runtime: $(BUILDDIR)/dew $(RUNTIME_TESTS)
 	$(Q)_FC=0; $(foreach f,$(RUNTIME_TESTS),\
 	      $(if $(filter 1,$(V)),echo "RUN   $(f)";,) \

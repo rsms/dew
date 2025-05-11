@@ -43,8 +43,12 @@ struct T {
 	S*              s;     // owning S
 	Inbox* nullable inbox; // message queue
 
-	u32 tid;   // task identifier
+	u32 tid;     // task identifier
+	u16 tid_gen; // tid generation
+	u16 _unused1;
+
 	u32 nrefs; // references to task (when 0, T may be GC'd)
+	u32 _unused2;
 
 	u8  status;      // T_ constant (enum TStatus)
 	u8  resume_nres; // number of results on stack, to be returned via resume
@@ -59,8 +63,8 @@ struct T {
 	// 'info' holds data specific to 'status', used while task is suspended
 	union {
 		struct { // T_WAIT_TASK
-			u32 wait_tid; // tid of other task this task is waiting for
 			u32 next_tid; // link to other waiting task in 'waiters' list
+			u32 wait_tid; // tid of other task this task is waiting for
 		} wait_task;
 		struct { // T_WAIT_WORKER
 			u32 next_tid; // link to other waiting task in 'waiters' list
@@ -70,7 +74,8 @@ struct T {
 		} wait_async;
 		struct { // T_DEAD
 			u8 how; // TDied_ constant
-			// note: must not overlay wait_task.wait_tid
+			// Note: Must not overlay wait_task.wait_tid.
+			// Even though a task may be T_DEAD, its memory is still valid b/c GC refs.
 		} dead;
 		u64 _align;
 	} info;
@@ -109,6 +114,14 @@ struct S {
 	Chan* nullable asyncwork_sq;       // submission queue
 	Chan* nullable asyncwork_cq;       // completion queue, also used for cross-worker send/recv
 };
+
+// RemoteTask represents a task of another worker
+typedef struct RemoteTask {
+    UVal              uval;    // .type=UValType_RemoteTask
+    u16               tid_gen; // task ID generation
+    u32               tid;     // task ID (in remote S's namespace)
+    UWorker* nullable worker;  // NULL if local thread
+} RemoteTask;
 
 
 // s_id formats an identifier of a S for logging

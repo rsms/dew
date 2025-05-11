@@ -777,7 +777,7 @@
 	#undef  LUA_KCONTEXT
 	#define LUA_KCONTEXT unsigned long
 
-	#define SIZEOF_DEW_T    (sizeof(void*)*2 + sizeof(int)*8 + sizeof(uint64_t))
+	#define SIZEOF_DEW_T    (sizeof(void*)*2 + sizeof(uint64_t)*6)
 	#define LUA_EXTRASPACE  SIZEOF_DEW_T
 
 	// luai_userstatefree is called by luaE_freethread when a lua thread is free'd (GC'd.)

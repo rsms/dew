@@ -52,13 +52,20 @@
 #endif
 
 
-// LUA_EXTRASPACE is defined in lua/src/luaconf.h
+// LUA_EXTRASPACE is defined in src/lua/luaconf.h
 static_assert(sizeof(T) == LUA_EXTRASPACE, "");
+
+static_assert(sizeof(AsyncWorkRes) % sizeof(void*) == 0, "");
 
 
 static u8 g_reftabkey;              // table of objects with compex lifetime, to avoid GC
 static u8 g_timerobj_luatabkey;     // Timer object prototype
-static u8 g_uworker_uval_luatabkey; // Worker object prototype
+static u8 g_uworker_uval_luatabkey; // Worker object prototype (UWorkerUVal)
+static u8 g_remotetask_luatabkey;   // RemoteTask object prototype
+
+// g_exiting is true when the process is about to exit().
+// Finalization code uses this to avoid doing unnecessary work.
+static _Atomic(bool) g_exiting = false;
 
 // tls_s holds S for the current thread
 static _Thread_local S* tls_s = NULL;
@@ -72,6 +79,11 @@ static _Thread_local S* tls_s = NULL;
 	static _Atomic(u32)      tls_w_idgen = 1;
 	static _Thread_local u32 tls_w_id = 0;
 #endif
+
+
+static void worker_retain(Worker* w);
+static void worker_release(Worker* w);
+static bool worker_close(Worker* w);
 
 
 static int err_from_errno(int errno_val) {
@@ -244,6 +256,11 @@ static const char* t_status_str(u8 status) {
 		case T_DEAD:        return "T_DEAD";
 	}
 	return "?";
+}
+
+
+static u64 tid64(u32 tid, u16 tid_gen) {
+	return (u64)tid | ((u64)tid_gen << 32);
 }
 
 
@@ -548,24 +565,44 @@ static int l_sleep(lua_State* L) {
 }
 
 
+typedef struct TaskPoolEnt {
+	T*  t;
+	u16 tid_gen;
+	u8  _unused[sizeof(void*) - sizeof(u16)];
+} TaskPoolEnt;
+
+
 static bool s_task_register(S* s, T* t) {
-	T** tp = (T**)pool_entry_alloc(&s->tasks, &t->tid, sizeof(T*));
-	if (tp != NULL)
-		*tp = t;
-	return tp != NULL;
+	TaskPoolEnt* ent = pool_entry_alloc(&s->tasks, &t->tid, sizeof(TaskPoolEnt));
+	if (ent != NULL) {
+		ent->t = t;
+		t->tid_gen = ent->tid_gen;
+	}
+	return ent != NULL;
 }
 
 
 static void s_task_unregister(S* s, T* t) {
-	// optimization for main task (tid 1): skip work incurred by pool_entry_free
-	if (t->tid != 1)
-		pool_entry_free(s->tasks, t->tid);
+	// increment generation so that s_task_check_gen can detect invalid tid_gen
+	TaskPoolEnt* ent = pool_entry(s->tasks, t->tid, sizeof(TaskPoolEnt));
+	assertf(t->tid_gen == ent->tid_gen, "%u, %u", t->tid_gen, ent->tid_gen);
+	ent->tid_gen++;
+
+	pool_entry_free(s->tasks, t->tid);
 }
 
 
 inline static T* s_task(S* s, u32 tid) {
-	T** tp = (T**)pool_entry(s->tasks, tid, sizeof(T*));
-	return *tp;
+	TaskPoolEnt* ent = pool_entry(s->tasks, tid, sizeof(TaskPoolEnt));
+	return ent->t;
+}
+
+
+static T* nullable s_task_check_gen(S* s, u32 tid, u16 tid_gen) {
+	TaskPoolEnt* ent = pool_entry(s->tasks, tid, sizeof(TaskPoolEnt));
+	if (ent->tid_gen != tid_gen)
+		return NULL;
+	return ent->t;
 }
 
 
@@ -858,8 +895,10 @@ static void t_stop_r(T* parent, T* child) {
 __attribute__((visibility("hidden")))
 void t_gc(lua_State* L, T* t) {
 	trace_sched(T_ID_F " GC", t_id(t));
-	// remove from S's 'tasks' registry, effectively invalidating tid
-	s_task_unregister(t->s, t);
+	// Remove from S's 'tasks' registry, effectively invalidating tid.
+	// Skip useless work in case of main task (tid 1)
+	if (t->tid != 1)
+		s_task_unregister(t->s, t);
 }
 
 
@@ -989,6 +1028,44 @@ UNUSED static const char* TDied_str(enum TDied died_how) {
 };
 
 
+static void msg_msg_worker_free(InboxMsg* msg) {
+	assert(msg->type == InboxMsgType_MSG_WORKER);
+	free(msg->msg_worker.buf);
+	msg->msg_worker.buf = NULL;
+	if (msg->msg_worker.sender_worker) {
+		worker_release(&msg->msg_worker.sender_worker->w);
+		msg->msg_worker.sender_worker = NULL;
+	}
+}
+
+
+static void msg_worker_closed_free(InboxMsg* msg) {
+	assert(msg->type == InboxMsgType_WORKER_CLOSED);
+	worker_release(&msg->worker_closed.worker->w);
+}
+
+
+static void t_inbox_free(T* t) {
+	InboxMsg* msg;
+	while (( msg = inbox_pop(t->inbox) )) {
+		switch ((enum InboxMsgType)msg->type) {
+			case InboxMsgType_TIMER:
+			case InboxMsgType_MSG:
+			case InboxMsgType_MSG_DIRECT:
+				// no cleanup required
+				break;
+			case InboxMsgType_MSG_WORKER:
+				msg_msg_worker_free(msg);
+				break;
+			case InboxMsgType_WORKER_CLOSED:
+				msg_worker_closed_free(msg);
+				break;
+		}
+	}
+	inbox_free(t->inbox);
+	t->inbox = NULL;
+}
+
 static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 	S* s = t->s;
 
@@ -1068,6 +1145,10 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 		trace_sched("exit(%d)", (int)s->exiterr);
 		return exit(s->exiterr);
 	}
+
+	// free any un-recv messages in inbox
+	if (t->inbox)
+		t_inbox_free(t);
 
 	// stop any still-running timers (optimization: skip when S is shutting down)
 	if UNLIKELY(t->ntimers && !s->isclosed)
@@ -1240,11 +1321,6 @@ int s_iopoll_wake(S* s, IODesc** dv, u32 count) {
 }
 
 
-static void worker_retain(Worker* w);
-static void worker_release(Worker* w);
-static bool worker_close(Worker* w);
-
-
 static void s_workers_add(S* s, Worker* w) {
 	assert(w->next == NULL);
 	w->next = s->workers;
@@ -1253,27 +1329,75 @@ static void s_workers_add(S* s, Worker* w) {
 }
 
 
+static void t_send_worker_closed_msg(T* t, UWorker* uw) {
+	// put a message in its inbox
+	// Note: Inbox is practically unbounded in this case.
+	// The only other option is to drop the message.
+	const u32 maxcap = U32_MAX;
+	InboxMsg* msg = inbox_add(&t->inbox, maxcap);
+	if UNLIKELY(msg == NULL) {
+		logwarn("T%u inbox is full; dropping message", t->tid);
+		return;
+	}
+	msg->type = InboxMsgType_WORKER_CLOSED;
+	msg->worker_closed.worker = uw;
+	worker_retain(&uw->w);
+
+	// if the destination task is not currently waiting in a call to recv(),
+	// the message will be delivered later.
+	if (t->status == T_WAIT_RECV) {
+		trace_sched("wake " T_ID_F " waiting on recv", t_id(t));
+		s_runq_put_runnext(t->s, t);
+	} else {
+		trace_sched("deliver buffered msg to " T_ID_F, t_id(t));
+	}
+}
+
+
+static void s_on_worker_closed(S* s, Worker* w) {
+	trace_worker("worker %p closed", w);
+
+	// Wake any tasks waiting for this worker.
+	// Note: we do this before waking spawned_by_tid since if that same task is explicitly
+	// waiting for this task, its status will change to T_READY, meaning the next branch
+	// below becomes simpler.
+	if (w->waiters)
+		worker_wake_waiters(w);
+
+	// post a message to the spawner
+	if (w->wkind == WorkerKind_USER) {
+		UWorker* uw = (UWorker*)w;
+		T* t = s_task_check_gen(s, uw->spawned_by_tid, uw->spawned_by_tid_gen);
+		if (t && t->status != T_DEAD) {
+			assert(t->status != T_WAIT_WORKER); // handled by worker_wake_waiters
+			t_send_worker_closed_msg(t, uw);
+		} else {
+			// The task that spawned the worker has exited.
+			// We could use S's main task here instead, but that might muddy the waters of
+			// semantics a bit, making it harder to understand.
+		}
+	}
+
+	worker_release(w);
+}
+
+
 static void s_reap_workers(S* s) {
+	// search for CLOSED workers
 	Worker* w = s->workers;
 	Worker* prev_w = NULL;
 	while (w) {
 		if (atomic_load_explicit(&w->status, memory_order_acquire) == Worker_CLOSED) {
-			trace_worker("worker %p exited", w);
-
-			// wake any tasks waiting for this worker
-			if (w->waiters)
-				worker_wake_waiters(w);
-
 			// remove from list of live workers
-			Worker* next = w->next;
+			Worker* w1 = w;
+			w = w->next;
+			w1->next = NULL;
 			if (prev_w) {
-				prev_w->next = next;
+				prev_w->next = w;
 			} else {
-				s->workers = next;
+				s->workers = w;
 			}
-			w->next = NULL;
-			worker_release(w);
-			w = next;
+			s_on_worker_closed(s, w1);
 		} else {
 			prev_w = w;
 			w = w->next;
@@ -1282,64 +1406,49 @@ static void s_reap_workers(S* s) {
 }
 
 
-static void t_worker_msg_stow(T* t, InboxMsg* msg) {
-	lua_State* dst_L = t_L(t);
-
-	// Store message payload in a table.
-	// This way the message payload gets GC'd when the destination task is GC'd,
-	// regardless of message delivery.
-	lua_createtable(dst_L, msg->nres, 0);
-
-	// first value is the sender task (Lua "thread")
-	lua_pushnil(dst_L);         // TODO: push sender worker onto its own stack
-	lua_rawseti(dst_L, -2, 1);  // Store in table at index 1
-
-	for (int i = 2; i <= msg->nres; i++) {
-		lua_pushinteger(dst_L, 123); // TODO
-		lua_rawseti(dst_L, -2, i);   // Store in table at index (i-1)
-	}
-
-	msg->msg.ref = luaL_ref(dst_L, LUA_REGISTRYINDEX);
-}
-
-
 static void s_recv_worker_msg(S* s, AsyncWorkRes* res) {
-	// Deliver message from worker to this S's main task.
+	// This function is called then S discovers that a message has been sent to its worker.
+	// It's job is to deliver the message to this S's main task.
+	assert(res->op == AsyncWorkOp_WORKER_MSG);
+
 	// Inbox is practically unbounded in this case. The only other option is to drop the message.
 	const u32 maxcap = U32_MAX;
 
-	T* t = (s->nlive > 0) ? s_task(s, 1) : NULL; // main task
-	if (!t || t->status == T_DEAD) {
+	// find main task, which will receive the message
+	T* t = (s->nlive > 0) ? s_task(s, 1) : NULL;
+	if UNLIKELY(!t || t->status == T_DEAD || s->isclosed) {
+		// we are called to "clean up" when a worker is exiting, just free the memory
 		logwarn("ignoring message from worker received during shutdown");
-		goto end;
+		goto bail;
 	}
 
+	// put a message in its inbox
 	InboxMsg* msg = inbox_add(&t->inbox, maxcap);
 	if UNLIKELY(msg == NULL) {
 		logwarn("T%u inbox is full; dropping message", t->tid);
-		goto end;
+		goto bail;
 	}
-
-	memset(msg, 0, sizeof(*msg));
-	msg->type = InboxMsgType_MSG;
-	if (t->status == T_WAIT_SEND)
-		trace_sched("wake " T_ID_F " waiting on send", t_id(t));
-
-	// TODO: see l_msg_stow, how it stores message values for the receiver
+	msg->type = InboxMsgType_MSG_WORKER;
+	msg->msg_worker.sender_tid_gen = res->msg.sender_tid_gen;
+	msg->msg_worker.sender_tid = res->msg.sender_tid;
+	msg->msg_worker.sender_worker = res->msg.sender_worker;
+	msg->msg_worker.buf = res->msg.buf;
 
 	// if the destination task is not currently waiting in a call to recv(),
 	// the message will be delivered later.
-	if (t->status != T_WAIT_RECV) {
-		trace_sched("deliver buffered msg to " T_ID_F, t_id(t));
-		dlog("TODO: stow message");
-		t_worker_msg_stow(t, msg);
-	} else {
+	if (t->status == T_WAIT_RECV) {
 		trace_sched("wake " T_ID_F " waiting on recv", t_id(t));
 		s_runq_put_runnext(s, t);
+	} else {
+		trace_sched("deliver buffered msg to " T_ID_F, t_id(t));
 	}
 
-end: {}
-	//dlog("TODO: dispose of structured-clone msg");
+	return;
+
+bail:
+	free(res->msg.buf);
+	if (res->msg.sender_worker)
+		worker_release(&res->msg.sender_worker->w);
 }
 
 
@@ -1357,7 +1466,7 @@ static void s_asyncwork_read_cq(S* s) {
 	// causally delivered after writing to the CQ, completions can never "appear" _after_ a
 	// NOTE, only _before_ a NOTE (i.e. when we process more than one completion in one note.)
 	AsyncWorkRes res;
-	for (;;) {
+	while (s->asyncwork_cq != NULL) {
 		if (!chan_read(s->asyncwork_cq, CHAN_TRY, &res))
 			break;
 
@@ -1366,6 +1475,8 @@ static void s_asyncwork_read_cq(S* s) {
 			continue;
 		}
 
+		// Lookup task waiting for this work.
+		// Note: No need for tid_gen check here since the task can't exit as its suspended.
 		T* t = s_task(s, res.tid);
 		trace_sched("wake " T_ID_F " waiting on asyncwork", t_id(t));
 		if (res.flags & AsyncWorkFlag_HAS_CONT) {
@@ -1407,16 +1518,33 @@ static void s_shutdown(S* s) {
 
 
 static void s_free(S* s) {
+	trace_sched("free " S_ID_F, s_id(s));
+
 	iopoll_dispose(&s->iopoll);
 	pool_free_pool(s->tasks);
 	free(s->runq);
 	array_free((struct Array*)&s->timers);
+
+	if (s->isworker) {
+		// Close all active to-be-closed variables in the main thread, release all objects in
+		// S's Lua state (calling the corresponding garbage-collection metamethods, if any),
+		// and frees all dynamic memory used by this state.
+		assertnotnull(s->L);
+		lua_close(s->L);
+	} // else: this is the top-level scheduler which is managed by dew.c
 }
 
 
 static int s_finalize(S* s) {
 	trace_sched("finalize " S_ID_F, s_id(s));
 	atomic_store_explicit(&s->isclosed, true, memory_order_release);
+
+	bool exiting = s->doexit;
+	if (exiting) {
+		atomic_store_explicit(&g_exiting, true, memory_order_release);
+	} else if (s->isworker) {
+		exiting = atomic_load_explicit(&g_exiting, memory_order_acquire);
+	}
 
 	// stop main task
 	if (s->nlive > 0) {
@@ -1431,9 +1559,13 @@ static int s_finalize(S* s) {
 	// run GC to ensure pending IODesc close before S goes away
 	lua_gc(s->L, LUA_GCCOLLECT);
 
+	// make sure to free any messages in asyncwork completion queue to avoid memory leak from
+	// e.g. a message being sent to a user worker or a completion result.
+	if (!exiting)
+		s_asyncwork_read_cq(s);
+
 	// stop & wait for workers
-	if UNLIKELY(s->workers) {
-		trace_worker("shutting down workers");
+	if UNLIKELY(s->workers || s->isworker) {
 
 		// shutdown asyncwork channels as worker may be blocked on sq
 		if (s->asyncwork_sq != NULL)
@@ -1442,15 +1574,19 @@ static int s_finalize(S* s) {
 			chan_shutdown(s->asyncwork_cq);
 
 		// close all workers
-		for (Worker* w = s->workers; w; w = w->next)
+		for (Worker* w = s->workers; w; w = w->next) {
+			trace_worker("shutting down worker %p", w);
 			worker_close(w);
+		}
 
+		// wait for workers to exit
 		for (Worker* w = s->workers; w;) {
 			int err = pthread_join(w->thread, NULL);
 			if (err)
 				logwarn("failed to wait for worker thread=%p: %s", w->thread, strerror(err));
 			Worker* next_w = w->next;
-			worker_release(w);
+			if (!exiting)
+				worker_release(w);
 			w = next_w;
 		}
 
@@ -1601,6 +1737,10 @@ static int s_main(S* s) {
 	T* t;
 	while (!s->isclosed && s_find_runnable(s, &t))
 		t_resume(t);
+
+	// exit scheduler (if managed by a worker, worker_thread_exit will take care of it)
+	if (s->isworker)
+		return 0;
 	return s_finalize(s);
 }
 
@@ -1622,7 +1762,6 @@ int luaopen_runtime(lua_State* L);
 static void worker_free(Worker* w) {
 	trace_worker("free Worker %p", w);
 	if (w->wkind == WorkerKind_USER && !((UWorker*)w)->errdesc_invalid) {
-		trace_worker("free UWorker.errdesc %p", ((UWorker*)w)->errdesc);
 		free(((UWorker*)w)->errdesc);
 		((UWorker*)w)->errdesc = NULL;
 	}
@@ -1651,6 +1790,19 @@ static bool worker_add_waiter(Worker* w, T* waiter_task) {
 
 	// check if worker exited already
 	return atomic_load_explicit(&w->status, memory_order_acquire) != Worker_CLOSED;
+}
+
+
+static usize uworker_str(const UWorker* uw, char* buf, usize bufcap) {
+	return snprintf(buf, bufcap, "Worker#%lx", (uintptr)uw);
+}
+
+
+static int l_uworker_uval_str(lua_State* L) {
+	UWorkerUVal* uv = lua_touserdata(L, 1);
+	char buf[32];
+    lua_pushlstring(L, buf, uworker_str(uv->uw, buf, sizeof(buf)));
+    return 1;
 }
 
 
@@ -1724,8 +1876,9 @@ static void worker_thread_exit(Worker** wp) {
 		s_notify(w->s, S_NOTE_WEXIT);
 
 		UWorker* uw = (UWorker*)w;
-		if (uw->s.L)
-			lua_close(uw->s.L);
+
+		// finalize worker's scheduler
+		s_finalize(&uw->s);
 	} else {
 		assert(w->wkind == WorkerKind_ASYNC);
 		AWorker* aw = (AWorker*)w;
@@ -1741,7 +1894,8 @@ static void worker_thread_exit(Worker** wp) {
 		s_notify(w->s, notes);
 	}
 
-	worker_release(w);
+	if (atomic_load_explicit(&g_exiting, memory_order_acquire) == false)
+		worker_release(w);
 }
 
 
@@ -1882,14 +2036,18 @@ static int worker_open(Worker* w, S* s, u8 wkind) {
 	w->s = s;
 	w->wkind = wkind;
 	w->nrefs = 1; // caller's reference
-
-	// Chan* nullable chan_open(u32 cap, u32 entsize);
-
 	return 0;
 }
 
 
-static int uworker_open(UWorker** uwp, S* s, void* mainfun_lcode, u32 mainfun_lcode_len) {
+static int uworker_open(
+	UWorker** uwp,
+	S*        s,
+	void*     mainfun_lcode,
+	u32       mainfun_lcode_len,
+    u32       spawned_by_tid,
+    u16       spawned_by_tid_gen)
+{
 	UWorker* uw = calloc(1, sizeof(UWorker));
 	if (!uw)
 		return -ENOMEM;
@@ -1900,6 +2058,8 @@ static int uworker_open(UWorker** uwp, S* s, void* mainfun_lcode, u32 mainfun_lc
 		return err;
 	}
 
+    uw->spawned_by_tid = spawned_by_tid;
+    uw->spawned_by_tid_gen = spawned_by_tid_gen;
 	uw->mainfun_lcode_len = mainfun_lcode_len;
 	uw->mainfun_lcode = mainfun_lcode;
 	uw->s.isworker = true; // note: uw->s is the worker's S, not the spawner S 's'
@@ -1938,11 +2098,24 @@ static bool worker_close(Worker* w) {
 }
 
 
+// uworker_wrap_in_uval steals a reference to uw
+static UWorkerUVal* nullable uworker_wrap_in_uval(lua_State* L, UWorker* uw) {
+	UWorkerUVal* uval = uval_new(L, UValType_UWorker, sizeof(UWorkerUVal), 0);
+	if LIKELY(uval) {
+		lua_rawgetp(L, LUA_REGISTRYINDEX, &g_uworker_uval_luatabkey);
+		lua_setmetatable(L, -2);
+		uval->uw = uw;
+	}
+	return uval;
+}
+
+
 static int l_spawn_worker(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 	luaL_checktype(L, 1, LUA_TFUNCTION);
 
-	// serialize thread main function as Lua code, to be transferred to the thread
+	// Encode the thread's main function as Lua code, to be transferred to the thread.
+	// TODO: consider copying upvalues the way we do in structclone.
 	lua_settop(L, 1); // ensure function is on the top of the stack
 	Buf buf = {};
 	int err = buf_append_luafun(&buf, L, /*strip_debuginfo*/false);
@@ -1955,21 +2128,22 @@ static int l_spawn_worker(lua_State* L) {
 
 	// start a worker
 	UWorker* uw;
-	if UNLIKELY(( err = uworker_open(&uw, t->s, buf.bytes, buf.len) )) {
+	if UNLIKELY(( err = uworker_open(&uw, t->s, buf.bytes, buf.len, t->tid, t->tid_gen) )) {
 		buf_free(&buf);
 		return l_errno_error(L, -err);
 	}
 
-	// allocate & return Worker object so that we know when the user is done with it (GC)
-	UWorkerUVal* uval = uval_new(L, UValType_UWorker, sizeof(UWorkerUVal), 0);
+	// Allocate & return Worker object so that we know when the user is done with it (GC)
+	UWorkerUVal* uval = uworker_wrap_in_uval(L, uw);
 	if UNLIKELY(!uval) {
 		worker_close((Worker*)uw);
 		worker_release((Worker*)uw);
 		return 0;
 	}
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_uworker_uval_luatabkey);
-	lua_setmetatable(L, -2);
-	uval->uw = uw;
+
+	// TODO: consider instead returning a handle to the worker's main task (RemoteTask)
+	// instead of a handle to the worker itself. That might be a better API considering the
+	// nature of structural concurrency; a worker's main task is linked to the worker's lifetime.
 
 	return 1;
 }
@@ -2212,6 +2386,20 @@ static int l_yield(lua_State* L) {
 }
 
 
+// fun tid(task T = nil) uint
+static int l_tid(lua_State* L) {
+	T* t;
+	if (lua_gettop(L) > 0) {
+		if ((t = l_check_task(L, 1)) == NULL)
+			return 0;
+	} else {
+		t = REQUIRE_TASK(L);
+	}
+	lua_pushinteger(L, tid64(t->tid, t->tid_gen));
+	return 1;
+}
+
+
 // fun spawn_task(f fun(... any), ... any)
 static int l_spawn_task(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
@@ -2415,24 +2603,26 @@ static int l_read(lua_State* L) {
 
 
 static int l_msg_stow(lua_State* src_L, lua_State* dst_L, InboxMsg* msg) {
+	assert(msg->type == InboxMsgType_MSG || msg->type == InboxMsgType_MSG_DIRECT);
+
 	// Store message payload in a table.
 	// This way the message payload gets GC'd when the destination task is GC'd,
 	// regardless of message delivery.
-	lua_createtable(dst_L, msg->nres, 0);
+	lua_createtable(dst_L, msg->msg.nres, 0);
 
 	// first value is the sender task (Lua "thread")
 	lua_pushthread(src_L);      // push sender "thread" onto its own stack
 	lua_xmove(src_L, dst_L, 1); // move sender "thread" to receiver's stack
 	lua_rawseti(dst_L, -2, 1);  // Store in table at index 1
 
-	for (int i = 2; i <= msg->nres; i++) {
+	for (int i = 2; i <= msg->msg.nres; i++) {
 		lua_pushvalue(src_L, i);    // Get argument from its position in src_L ...
 		lua_xmove(src_L, dst_L, 1); // ... and move it to dst_L
 		lua_rawseti(dst_L, -2, i);  // Store in table at index (i-1)
 	}
 
 	#ifdef DEBUG
-	for (int i = 1; i <= msg->nres; i++) {
+	for (int i = 1; i <= msg->msg.nres; i++) {
 		lua_rawgeti(dst_L, -1, i);
 		if (lua_isnil(dst_L, -1)) {
 			lua_pop(dst_L, 2);  // pop nil and table
@@ -2456,18 +2646,78 @@ static int l_msg_unload(lua_State* dst_L, InboxMsg* msg) {
 	lua_rawgeti(dst_L, LUA_REGISTRYINDEX, msg->msg.ref); // Get the payload table
 	assertf(lua_type(dst_L, 2) == LUA_TTABLE,
 			"%s", lua_typename(dst_L, lua_type(dst_L, 2)));
-	for (int i = 1; i <= msg->nres; i++) {
+	for (int i = 1; i <= msg->msg.nres; i++) {
 		lua_rawgeti(dst_L, 2, i); // get value i from table
 		assert(!lua_isnoneornil(dst_L, -1));
 	}
 	lua_remove(dst_L, 2); // remove payload table from stack
 	luaL_unref(dst_L, LUA_REGISTRYINDEX, msg->msg.ref); // free reference
-	return 1 + msg->nres; // msg.type + payload
+	return 1 + msg->msg.nres; // msg.type + payload
+}
+
+
+static usize remotetask_str(const RemoteTask* rt, char* buf, usize bufcap) {
+	u64 tid_64 = tid64(rt->tid, rt->tid_gen);
+	if (rt->worker) {
+		char worker_buf[32];
+		int worker_buf_len = uworker_str(rt->worker, worker_buf, sizeof(worker_buf));
+		return snprintf(buf, bufcap, "Task{%.*s:%lx}", worker_buf_len, worker_buf, tid_64);
+	} else {
+		return snprintf(buf, bufcap, "Task{main:%lx}", tid_64);
+	}
+}
+
+
+static int l_remotetask_str(lua_State* L) {
+	RemoteTask* rt = lua_touserdata(L, 1);
+	char buf[64];
+	lua_pushlstring(L, buf, remotetask_str(rt, buf, sizeof(buf)));
+    return 1;
+}
+
+
+static int l_remotetask_gc(lua_State* L) {
+	RemoteTask* rt = lua_touserdata(L, 1);
+	trace_sched("GC RemoteTask %p", rt);
+	if (rt->worker)
+		worker_release(&rt->worker->w);
+	return 0;
+}
+
+
+static int l_recv_deliver_worker_msg(lua_State* L, InboxMsg* msg) {
+    // push sender on stack
+    RemoteTask* sender = uval_new(L, UValType_RemoteTask, sizeof(RemoteTask), 0);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_remotetask_luatabkey);
+	lua_setmetatable(L, -2);
+    sender->tid_gen = msg->msg_worker.sender_tid_gen;
+    sender->tid = msg->msg_worker.sender_tid;
+    sender->worker = msg->msg_worker.sender_worker;
+
+    // decode structclone data onto T's stack
+    // TODO: Handle exceptions; currently leaking buf_bytes memory if it would happen!
+    int nres = structclone_decode(L, msg->msg_worker.buf->bytes, msg->msg_worker.buf->len);
+    msg_msg_worker_free(msg);
+
+	return 2 + nres;
+}
+
+
+static int l_recv_deliver_worker_closed(lua_State* L, InboxMsg* msg) {
+    // lua_pushnil(L); // push "no sender"
+
+    // push sender: worker that exited (uworker_wrap_in_uval steals msg's reference to uw)
+    if (!uworker_wrap_in_uval(L, msg->worker_closed.worker)) {
+    	worker_release(&msg->worker_closed.worker->w);
+    	return 0;
+    }
+
+	return 2;
 }
 
 
 static int l_recv_deliver(lua_State* dst_L, T* t, InboxMsg* msg) {
-	trace_sched(T_ID_F " deliver msg type=%u", t_id(t), msg->type);
+	trace_sched(T_ID_F " deliver %s", t_id(t), inbox_msg_type_str(msg->type));
 	assert(msg->type != InboxMsgType_MSG_DIRECT); // should never happen
 
 	// wake tasks waiting to send
@@ -2477,9 +2727,22 @@ static int l_recv_deliver(lua_State* dst_L, T* t, InboxMsg* msg) {
 	}
 
 	lua_pushinteger(dst_L, msg->type);
-	if (msg->type == InboxMsgType_MSG)
-		return l_msg_unload(dst_L, msg);
-	return 1 + msg->nres;
+
+	switch ((enum InboxMsgType)msg->type) {
+    	case InboxMsgType_TIMER:
+    		return 1;
+    	case InboxMsgType_MSG:
+    		return l_msg_unload(dst_L, msg);
+    	case InboxMsgType_MSG_DIRECT:
+    		return 1 + msg->msg.nres;
+    	case InboxMsgType_MSG_WORKER:
+    		return l_recv_deliver_worker_msg(dst_L, msg);
+    	case InboxMsgType_WORKER_CLOSED:
+    		return l_recv_deliver_worker_closed(dst_L, msg);
+    }
+
+    panic("unexpected msg->type 0x%02x", msg->type);
+	return 0;
 }
 
 
@@ -2489,7 +2752,7 @@ static int l_recv_cont(lua_State* L, int ltstatus, void* arg) {
 	InboxMsg* msg = inbox_pop(t->inbox);
 	assert(msg != NULL);
 	if (msg->type == InboxMsgType_MSG_DIRECT)
-		return 1 + msg->nres;
+		return 1 + msg->msg.nres;
 	return l_recv_deliver(L, t, msg);
 }
 
@@ -2567,7 +2830,7 @@ static int l_send_task1(lua_State* L, T* t, T* dst_t) {
 	// Set message argument count, which includes msg type and sender.
 	// Note: The logical arithmetic is non-trivial here: It's actually "(lua_gettop(L)-1) + 1"
 	// -1 the destination argument to 'send()' +1 sender.
-	msg->nres = lua_gettop(L);
+	msg->msg.nres = lua_gettop(L);
 
 	lua_State* src_L = L;
 	lua_State* dst_L = t_L(dst_t);
@@ -2585,10 +2848,10 @@ static int l_send_task1(lua_State* L, T* t, T* dst_t) {
 	// Move message values from send() function's arguments to destination task's L stack,
 	// which is essentially the stack (activation record) of the recv() function call of the
 	// destination task.
-	lua_pushinteger(dst_L, msg->type); // push message type
-	lua_pushthread(src_L);             // push sender "thread" onto its own stack
-	lua_xmove(src_L, dst_L, 1);        // move sender "thread" to receiver's stack
-	lua_xmove(src_L, dst_L, msg->nres - 1); // arguments passed after 'dst' to send()
+	lua_pushinteger(dst_L, msg->type);          // push message type
+	lua_pushthread(src_L);                      // push sender "thread" onto its own stack
+	lua_xmove(src_L, dst_L, 1);                 // move sender "thread" to receiver's stack
+	lua_xmove(src_L, dst_L, msg->msg.nres - 1); // arguments passed after 'dst' to send()
 	msg->type = InboxMsgType_MSG_DIRECT;
 
 	// Now, there are two options for how to resume the waiting receiver task.
@@ -2673,21 +2936,44 @@ static int l_send_worker(lua_State* L) {
 		return 0;
 	UWorker* uw = uval->uw;
 
+	// check if worker is closed
+	if (atomic_load_explicit(&uw->w.status, memory_order_acquire) == Worker_CLOSED)
+		return luaL_error(L, "send to closed worker");
+
+	// allocate a buffer and make room for MiniBuf.len
+	Buf buf = {};
+    if UNLIKELY(!buf_reserve(&buf, 128))
+        return l_errno_error(L, ENOMEM);
+    buf.len += sizeof(((MiniBuf*)0)->len);
+
 	// structurally clone the arguments
 	int nargs = lua_gettop(L) - 1; // -1: not including worker
-	Buf buf = {};
 	int err = structclone_encode(L, &buf, 0, nargs);
 	if (err)
 		return l_errno_error(L, -err);
+
+	// interpret data at buf.bytes as minibuf
+	MiniBuf* minibuf = (MiniBuf*)buf.bytes;
+	minibuf->len = buf.len - sizeof(minibuf->len);
 
 	// put message on target worker's CQ
 	ChanTx tx = chan_write_begin(uw->s.asyncwork_cq, 0);
 	assertf(tx.entry != NULL, "chan_write(cq) failed");
 	AsyncWorkRes* res = tx.entry;
+
 	res->op = AsyncWorkOp_WORKER_MSG;
-	res->msg.a = 1;
-	res->msg.b = 2;
-	res->msg.c = 3;
+	res->msg.buf = minibuf;
+
+	res->msg.sender_tid_gen = t->tid_gen;
+	res->msg.sender_tid = t->tid;
+	if (t->s->isworker) {
+		UWorker* local_uw = s_worker(t->s);
+		worker_retain(&local_uw->w);
+		res->msg.sender_worker = local_uw;
+	} else {
+		res->msg.sender_worker = NULL;
+	}
+
 	chan_write_commit(uw->s.asyncwork_cq, tx);
 
 	// notify the worker's scheduler that there's stuff in asyncwork_cq
@@ -2898,6 +3184,7 @@ static const luaL_Reg dew_lib[] = {
 	{"await", l_await},
 	{"recv", l_recv},
 	{"send", l_send},
+	{"tid", l_tid},
 	{"structclone_encode", l_structclone_encode},
 	{"structclone_decode", l_structclone_decode},
 
@@ -2946,7 +3233,17 @@ int luaopen_runtime(lua_State* L) {
 	luaL_newmetatable(L, "Worker");
 	lua_pushcfunction(L, l_uworker_uval_gc);
 	lua_setfield(L, -2, "__gc");
+    lua_pushcfunction(L, l_uworker_uval_str);
+    lua_setfield(L, -2, "__tostring");
 	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_uworker_uval_luatabkey);
+
+	// RemoteTask
+	luaL_newmetatable(L, "RemoteTask");
+	lua_pushcfunction(L, l_remotetask_gc);
+	lua_setfield(L, -2, "__gc");
+    lua_pushcfunction(L, l_remotetask_str);
+    lua_setfield(L, -2, "__tostring");
+	lua_rawsetp(L, LUA_REGISTRYINDEX, &g_remotetask_luatabkey);
 
 	// export libc & syscall constants
 	#define _(NAME) \
