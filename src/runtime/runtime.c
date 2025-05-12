@@ -565,15 +565,97 @@ static int l_sleep(lua_State* L) {
 }
 
 
-typedef struct TaskPoolEnt {
+typedef struct TaskInfo {
+	u32 tid_gen;
+	u32 sid; // what S this belongs to
+	// u32 type : 8; // enum TaskType
 	T*  t;
-	u16 tid_gen;
-	u8  _unused[sizeof(void*) - sizeof(u16)];
-} TaskPoolEnt;
+} TaskInfo;
+
+typedef struct SRegInfo {
+	u16 gen;
+	S*  s;
+} SRegInfo;
+
+enum TaskType {
+	TaskType_LOCAL,  // task on this computer
+	// TaskType_REMOTE, // task on a different comuter
+};
+
+// global scheduler registry
+static Pool*           g_sreg = NULL;
+static pthread_mutex_t g_sreg_mu;
+
+// global task registry
+static Pool*           g_taskreg = NULL;
+static pthread_mutex_t g_taskreg_mu;
+
+
+void dew_runtime_init() {
+	pthread_mutex_init(&g_sreg_mu, NULL);
+	pthread_mutex_init(&g_taskreg_mu, NULL);
+}
+
+
+static bool sreg_add(S* s) {
+	u32 idx;
+	s->sid = 0; // in case of error
+	pthread_mutex_lock(&g_sreg_mu);
+	SRegInfo* sinfo = pool_entry_alloc(&g_sreg, &idx, sizeof(SRegInfo));
+	if (sinfo != NULL) {
+		if UNLIKELY(idx > 0xffff) {
+			pool_entry_free(g_sreg, idx);
+			sinfo = NULL;
+		} else {
+			sinfo->s = s;
+			s->sid = idx | ((u32)sinfo->gen << 16);
+		}
+	}
+	pthread_mutex_unlock(&g_sreg_mu);
+	return sinfo != NULL;
+}
+
+
+static void sreg_del(S* s) {
+	pthread_mutex_lock(&g_sreg_mu);
+	SRegInfo* sinfo = pool_entry(g_sreg, s->sid & 0xffff, sizeof(SRegInfo));
+	assertf((u16)(s->sid >> 16) == sinfo->gen, "%u, %u", (s->sid >> 16), sinfo->gen);
+	sinfo->gen++; // increment generation so we can detect invalid deref
+	pool_entry_free(g_sreg, s->sid & 0xffff);
+	pthread_mutex_unlock(&g_sreg_mu);
+	s->sid = 0;
+}
+
+
+static bool taskreg_add(T* t) {
+	u32 idx;
+	assertnotnull(t->s);
+	pthread_mutex_lock(&g_taskreg_mu);
+	TaskInfo* taskinfo = pool_entry_alloc(&g_taskreg, &idx, sizeof(TaskInfo));
+	if (taskinfo != NULL) {
+		taskinfo->sid = t->s->sid;
+		taskinfo->t = t;
+		t->tid_gen = taskinfo->tid_gen;
+		t->tid = idx;
+	}
+	pthread_mutex_unlock(&g_taskreg_mu);
+	return taskinfo != NULL;
+}
+
+
+static void taskreg_del(T* t) {
+	pthread_mutex_lock(&g_taskreg_mu);
+	TaskInfo* ent = pool_entry(g_taskreg, t->tid, sizeof(TaskInfo));
+	assertf(t->tid_gen == ent->tid_gen, "%u, %u", t->tid_gen, ent->tid_gen);
+	ent->tid_gen++; // increment generation so we can detect invalid deref
+	pool_entry_free(g_taskreg, t->tid);
+	pthread_mutex_unlock(&g_taskreg_mu);
+	t->tid = 0;
+}
 
 
 static bool s_task_register(S* s, T* t) {
-	TaskPoolEnt* ent = pool_entry_alloc(&s->tasks, &t->tid, sizeof(TaskPoolEnt));
+	TaskInfo* ent = pool_entry_alloc(&s->taskreg, &t->tid, sizeof(TaskInfo));
 	if (ent != NULL) {
 		ent->t = t;
 		t->tid_gen = ent->tid_gen;
@@ -584,22 +666,22 @@ static bool s_task_register(S* s, T* t) {
 
 static void s_task_unregister(S* s, T* t) {
 	// increment generation so that s_task_check_gen can detect invalid tid_gen
-	TaskPoolEnt* ent = pool_entry(s->tasks, t->tid, sizeof(TaskPoolEnt));
+	TaskInfo* ent = pool_entry(s->taskreg, t->tid, sizeof(TaskInfo));
 	assertf(t->tid_gen == ent->tid_gen, "%u, %u", t->tid_gen, ent->tid_gen);
 	ent->tid_gen++;
 
-	pool_entry_free(s->tasks, t->tid);
+	pool_entry_free(s->taskreg, t->tid);
 }
 
 
 inline static T* s_task(S* s, u32 tid) {
-	TaskPoolEnt* ent = pool_entry(s->tasks, tid, sizeof(TaskPoolEnt));
+	TaskInfo* ent = pool_entry(s->taskreg, tid, sizeof(TaskInfo));
 	return ent->t;
 }
 
 
 static T* nullable s_task_check_gen(S* s, u32 tid, u16 tid_gen) {
-	TaskPoolEnt* ent = pool_entry(s->tasks, tid, sizeof(TaskPoolEnt));
+	TaskInfo* ent = pool_entry(s->taskreg, tid, sizeof(TaskInfo));
 	if (ent->tid_gen != tid_gen)
 		return NULL;
 	return ent->t;
@@ -897,8 +979,10 @@ void t_gc(lua_State* L, T* t) {
 	trace_sched(T_ID_F " GC", t_id(t));
 	// Remove from S's 'tasks' registry, effectively invalidating tid.
 	// Skip useless work in case of main task (tid 1)
-	if (t->tid != 1)
-		s_task_unregister(t->s, t);
+	if (t->tid != 1) {
+		taskreg_del(t);
+		s_task_unregister(t->s, t); // TODO: remove DEPRECATED
+	}
 }
 
 
@@ -933,7 +1017,7 @@ static void t_remove_from_waiters(T* t) {
 
 	u32 next_waiter_tid = t->info.wait_task.next_tid;
 	u32 wait_tid = t->info.wait_task.wait_tid;
-	assertf(!pool_entry_isfree(s->tasks, wait_tid), "%u", wait_tid);
+	assertf(!pool_entry_isfree(s->taskreg, wait_tid), "%u", wait_tid);
 	T* other_t = s_task(s, wait_tid);
 
 	// common case is head of list
@@ -1257,7 +1341,15 @@ static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 	t->nrefs = 1; // S's "live" reference
 	t->resume_nres = nargs;
 
-	// allocate id and store in 'tasks' set
+	// register task, allocating a tid
+	if UNLIKELY(!taskreg_add(t)) {
+		lua_closethread(NL, L);
+		return l_errno_error(L, ENOMEM);
+	}
+	trace_sched("register task " T_ID_F " (L=%p)", t_id(t), t_L(t));
+
+	// allocate id and store in 'tasks' set (DEPRECATED)
+	// TODO: remove
 	if UNLIKELY(!s_task_register(s, t)) {
 		lua_closethread(NL, L);
 		return l_errno_error(L, ENOMEM);
@@ -1270,7 +1362,8 @@ static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 
 	// setup t to be run next by schedule
 	if UNLIKELY(!s_runq_put_runnext(s, t)) {
-		s_task_unregister(s, t);
+		taskreg_del(t);
+		s_task_unregister(s, t); // TODO: remove DEPRECATED
 		lua_closethread(NL, L);
 		return l_errno_error(L, ENOMEM);
 	}
@@ -1520,8 +1613,11 @@ static void s_shutdown(S* s) {
 static void s_free(S* s) {
 	trace_sched("free " S_ID_F, s_id(s));
 
+	if (s->sid != 0)
+		sreg_del(s);
+
 	iopoll_dispose(&s->iopoll);
-	pool_free_pool(s->tasks);
+	pool_free_pool(s->taskreg);
 	free(s->runq);
 	array_free((struct Array*)&s->timers);
 
@@ -1548,7 +1644,7 @@ static int s_finalize(S* s) {
 
 	// stop main task
 	if (s->nlive > 0) {
-		assertf(!pool_entry_isfree(s->tasks, 1),
+		assertf(!pool_entry_isfree(s->taskreg, 1),
 				"main task is DEAD but other tasks are still alive");
 		t_stop(NULL, s_task(s, 1));
 	}
@@ -1603,6 +1699,7 @@ static int s_finalize(S* s) {
 	}
 
 	trace_sched("finalized " S_ID_F, s_id(s));
+	s_free(s);
 
 	// clear TLS entry to catch bugs
 	tls_s = NULL;
@@ -1610,7 +1707,6 @@ static int s_finalize(S* s) {
 		tls_s_id = 0;
 	#endif
 
-	s_free(s);
 	return 0;
 }
 
@@ -1707,12 +1803,20 @@ static int s_main(S* s) {
 		return l_errno_error(L, ENOMEM);
 
 	// allocate task pool with inital space for 8 entries
-	if UNLIKELY(!pool_init(&s->tasks, 8, sizeof(T*)))
+	if UNLIKELY(!pool_init(&s->taskreg, 8, sizeof(T*)))
 		return l_errno_error(L, ENOMEM);
+
+	// register S
+	if UNLIKELY(!sreg_add(s)) {
+		dlog("sreg_add: %s", strerror(ENOMEM));
+		s_free(s);
+		return -ENOMEM;
+	}
+	dlog("sreg: assigned sid %u to S %p", s->sid, s);
 
 	// initialize platform I/O facility
 	int err = iopoll_init(&s->iopoll, s);
-	if (err) {
+	if UNLIKELY(err) {
 		dlog("error: iopoll_init: %s", strerror(-err));
 		s_free(s);
 		return l_errno_error(L, -err);

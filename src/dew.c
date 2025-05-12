@@ -204,6 +204,7 @@ static int pmain(lua_State* L) {
 
 int main(int argc, char* argv[]) {
 	g_prog = argv[0] && *argv[0] ? argv[0] : "dew";
+	dew_runtime_init();
 	lua_State* L = luaL_newstate();
 	if (L == NULL) {
 		logerr("cannot create state: not enough memory");

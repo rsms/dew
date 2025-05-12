@@ -9,9 +9,10 @@
 
 API_BEGIN
 
-typedef struct S    S; // scheduler (M+P in Go lingo)
-typedef struct T    T; // task
-typedef struct RunQ RunQ;
+typedef struct S    S;    // scheduler (M+P in Go lingo)
+typedef struct T    T;    // task
+typedef struct RunQ RunQ; // run queue (FIFO)
+typedef struct GID  GID;  // globally unique identifier
 
 // Worker forward declaration since S uses Worker
 typedef struct Worker Worker;
@@ -19,6 +20,11 @@ typedef struct Worker Worker;
 struct RunQ {
 	FIFO fifo;
 	T*   entries[];
+};
+
+struct GID {
+	u32 idx;
+	u32 gen;
 };
 
 enum TStatus {
@@ -91,7 +97,8 @@ enum { // S.notes
 struct S {
 	lua_State*    L;         // base Lua environment
 	IOPoll        iopoll;    // platform-specific I/O facility
-	Pool*         tasks;     // all live tasks
+	Pool*         taskreg;   // all live tasks
+	u32           sid;
 	u32           nlive;     // number of live (not T_DEAD) tasks
 	_Atomic(bool) isclosed;  // true when the parent worker is shutting down
 	_Atomic(u8)   notes;     // events from a worker (e.g. worker exited; S_NOTE_ bits)

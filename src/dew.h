@@ -387,5 +387,7 @@ isize snprintf_lval(char* buf, usize bufcap, lua_State* L, int i);
     #define fmtlval(...) "value"
 #endif
 
+void dew_runtime_init();
+
 
 API_END
