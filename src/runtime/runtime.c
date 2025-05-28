@@ -586,14 +586,9 @@ enum TaskType {
 static Pool*           g_sreg = NULL;
 static pthread_mutex_t g_sreg_mu;
 
-// global task registry
-static Pool*           g_taskreg = NULL;
-static pthread_mutex_t g_taskreg_mu;
-
 
 void dew_runtime_init() {
 	pthread_mutex_init(&g_sreg_mu, NULL);
-	pthread_mutex_init(&g_taskreg_mu, NULL);
 }
 
 
@@ -624,33 +619,6 @@ static void sreg_del(S* s) {
 	pool_entry_free(g_sreg, s->sid & 0xffff);
 	pthread_mutex_unlock(&g_sreg_mu);
 	s->sid = 0;
-}
-
-
-static bool taskreg_add(T* t) {
-	u32 idx;
-	assertnotnull(t->s);
-	pthread_mutex_lock(&g_taskreg_mu);
-	TaskInfo* taskinfo = pool_entry_alloc(&g_taskreg, &idx, sizeof(TaskInfo));
-	if (taskinfo != NULL) {
-		taskinfo->sid = t->s->sid;
-		taskinfo->t = t;
-		t->tid_gen = taskinfo->tid_gen;
-		t->tid = idx;
-	}
-	pthread_mutex_unlock(&g_taskreg_mu);
-	return taskinfo != NULL;
-}
-
-
-static void taskreg_del(T* t) {
-	pthread_mutex_lock(&g_taskreg_mu);
-	TaskInfo* ent = pool_entry(g_taskreg, t->tid, sizeof(TaskInfo));
-	assertf(t->tid_gen == ent->tid_gen, "%u, %u", t->tid_gen, ent->tid_gen);
-	ent->tid_gen++; // increment generation so we can detect invalid deref
-	pool_entry_free(g_taskreg, t->tid);
-	pthread_mutex_unlock(&g_taskreg_mu);
-	t->tid = 0;
 }
 
 
@@ -979,10 +947,8 @@ void t_gc(lua_State* L, T* t) {
 	trace_sched(T_ID_F " GC", t_id(t));
 	// Remove from S's 'tasks' registry, effectively invalidating tid.
 	// Skip useless work in case of main task (tid 1)
-	if (t->tid != 1) {
-		taskreg_del(t);
-		s_task_unregister(t->s, t); // TODO: remove DEPRECATED
-	}
+	if (t->tid != 1)
+		s_task_unregister(t->s, t);
 }
 
 
@@ -1342,19 +1308,11 @@ static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 	t->resume_nres = nargs;
 
 	// register task, allocating a tid
-	if UNLIKELY(!taskreg_add(t)) {
-		lua_closethread(NL, L);
-		return l_errno_error(L, ENOMEM);
-	}
-	trace_sched("register task " T_ID_F " (L=%p)", t_id(t), t_L(t));
-
-	// allocate id and store in 'tasks' set (DEPRECATED)
-	// TODO: remove
 	if UNLIKELY(!s_task_register(s, t)) {
 		lua_closethread(NL, L);
 		return l_errno_error(L, ENOMEM);
 	}
-	trace_sched("register task " T_ID_F, t_id(t));
+	trace_sched("register task " T_ID_F " (L=%p)", t_id(t), t_L(t));
 
 	// assert that main task is assigned tid 1
 	if (!parent)
@@ -1362,8 +1320,7 @@ static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 
 	// setup t to be run next by schedule
 	if UNLIKELY(!s_runq_put_runnext(s, t)) {
-		taskreg_del(t);
-		s_task_unregister(s, t); // TODO: remove DEPRECATED
+		s_task_unregister(s, t);
 		lua_closethread(NL, L);
 		return l_errno_error(L, ENOMEM);
 	}
@@ -2219,7 +2176,7 @@ static int l_spawn_worker(lua_State* L) {
 	luaL_checktype(L, 1, LUA_TFUNCTION);
 
 	// Encode the thread's main function as Lua code, to be transferred to the thread.
-	// TODO: consider copying upvalues the way we do in structclone.
+	// TODO: consider copying upvalues the way structclone does it.
 	lua_settop(L, 1); // ensure function is on the top of the stack
 	Buf buf = {};
 	int err = buf_append_luafun(&buf, L, /*strip_debuginfo*/false);

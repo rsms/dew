@@ -12,7 +12,7 @@ API_BEGIN
 typedef struct S    S;    // scheduler (M+P in Go lingo)
 typedef struct T    T;    // task
 typedef struct RunQ RunQ; // run queue (FIFO)
-typedef struct GID  GID;  // globally unique identifier
+typedef struct TID  TID;  // globally unique identifier
 
 // Worker forward declaration since S uses Worker
 typedef struct Worker Worker;
@@ -22,7 +22,7 @@ struct RunQ {
 	T*   entries[];
 };
 
-struct GID {
+struct TID {
 	u32 idx;
 	u32 gen;
 };
@@ -125,8 +125,10 @@ struct S {
 // RemoteTask represents a task of another worker
 typedef struct RemoteTask {
     UVal              uval;    // .type=UValType_RemoteTask
+    u32               sid;     // owning S's ID
+    u16               _unused; //
     u16               tid_gen; // task ID generation
-    u32               tid;     // task ID (in remote S's namespace)
+    u32               tid;     // task ID (in owning S's namespace)
     UWorker* nullable worker;  // NULL if local thread
 } RemoteTask;
 
