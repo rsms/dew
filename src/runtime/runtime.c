@@ -259,8 +259,16 @@ static const char* t_status_str(u8 status) {
 }
 
 
-static u64 tid64(u32 tid, u16 tid_gen) {
-	return (u64)tid | ((u64)tid_gen << 32);
+inline static u64 gtid_make(u32 sid, u32 tid) {
+	return (u64)tid | ((u64)sid << 32);
+}
+
+inline static u32 gtid_sid(GTID gtid) {
+	return (u32)(gtid >> 32);
+}
+
+inline static u32 gtid_tid(GTID gtid) {
+	return (u32)(gtid & 0xfffffffful);
 }
 
 
@@ -566,10 +574,8 @@ static int l_sleep(lua_State* L) {
 
 
 typedef struct TaskInfo {
-	u32 tid_gen;
-	u32 sid; // what S this belongs to
-	// u32 type : 8; // enum TaskType
-	T*  t;
+	u8 gen;
+	T* t;
 } TaskInfo;
 
 typedef struct SRegInfo {
@@ -594,20 +600,26 @@ void dew_runtime_init() {
 
 static bool sreg_add(S* s) {
 	u32 idx;
-	s->sid = 0; // in case of error
+	assertf(s->sid == 0, "%u", s->sid);
 	pthread_mutex_lock(&g_sreg_mu);
 	SRegInfo* sinfo = pool_entry_alloc(&g_sreg, &idx, sizeof(SRegInfo));
-	if (sinfo != NULL) {
-		if UNLIKELY(idx > 0xffff) {
-			pool_entry_free(g_sreg, idx);
-			sinfo = NULL;
-		} else {
-			sinfo->s = s;
-			s->sid = idx | ((u32)sinfo->gen << 16);
-		}
+
+	if UNLIKELY(sinfo == NULL) {
+		pthread_mutex_unlock(&g_sreg_mu);
+		dlog("sreg_add: %s", strerror(ENOMEM));
+		return false;
+	}
+
+	if UNLIKELY(idx > 0xffff) {
+		pool_entry_free(g_sreg, idx);
+		sinfo = NULL;
+	} else {
+		sinfo->s = s;
+		s->sid = idx | ((u32)sinfo->gen << 16);
 	}
 	pthread_mutex_unlock(&g_sreg_mu);
-	return sinfo != NULL;
+	trace_sched("[sreg] assigned sid %u to S %p", s->sid, s);
+	return true;
 }
 
 
@@ -622,37 +634,67 @@ static void sreg_del(S* s) {
 }
 
 
-static bool s_task_register(S* s, T* t) {
-	TaskInfo* ent = pool_entry_alloc(&s->taskreg, &t->tid, sizeof(TaskInfo));
-	if (ent != NULL) {
-		ent->t = t;
-		t->tid_gen = ent->tid_gen;
-	}
-	return ent != NULL;
+static S* nullable sreg_get(u32 sid) {
+	SRegInfo* sinfo = NULL;
+	u32 idx = sid & 0xffff;
+	assert(idx != 0); // more helpful error messages than pool_entry, which has the same check
+	pthread_mutex_lock(&g_sreg_mu);
+	if (!pool_idx_isdead(g_sreg, idx))
+		sinfo = pool_entry(g_sreg, idx, sizeof(SRegInfo));
+	pthread_mutex_unlock(&g_sreg_mu);
+	if (sinfo == NULL || sinfo->gen != (u16)(sid >> 16))
+		return NULL;
+	return sinfo->s;
 }
 
 
-static void s_task_unregister(S* s, T* t) {
-	// increment generation so that s_task_check_gen can detect invalid tid_gen
-	TaskInfo* ent = pool_entry(s->taskreg, t->tid, sizeof(TaskInfo));
-	assertf(t->tid_gen == ent->tid_gen, "%u, %u", t->tid_gen, ent->tid_gen);
-	ent->tid_gen++;
+static bool s_taskreg_add(S* s, T* t) {
+	TaskInfo* tinfo = pool_entry_alloc(&s->taskreg, &t->tid, sizeof(TaskInfo));
+	if LIKELY(tinfo != NULL) {
+		if UNLIKELY(t->tid > 0xffffff) {
+			dlog(S_ID_F " out of TIDs", s_id(s));
+			pool_entry_free(s->taskreg, t->tid);
+			t->tid = 0;
+			return false;
+		}
+		tinfo->t = t;
+		t->tid |= (u32)tinfo->gen << 24;
+	}
+	return tinfo != NULL;
+}
 
-	pool_entry_free(s->taskreg, t->tid);
+
+static void s_taskreg_remove(S* s, T* t) {
+	u32 idx = t->tid & 0xffffff;
+
+	// increment generation so that s_task_checked can detect invalid tid_gen
+	TaskInfo* tinfo = pool_entry(s->taskreg, idx, sizeof(TaskInfo));
+	#ifdef DEBUG
+		u8 gen = (u8)(t->tid >> 24);
+		assertf(gen == tinfo->gen, "%u, %u", gen, tinfo->gen);
+	#endif
+	tinfo->gen++;
+
+	pool_entry_free(s->taskreg, idx);
 }
 
 
 inline static T* s_task(S* s, u32 tid) {
-	TaskInfo* ent = pool_entry(s->taskreg, tid, sizeof(TaskInfo));
-	return ent->t;
+	u32 idx = tid & 0xffffff;
+	TaskInfo* tinfo = pool_entry(s->taskreg, idx, sizeof(TaskInfo));
+	return tinfo->t;
 }
 
 
-static T* nullable s_task_check_gen(S* s, u32 tid, u16 tid_gen) {
-	TaskInfo* ent = pool_entry(s->taskreg, tid, sizeof(TaskInfo));
-	if (ent->tid_gen != tid_gen)
+static T* nullable s_task_checked(S* s, u32 tid) {
+	u32 idx = tid & 0xffffff;
+	u8 gen = (u8)(tid >> 24);
+	if UNLIKELY(pool_idx_isdead(s->taskreg, idx))
 		return NULL;
-	return ent->t;
+	TaskInfo* tinfo = pool_entry(s->taskreg, idx, sizeof(TaskInfo));
+	if (tinfo->gen != gen)
+		return NULL;
+	return tinfo->t;
 }
 
 
@@ -948,7 +990,7 @@ void t_gc(lua_State* L, T* t) {
 	// Remove from S's 'tasks' registry, effectively invalidating tid.
 	// Skip useless work in case of main task (tid 1)
 	if (t->tid != 1)
-		s_task_unregister(t->s, t);
+		s_taskreg_remove(t->s, t);
 }
 
 
@@ -1016,19 +1058,23 @@ static void worker_wake_waiters(Worker* w) {
 		T* waiting_t = s_task(s, tid);
 		trace_sched("wake " T_ID_F " waiting on Worker %p", t_id(waiting_t), w);
 
-		// we expect task to be waiting for a user worker or work performed by an async worker
-		assert(waiting_t->status == T_WAIT_WORKER || waiting_t->status == T_WAIT_ASYNC);
+		if (waiting_t->status != T_DEAD) {
+			// we expect task to be waiting for a user worker or work performed by an async worker
+			assertf(waiting_t->status == T_WAIT_WORKER || waiting_t->status == T_WAIT_ASYNC,
+			        "%s (%u)", t_status_str(waiting_t->status), waiting_t->status);
 
-		// put waiting task on (priority) runq
-		bool ok;
-		if (tid == w->waiters) {
-			ok = s_runq_put_runnext(s, waiting_t);
-		} else {
-			ok = s_runq_put(s, waiting_t);
+			// put waiting task on (priority) runq
+			bool ok;
+			if (tid == w->waiters) {
+				ok = s_runq_put_runnext(s, waiting_t);
+			} else {
+				ok = s_runq_put(s, waiting_t);
+			}
+			if UNLIKELY(!ok)
+				panic_oom();
 		}
-		if UNLIKELY(!ok)
-			panic_oom();
 
+		assert(waiting_t->info.wait_worker.next_tid != tid);
 		tid = waiting_t->info.wait_worker.next_tid;
 	}
 	w->waiters = 0;
@@ -1078,14 +1124,10 @@ UNUSED static const char* TDied_str(enum TDied died_how) {
 };
 
 
-static void msg_msg_worker_free(InboxMsg* msg) {
-	assert(msg->type == InboxMsgType_MSG_WORKER);
-	free(msg->msg_worker.buf);
-	msg->msg_worker.buf = NULL;
-	if (msg->msg_worker.sender_worker) {
-		worker_release(&msg->msg_worker.sender_worker->w);
-		msg->msg_worker.sender_worker = NULL;
-	}
+static void msg_msg_remote_free(InboxMsg* msg) {
+	assert(msg->type == InboxMsgType_MSG_REMOTE);
+	free(msg->msg_remote.buf);
+	msg->msg_remote.buf = NULL;
 }
 
 
@@ -1104,8 +1146,8 @@ static void t_inbox_free(T* t) {
 			case InboxMsgType_MSG_DIRECT:
 				// no cleanup required
 				break;
-			case InboxMsgType_MSG_WORKER:
-				msg_msg_worker_free(msg);
+			case InboxMsgType_MSG_REMOTE:
+				msg_msg_remote_free(msg);
 				break;
 			case InboxMsgType_WORKER_CLOSED:
 				msg_worker_closed_free(msg);
@@ -1125,11 +1167,10 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 
 	// Note: t_stop updates t->status before calling t_finalize. For that reason we can't trust
 	// the current value of t->status in here but must use prev_tstatus.
-	trace_sched(T_ID_F " exited (died_how=%s)", t_id(t), TDied_str(died_how));
+	trace_sched(T_ID_F " exited (died_how=%s, status=%s)",
+	            t_id(t), TDied_str(died_how), t_status_str(prev_tstatus));
 	if UNLIKELY(died_how == TDied_ERR) {
-		// if this is the main task, set s->exiterr
-		if (t->tid == 1)
-			s->exiterr = true;
+		s->exiterr = true;
 
 		// one error as the final result value
 		t->resume_nres = 1;
@@ -1137,13 +1178,14 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 		// unless there are tasks waiting for this task, report the error as unhandled
 		if (t->waiters == 0) {
 			if (s->isworker && t->tid == 1) {
-				// main task of a worker; only report error if no task is waiting for worker
+				// main task of a worker
 				UWorker* w = s_worker(s);
+				if (!w->errdesc_invalid)
+					free(w->errdesc); // just in case...
+				w->errdesc_invalid = 0;
+				w->errdesc = t_report_error_buf(t);
+				// only report error if no task is waiting for worker
 				if (atomic_load_explicit(&w->w.waiters, memory_order_acquire)) {
-					if (!w->errdesc_invalid)
-						free(w->errdesc); // just in case...
-					w->errdesc_invalid = 0;
-					w->errdesc = t_report_error_buf(t);
 					#if DEBUG
 					t_report_error(t, "[DEBUG] Uncaught error in worker");
 					#endif
@@ -1190,11 +1232,11 @@ static void t_finalize(T* t, enum TDied died_how, u8 prev_tstatus) {
 		t->waiters = 0;
 	}
 
-	// if S is supposed to exit() when done, do that now if this is the last task
-	if (s->doexit && s->nlive == 0 && s->workers == NULL) {
-		trace_sched("exit(%d)", (int)s->exiterr);
-		return exit(s->exiterr);
-	}
+	// // if S is supposed to exit() when done, do that now if this is the last task
+	// if (s->doexit && s->nlive == 0 && s->workers == NULL) {
+	// 	trace_sched("exit(%d)", (int)s->exiterr);
+	// 	return exit(s->exiterr);
+	// }
 
 	// free any un-recv messages in inbox
 	if (t->inbox)
@@ -1308,7 +1350,7 @@ static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 	t->resume_nres = nargs;
 
 	// register task, allocating a tid
-	if UNLIKELY(!s_task_register(s, t)) {
+	if UNLIKELY(!s_taskreg_add(s, t)) {
 		lua_closethread(NL, L);
 		return l_errno_error(L, ENOMEM);
 	}
@@ -1320,7 +1362,7 @@ static int s_spawn_task(S* s, lua_State* L, T* nullable parent) {
 
 	// setup t to be run next by schedule
 	if UNLIKELY(!s_runq_put_runnext(s, t)) {
-		s_task_unregister(s, t);
+		s_taskreg_remove(s, t);
 		lua_closethread(NL, L);
 		return l_errno_error(L, ENOMEM);
 	}
@@ -1380,9 +1422,8 @@ static void s_workers_add(S* s, Worker* w) {
 
 
 static void t_send_worker_closed_msg(T* t, UWorker* uw) {
-	// put a message in its inbox
-	// Note: Inbox is practically unbounded in this case.
-	// The only other option is to drop the message.
+	// put a message in T's inbox.
+	// Note: Inbox is practically unbounded here (only other option is to drop the message)
 	const u32 maxcap = U32_MAX;
 	InboxMsg* msg = inbox_add(&t->inbox, maxcap);
 	if UNLIKELY(msg == NULL) {
@@ -1417,7 +1458,7 @@ static void s_on_worker_closed(S* s, Worker* w) {
 	// post a message to the spawner
 	if (w->wkind == WorkerKind_USER) {
 		UWorker* uw = (UWorker*)w;
-		T* t = s_task_check_gen(s, uw->spawned_by_tid, uw->spawned_by_tid_gen);
+		T* t = s_task_checked(s, uw->spawned_by_tid);
 		if (t && t->status != T_DEAD) {
 			assert(t->status != T_WAIT_WORKER); // handled by worker_wake_waiters
 			t_send_worker_closed_msg(t, uw);
@@ -1457,8 +1498,8 @@ static void s_reap_workers(S* s) {
 
 
 static void s_recv_worker_msg(S* s, AsyncWorkRes* res) {
-	// This function is called then S discovers that a message has been sent to its worker.
-	// It's job is to deliver the message to this S's main task.
+	// This function is called when S discovers that a message has been sent to its worker.
+	// Its job is to deliver the message to this S's main task.
 	assert(res->op == AsyncWorkOp_WORKER_MSG);
 
 	// Inbox is practically unbounded in this case. The only other option is to drop the message.
@@ -1478,11 +1519,10 @@ static void s_recv_worker_msg(S* s, AsyncWorkRes* res) {
 		logwarn("T%u inbox is full; dropping message", t->tid);
 		goto bail;
 	}
-	msg->type = InboxMsgType_MSG_WORKER;
-	msg->msg_worker.sender_tid_gen = res->msg.sender_tid_gen;
-	msg->msg_worker.sender_tid = res->msg.sender_tid;
-	msg->msg_worker.sender_worker = res->msg.sender_worker;
-	msg->msg_worker.buf = res->msg.buf;
+	msg->type = InboxMsgType_MSG_REMOTE;
+	msg->msg_remote.sender_tid = res->msg.sender_tid;
+	msg->msg_remote.sender_sid = res->msg.sender_sid;
+	msg->msg_remote.buf = res->msg.buf;
 
 	// if the destination task is not currently waiting in a call to recv(),
 	// the message will be delivered later.
@@ -1497,8 +1537,6 @@ static void s_recv_worker_msg(S* s, AsyncWorkRes* res) {
 
 bail:
 	free(res->msg.buf);
-	if (res->msg.sender_worker)
-		worker_release(&res->msg.sender_worker->w);
 }
 
 
@@ -1628,7 +1666,7 @@ static int s_finalize(S* s) {
 
 		// close all workers
 		for (Worker* w = s->workers; w; w = w->next) {
-			trace_worker("shutting down worker %p", w);
+			trace_worker("shutting down %s", fmtworker(w));
 			worker_close(w);
 		}
 
@@ -1636,19 +1674,24 @@ static int s_finalize(S* s) {
 		for (Worker* w = s->workers; w;) {
 			int err = pthread_join(w->thread, NULL);
 			if (err)
-				logwarn("failed to wait for worker thread=%p: %s", w->thread, strerror(err));
+				logwarn("failed to wait for %s: %s", fmtworker(w), strerror(err));
 			Worker* next_w = w->next;
 			if (!exiting)
 				worker_release(w);
 			w = next_w;
 		}
+	}
 
-		// if S is supposed to exit() when done, do that now
+	// reload
+	exiting = exiting || atomic_load_explicit(&g_exiting, memory_order_acquire);
+
+	// if S is supposed to exit() when done, do that now
+	if (exiting) {
 		if (s->doexit) {
 			trace_sched("exit(%d)", (int)s->exiterr);
 			exit(s->exiterr);
 		}
-
+	} else {
 		if (s->asyncwork_sq)
 			chan_close(s->asyncwork_sq);
 		if (s->asyncwork_cq)
@@ -1656,6 +1699,9 @@ static int s_finalize(S* s) {
 	}
 
 	trace_sched("finalized " S_ID_F, s_id(s));
+	if (exiting)
+		return 0;
+
 	s_free(s);
 
 	// clear TLS entry to catch bugs
@@ -1764,12 +1810,10 @@ static int s_main(S* s) {
 		return l_errno_error(L, ENOMEM);
 
 	// register S
-	if UNLIKELY(!sreg_add(s)) {
-		dlog("sreg_add: %s", strerror(ENOMEM));
+	if UNLIKELY(s->sid == 0 && !sreg_add(s)) {
 		s_free(s);
 		return -ENOMEM;
 	}
-	dlog("sreg: assigned sid %u to S %p", s->sid, s);
 
 	// initialize platform I/O facility
 	int err = iopoll_init(&s->iopoll, s);
@@ -1820,6 +1864,51 @@ static int l_main(lua_State* L) {
 int luaopen_runtime(lua_State* L);
 
 
+static usize remotetask_str(const RemoteTask* rt, char* buf, usize bufcap) {
+	return snprintf(buf, bufcap, "RemoteTask#%lx", gtid_make(rt->sid, rt->tid));
+}
+
+
+static RemoteTask* remotetask_create(lua_State* L, u32 sid, u32 tid) {
+    RemoteTask* rt = uval_new(L, UValType_RemoteTask, sizeof(RemoteTask), 0);
+    assertnotnull(rt);
+	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_remotetask_luatabkey);
+	lua_setmetatable(L, -2);
+	rt->flags = 0;
+    rt->tid = tid;
+    rt->sid = sid;
+    return rt;
+}
+
+
+static int l_remotetask_str(lua_State* L) {
+	RemoteTask* rt = lua_touserdata(L, 1);
+	char buf[64];
+	lua_pushlstring(L, buf, remotetask_str(rt, buf, sizeof(buf)));
+    return 1;
+}
+
+
+static int l_remotetask_gc(lua_State* L) {
+	RemoteTask* rt = lua_touserdata(L, 1);
+	trace_sched("GC RemoteTask %p", rt);
+
+	// release reference to worker, if any
+	if ((rt->flags & RemoteTask_FLAG_WORKER_REF) &&
+	    !atomic_load_explicit(&g_exiting, memory_order_acquire))
+	{
+		S* s = sreg_get(rt->sid);
+		if (s) {
+			assert(s->isworker);
+			UWorker* uw = s_worker(s);
+			worker_release(&uw->w);
+		}
+	}
+
+	return 0;
+}
+
+
 static void worker_free(Worker* w) {
 	trace_worker("free Worker %p", w);
 	if (w->wkind == WorkerKind_USER && !((UWorker*)w)->errdesc_invalid) {
@@ -1850,7 +1939,20 @@ static bool worker_add_waiter(Worker* w, T* waiter_task) {
 	atomic_store_explicit(&w->waiters, waiter_task->tid, memory_order_release);
 
 	// check if worker exited already
-	return atomic_load_explicit(&w->status, memory_order_acquire) != Worker_CLOSED;
+	if LIKELY(atomic_load_explicit(&w->status, memory_order_acquire) != Worker_CLOSED)
+		return true;
+
+	// undo
+	u32 next_tid = waiter_task->info.wait_worker.next_tid;
+	for (;;) {
+		u32 curr_tid = waiter_task->tid;
+		if (atomic_compare_exchange_weak_explicit(
+				&w->waiters, &curr_tid, next_tid, memory_order_acq_rel, memory_order_relaxed))
+		{
+			break;
+		}
+	}
+	return false;
 }
 
 
@@ -2064,7 +2166,7 @@ static void worker_thread(Worker* w) {
 
 	#if defined(TRACE_SCHED_WORKER)
 		tls_w_id = atomic_fetch_add(&tls_w_idgen, 1);
-		trace_worker("start worker thread=%p", w->thread);
+		trace_worker("start %s", fmtworker(w));
 	#endif
 
 	if (w->wkind == WorkerKind_USER) {
@@ -2083,7 +2185,7 @@ static int worker_start(Worker* w) {
 	worker_retain(w); // thread's reference
 	pthread_attr_t* thr_attr = NULL;
 	int err = pthread_create(&w->thread, thr_attr, (void*(*)(void*))worker_thread, w);
-	trace_sched("spawn worker thread=%p", w->thread);
+	trace_sched("spawn %s os_thread=%p", fmtworker(w), w->thread);
 	if UNLIKELY(err) {
 		free(w);
 		return -err;
@@ -2106,8 +2208,7 @@ static int uworker_open(
 	S*        s,
 	void*     mainfun_lcode,
 	u32       mainfun_lcode_len,
-    u32       spawned_by_tid,
-    u16       spawned_by_tid_gen)
+    u32       spawned_by_tid)
 {
 	UWorker* uw = calloc(1, sizeof(UWorker));
 	if (!uw)
@@ -2120,14 +2221,27 @@ static int uworker_open(
 	}
 
     uw->spawned_by_tid = spawned_by_tid;
-    uw->spawned_by_tid_gen = spawned_by_tid_gen;
 	uw->mainfun_lcode_len = mainfun_lcode_len;
 	uw->mainfun_lcode = mainfun_lcode;
 	uw->s.isworker = true; // note: uw->s is the worker's S, not the spawner S 's'
 
+	if UNLIKELY(!sreg_add(&uw->s)) {
+		free(uw);
+		return -ENOMEM;
+	}
+
 	if (( err = s_asyncwork_cq_setup(&uw->s) )) {
 		free(uw);
 		return err;
+	}
+
+	// also setup cq for current S, if needed, since the worker may send messages back to us
+	if (s->asyncwork_cq == NULL) {
+		if (( err = s_asyncwork_cq_setup(s) )) {
+			chan_close(uw->s.asyncwork_cq);
+			free(uw);
+			return err;
+		}
 	}
 
 	*uwp = uw;
@@ -2143,7 +2257,7 @@ static bool worker_close(Worker* w) {
 		return false;
 	}
 
-	trace_worker("closing worker thread=%p", w->thread);
+	trace_worker("closing %s", fmtworker(w));
 
 	// signal to worker's scheduler that it's time to shut down
 	if (w->wkind == WorkerKind_USER) {
@@ -2189,22 +2303,19 @@ static int l_spawn_worker(lua_State* L) {
 
 	// start a worker
 	UWorker* uw;
-	if UNLIKELY(( err = uworker_open(&uw, t->s, buf.bytes, buf.len, t->tid, t->tid_gen) )) {
+	if UNLIKELY(( err = uworker_open(&uw, t->s, buf.bytes, buf.len, t->tid) )) {
 		buf_free(&buf);
 		return l_errno_error(L, -err);
 	}
 
-	// Allocate & return Worker object so that we know when the user is done with it (GC)
-	UWorkerUVal* uval = uworker_wrap_in_uval(L, uw);
-	if UNLIKELY(!uval) {
-		worker_close((Worker*)uw);
-		worker_release((Worker*)uw);
-		return 0;
-	}
+	// Create a remote task handle representing the main task of the worker.
+	// Note: a worker's main task is linked to the worker's lifetime.
+	// Note: tid of main task is always 1
+	RemoteTask* rt = remotetask_create(L, uw->s.sid, 1);
 
-	// TODO: consider instead returning a handle to the worker's main task (RemoteTask)
-	// instead of a handle to the worker itself. That might be a better API considering the
-	// nature of structural concurrency; a worker's main task is linked to the worker's lifetime.
+	// remote task holds on to a ref to the worker, which is what keeps the worker alive
+	rt->flags |= RemoteTask_FLAG_WORKER_REF;
+    worker_retain(&uw->w);
 
 	return 1;
 }
@@ -2456,7 +2567,7 @@ static int l_tid(lua_State* L) {
 	} else {
 		t = REQUIRE_TASK(L);
 	}
-	lua_pushinteger(L, tid64(t->tid, t->tid_gen));
+	lua_pushinteger(L, gtid_make(t->s->sid, t->tid));
 	return 1;
 }
 
@@ -2717,63 +2828,41 @@ static int l_msg_unload(lua_State* dst_L, InboxMsg* msg) {
 }
 
 
-static usize remotetask_str(const RemoteTask* rt, char* buf, usize bufcap) {
-	u64 tid_64 = tid64(rt->tid, rt->tid_gen);
-	if (rt->worker) {
-		char worker_buf[32];
-		int worker_buf_len = uworker_str(rt->worker, worker_buf, sizeof(worker_buf));
-		return snprintf(buf, bufcap, "Task{%.*s:%lx}", worker_buf_len, worker_buf, tid_64);
-	} else {
-		return snprintf(buf, bufcap, "Task{main:%lx}", tid_64);
-	}
-}
-
-
-static int l_remotetask_str(lua_State* L) {
-	RemoteTask* rt = lua_touserdata(L, 1);
-	char buf[64];
-	lua_pushlstring(L, buf, remotetask_str(rt, buf, sizeof(buf)));
-    return 1;
-}
-
-
-static int l_remotetask_gc(lua_State* L) {
-	RemoteTask* rt = lua_touserdata(L, 1);
-	trace_sched("GC RemoteTask %p", rt);
-	if (rt->worker)
-		worker_release(&rt->worker->w);
-	return 0;
-}
-
-
 static int l_recv_deliver_worker_msg(lua_State* L, InboxMsg* msg) {
-    // push sender on stack
-    RemoteTask* sender = uval_new(L, UValType_RemoteTask, sizeof(RemoteTask), 0);
-	lua_rawgetp(L, LUA_REGISTRYINDEX, &g_remotetask_luatabkey);
-	lua_setmetatable(L, -2);
-    sender->tid_gen = msg->msg_worker.sender_tid_gen;
-    sender->tid = msg->msg_worker.sender_tid;
-    sender->worker = msg->msg_worker.sender_worker;
+    // push sender's GTID on stack
+    lua_pushinteger(L, gtid_make(msg->msg_remote.sender_sid, msg->msg_remote.sender_tid));
+
+    // RemoteTask* sender = remotetask_create(
+	// 	L, msg->msg_remote.sender_sid, msg->msg_remote.sender_tid);
 
     // decode structclone data onto T's stack
     // TODO: Handle exceptions; currently leaking buf_bytes memory if it would happen!
-    int nres = structclone_decode(L, msg->msg_worker.buf->bytes, msg->msg_worker.buf->len);
-    msg_msg_worker_free(msg);
+    int nres = structclone_decode(L, msg->msg_remote.buf->bytes, msg->msg_remote.buf->len);
+    msg_msg_remote_free(msg);
 
 	return 2 + nres;
 }
 
 
 static int l_recv_deliver_worker_closed(lua_State* L, InboxMsg* msg) {
-    // lua_pushnil(L); // push "no sender"
+	UWorker* uw = msg->worker_closed.worker;
 
-    // push sender: worker that exited (uworker_wrap_in_uval steals msg's reference to uw)
-    if (!uworker_wrap_in_uval(L, msg->worker_closed.worker)) {
-    	worker_release(&msg->worker_closed.worker->w);
-    	return 0;
-    }
+	// push GTID of worker (main task of worker's S)
+    lua_pushinteger(L, gtid_make(uw->s.sid, 1));
 
-	return 2;
+	if LIKELY(uw->s.exiterr == false) {
+		lua_pushnil(L);
+	} else {
+		// worker exited because of an error
+		const char* errdesc = "unknown error";
+		if (!uw->errdesc_invalid && uw->errdesc && *uw->errdesc)
+			errdesc = uw->errdesc;
+		lua_pushstring(L, errdesc);
+	}
+
+    msg_worker_closed_free(msg);
+
+    return 3;
 }
 
 
@@ -2796,7 +2885,7 @@ static int l_recv_deliver(lua_State* dst_L, T* t, InboxMsg* msg) {
     		return l_msg_unload(dst_L, msg);
     	case InboxMsgType_MSG_DIRECT:
     		return 1 + msg->msg.nres;
-    	case InboxMsgType_MSG_WORKER:
+    	case InboxMsgType_MSG_REMOTE:
     		return l_recv_deliver_worker_msg(dst_L, msg);
     	case InboxMsgType_WORKER_CLOSED:
     		return l_recv_deliver_worker_closed(dst_L, msg);
@@ -2990,16 +3079,66 @@ static int l_structclone_decode(lua_State* L) {
 }
 
 
-static int l_send_worker(lua_State* L) {
-	T* t = REQUIRE_TASK(L);
-	UWorkerUVal* uval = uval_check(L, 1, UValType_UWorker, "Task or Worker");
-	if (!uval)
-		return 0;
-	UWorker* uw = uval->uw;
 
-	// check if worker is closed
-	if (atomic_load_explicit(&uw->w.status, memory_order_acquire) == Worker_CLOSED)
-		return luaL_error(L, "send to closed worker");
+
+// l_check_anytask accepts a task value as either GTID integer or RemoteTask object.
+// Note: Does not (yet) support T's, which are lua "thread" objects, handled separately.
+static S* nullable l_check_anytask(lua_State* L, int local_idx, T** local_t_out, u32* tid_out) {
+	int isint;
+    i64 gtid = lua_tointegerx(L, local_idx, &isint);
+    u32 sid;
+	if (isint) {
+		sid = gtid_sid(gtid);
+		*tid_out = gtid_tid(gtid);
+	} else {
+		RemoteTask* rt = uval_check(L, local_idx, UValType_RemoteTask, "Task");
+		assertnotnull(rt);
+		sid = rt->sid;
+		*tid_out = rt->tid;
+	}
+
+	// check if task is local (current S == dst_sid)
+	S* local_s = L_t(L)->s;
+	if UNLIKELY(sid == local_s->sid) {
+		*local_t_out = s_task_checked(local_s, *tid_out);
+		if (*local_t_out == NULL)
+			return NULL;
+		return local_s;
+	}
+
+	*local_t_out = NULL;
+
+	// lookup scheduler (may be dead)
+	return sreg_get(sid);
+}
+
+
+static int l_send_remotetask_err_dead(lua_State* L) {
+	return luaL_error(L, "send to dead RemoteTask");
+}
+
+
+static int l_send_remotetask(lua_State* L) {
+	T* t = REQUIRE_TASK(L);
+
+	// we accept destiation task as either GTID integer or RemoteTask object
+	u32 dst_tid;
+	T* local_t;
+	S* dst_s = l_check_anytask(L, 1, &local_t, &dst_tid);
+
+	// if remote_s is a worker, check if it has closed
+	if (dst_s && dst_s->isworker) {
+		UWorker* uw = s_worker(dst_s);
+		if UNLIKELY(atomic_load_explicit(&uw->w.status, memory_order_acquire) == Worker_CLOSED)
+			dst_s = NULL;
+	}
+
+	if (!dst_s)
+		return luaL_error(L, "send to dead task");
+
+	// use l_send_task1 if task is local (current S == dst_sid)
+	if UNLIKELY(local_t)
+		return l_send_task1(L, t, local_t);
 
 	// allocate a buffer and make room for MiniBuf.len
 	Buf buf = {};
@@ -3018,27 +3157,20 @@ static int l_send_worker(lua_State* L) {
 	minibuf->len = buf.len - sizeof(minibuf->len);
 
 	// put message on target worker's CQ
-	ChanTx tx = chan_write_begin(uw->s.asyncwork_cq, 0);
+	ChanTx tx = chan_write_begin(dst_s->asyncwork_cq, 0);
 	assertf(tx.entry != NULL, "chan_write(cq) failed");
 	AsyncWorkRes* res = tx.entry;
 
 	res->op = AsyncWorkOp_WORKER_MSG;
 	res->msg.buf = minibuf;
 
-	res->msg.sender_tid_gen = t->tid_gen;
 	res->msg.sender_tid = t->tid;
-	if (t->s->isworker) {
-		UWorker* local_uw = s_worker(t->s);
-		worker_retain(&local_uw->w);
-		res->msg.sender_worker = local_uw;
-	} else {
-		res->msg.sender_worker = NULL;
-	}
+	res->msg.sender_sid = t->s->sid;
 
-	chan_write_commit(uw->s.asyncwork_cq, tx);
+	chan_write_commit(dst_s->asyncwork_cq, tx);
 
 	// notify the worker's scheduler that there's stuff in asyncwork_cq
-	s_notify(&uw->s, S_NOTE_ASYNCWORK);
+	s_notify(dst_s, S_NOTE_ASYNCWORK);
 
 	return 0;
 }
@@ -3048,7 +3180,7 @@ static int l_send_worker(lua_State* L) {
 static int l_send(lua_State* L) {
 	if (lua_isthread(L, 1))
 		return l_send_task(L);
-	return l_send_worker(L);
+	return l_send_remotetask(L);
 }
 
 
@@ -3113,12 +3245,12 @@ static int l_await_task(lua_State* L) {
 }
 
 
-static int l_await_worker_cont1(lua_State* L, UWorker* uw) {
-	if LIKELY(uw->s.exiterr == 0) {
+static int l_await_remotetask_cont1(lua_State* L, UWorker* uw) {
+	if LIKELY(!uw->s.exiterr) {
 		lua_pushboolean(L, true);
 		return 1;
 	}
-	// worker exited because of an error
+	// worker exited because of an error (see also: l_recv_deliver_worker_closed)
 	lua_pushboolean(L, false);
 	const char* errdesc = "unknown error";
 	if (!uw->errdesc_invalid && uw->errdesc && *uw->errdesc)
@@ -3128,38 +3260,47 @@ static int l_await_worker_cont1(lua_State* L, UWorker* uw) {
 }
 
 
-static int l_await_worker_cont(lua_State* L, int ltstatus, void* arg) {
-	return l_await_worker_cont1(L, arg);
+static int l_await_remotetask_cont(lua_State* L, int ltstatus, void* arg) {
+	return l_await_remotetask_cont1(L, arg);
 }
 
 
-// fun await(w Worker) (ok bool, err string)
+// fun await(w Task|tid) (ok bool, err string)
 // Returns true if w exited cleanly or false if w exited because of an error.
-static int l_await_worker(lua_State* L) {
+static int l_await_remotetask(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
-	UWorkerUVal* uval = uval_check(L, 1, UValType_UWorker, "Task or Worker");
-	if (!uval)
-		return 0;
-	UWorker* uw = uval->uw;
 
-	// can't await the worker the calling task is running on
-	if UNLIKELY(t->s == &uw->s)
-		return luaL_error(L, "attempt to 'await' itself");
+	// we accept destiation task as either GTID integer or RemoteTask object
+	u32 dst_tid;
+	T* local_t;
+	S* dst_s = l_check_anytask(L, 1, &local_t, &dst_tid);
+	if UNLIKELY(!dst_s) {
+		// S is no longer valid; GTID may be invalid (we can't tell, but this is rare)
+		lua_pushboolean(L, true);
+		return 1;
+	}
 
+	// use l_send_task1 if task is local (current S == dst_sid)
+	if UNLIKELY(local_t)
+		return l_await_task(L);
+
+	// add t to list of tasks waiting for worker uw to exit
+	UWorker* uw = s_worker(dst_s);
 	if (worker_add_waiter((Worker*)uw, t)) {
 		t->resume_nres = 0;
-		return t_suspend(t, T_WAIT_WORKER, uw, l_await_worker_cont);
+		return t_suspend(t, T_WAIT_WORKER, uw, l_await_remotetask_cont);
 	}
 
 	// worker closed before we could add t to list of tasks waiting for w
-	return l_await_worker_cont1(L, uw);
+	trace_sched(T_ID_F " await: " UWORKER_ID_F " already closed", t_id(t), uworker_id(uw));
+	return l_await_remotetask_cont1(L, uw);
 }
 
 
 static int l_await(lua_State* L) {
 	if (lua_isthread(L, 1))
 		return l_await_task(L);
-	return l_await_worker(L);
+	return l_await_remotetask(L);
 }
 
 

@@ -49,12 +49,8 @@ struct T {
 	S*              s;     // owning S
 	Inbox* nullable inbox; // message queue
 
-	u32 tid;     // task identifier
-	u16 tid_gen; // tid generation
-	u16 _unused1;
-
+	u32 tid;   // task identifier (with embedded generation value)
 	u32 nrefs; // references to task (when 0, T may be GC'd)
-	u32 _unused2;
 
 	u8  status;      // T_ constant (enum TStatus)
 	u8  resume_nres; // number of results on stack, to be returned via resume
@@ -122,15 +118,20 @@ struct S {
 	Chan* nullable asyncwork_cq;       // completion queue, also used for cross-worker send/recv
 };
 
-// RemoteTask represents a task of another worker
+enum {
+	RemoteTask_FLAG_WORKER_REF = 1<<0, // RemoteTask owns a ref to S of sid, which is a worker
+};
+
+// RemoteTask represents a task (T) of another worker (S)
 typedef struct RemoteTask {
-    UVal              uval;    // .type=UValType_RemoteTask
-    u32               sid;     // owning S's ID
-    u16               _unused; //
-    u16               tid_gen; // task ID generation
-    u32               tid;     // task ID (in owning S's namespace)
-    UWorker* nullable worker;  // NULL if local thread
+    UVal uval;  // .type=UValType_RemoteTask
+    u8   flags; // bits of RemoteTask_FLAG_
+    u32  tid;   // task
+    u32  sid;   // scheduler that owns the task
 } RemoteTask;
+
+// GTID uniquely identifies a task across an entire dew runtime instance (sid+tid)
+typedef u64 GTID;
 
 
 // s_id formats an identifier of a S for logging

@@ -173,7 +173,8 @@ end
 
 -- Runtime dev
 -- require("tests/rt/worker-exit-recv-deadlock")
-require("tests/rt/worker-echo")
+require("tests/rt/await-task") -- bug
+-- require("tests/rt/worker-echo") -- WIP
 -- require("tests/rt/worker-send-recv")
 -- require("tests/rt/task-tid-gen-detect")
 -- require("tests/rt/send-to-dead-worker")

@@ -7,12 +7,13 @@ API_BEGIN
 typedef struct Inbox    Inbox;
 typedef struct InboxMsg InboxMsg;
 typedef struct UWorker  UWorker;
+typedef struct S        S;
 
 enum InboxMsgType {
     InboxMsgType_TIMER,         // timer rang
     InboxMsgType_MSG,           // message via send(task ...)
     InboxMsgType_MSG_DIRECT,    // message via send(task ...) delivered directly
-    InboxMsgType_MSG_WORKER,    // message via send(worker ...)
+    InboxMsgType_MSG_REMOTE,    // message via send(remotetask ...)
     InboxMsgType_WORKER_CLOSED, // message sent by runtime when a worker closed
 };
 
@@ -27,12 +28,13 @@ struct InboxMsg {
             u16 nres; // number of result values
             int ref;  // Lua ref to an array table holding values
         } __attribute__((packed)) msg;
-        struct { // InboxMsgType_MSG_WORKER
-            u16               sender_tid_gen;
-            u32               sender_tid;
-            UWorker* nullable sender_worker; // NULL if parent of current worker
-            MiniBuf*          buf; // owned by this InboxMsg
-        } __attribute__((packed)) msg_worker;
+        struct { // InboxMsgType_MSG_REMOTE
+            u16      _unused1;
+            u32      sender_sid;
+            u32      sender_tid;
+            u32      _unused2;
+            MiniBuf* buf; // owned by this InboxMsg
+        } __attribute__((packed)) msg_remote;
         struct { // InboxMsgType_WORKER_CLOSED
             u16      _unused1;
             u32      _unused2;

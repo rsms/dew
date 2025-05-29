@@ -37,8 +37,12 @@ inline static u8* pool_entries(const Pool* p) {
     return (u8*)p->freebm + (p->cap >> 3); // + cap/bytes_per_freebm
 }
 
+inline static bool pool_idx_isdead(const Pool* p, u32 idx) {
+    return idx > p->maxidx;
+}
+
 inline static void* pool_entry(const Pool* p, u32 idx, usize elemsize) {
-    assert(idx > 0 && idx <= p->maxidx);
+    assertf(idx > 0 && idx <= p->maxidx, "%u", idx);
     return (void*)(pool_entries(p) + (idx-1)*elemsize);
 }
 

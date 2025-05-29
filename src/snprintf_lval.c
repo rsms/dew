@@ -41,12 +41,9 @@ isize snprintf_lval(char* buf, usize bufcap, lua_State* L, int i) {
 
 #ifdef DEBUG
 
-static char fmtbufv[8][128];
-static int  fmtbufi = 0;
-
 const char* fmtlval(lua_State* L, int i) {
-    char* buf = fmtbufv[fmtbufi++ % 8];
-    snprintf_lval(buf, sizeof(fmtbufv[0]), L, i);
+    char* buf = fmtbuf_get();
+    snprintf_lval(buf, fmtbuf_cap(), L, i);
     return buf;
 }
 
@@ -67,9 +64,9 @@ void dlog_lua_stackf(lua_State* L, const char* fmt, ...) {
     }
 
     fprintf(stderr, "\n");
-    char* buf = fmtbufv[fmtbufi++ % 8];
+    char* buf = fmtbuf_get();
     for (int i = 1; i <= top; i++) {
-        _snprintf_lval(buf, sizeof(fmtbufv[0]), L, i, "\t", "");
+        _snprintf_lval(buf, fmtbuf_cap(), L, i, "\t", "");
         fprintf(stderr, "%4d %s\n", i, buf);
     }
 }

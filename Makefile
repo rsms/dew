@@ -15,6 +15,7 @@ DEW_SRCS := \
 	src/panic.c \
 	src/logmsg.c \
 	src/hexdump.c \
+	src/fmtbuf.c \
 	src/snprintf_lval.c \
 	src/runtime/array.c \
 	src/runtime/uval.c \
@@ -34,6 +35,7 @@ DEW_SRCS := \
 	src/runtime/structclone.c \
 	src/runtime/time.c \
 	src/runtime/timer.c \
+	src/runtime/worker.c \
 	$(call ifs,TARGET,web,, src/runtime/tsem.c) \
 	$(call ifs,TARGET,darwin, src/runtime/iopoll_darwin.c) \
 	$(call ifs,TARGET,linux,  src/runtime/iopoll_linux.c) \

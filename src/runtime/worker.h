@@ -36,16 +36,17 @@ struct AsyncWorkReq {
 typedef struct AsyncWorkRes {
     u16 op;     // operation performed
     union {
-        struct { // op != AsyncWorkOp_WORKER_MSG
+        struct { // all ops but AsyncWorkOp_WORKER_MSG
             u16 flags;  //
             u32 tid;    // task waiting for this work
             i64 result; // output result
         } __attribute__((packed));
         struct { // op == AsyncWorkOp_WORKER_MSG
-            u16               sender_tid_gen;
-            u32               sender_tid;    // tid in namespace of receiving worker's parent S
-            UWorker* nullable sender_worker; // NULL if parent of current worker
-            MiniBuf*          buf;
+            u16      _unused1;
+            u32      sender_sid;
+            u32      sender_tid; // tid in namespace of receiving worker's parent S
+            u32      _unsued2;
+            MiniBuf* buf; // owned by this AsyncWorkRes
         } __attribute__((packed)) msg;
     };
 } AsyncWorkRes;
@@ -77,8 +78,7 @@ struct Worker {
 struct UWorker { // wkind == WorkerKind_USER
     Worker w;
     u32    spawned_by_tid;
-    u16    spawned_by_tid_gen;
-    u16    _unused;
+    u32    _unused;
     union { // input & output data (as input for workeru_open, as output from worker exit.)
         struct { // input
             // mainfun_lcode contains Lua bytecode for the main function, used during setup.
@@ -119,5 +119,22 @@ typedef struct UWorkerUVal {
     UVal     uval;
     UWorker* uw;
 } UWorkerUVal;
+
+// uworker_id formats a UWorker for logging
+#define uworker_id(uw) (unsigned long)(uintptr)(uw), (uw)->s.sid
+#define UWORKER_ID_F   "UWorker#%lx(S%u)"
+
+// aworker_id formats a AWorker for logging
+#define aworker_id(aw) (unsigned long)(uintptr)(aw)
+#define AWORKER_ID_F   "AWorker#%lx"
+
+// const char* fmtworker(T worker)
+#define fmtworker(w) _Generic((w), \
+    const Worker*: _fmtworker,  Worker*: _fmtworker, \
+    const UWorker*: fmtuworker, UWorker*: fmtuworker, \
+    const AWorker*: fmtaworker, AWorker*: fmtaworker)(w)
+const char* _fmtworker(const Worker*);
+const char* fmtuworker(const UWorker*);
+const char* fmtaworker(const AWorker*);
 
 API_END

@@ -23,7 +23,7 @@ const char* inbox_msg_type_str(enum InboxMsgType t) {
     case InboxMsgType_TIMER:         return "TIMER";
     case InboxMsgType_MSG:           return "MSG";
     case InboxMsgType_MSG_DIRECT:    return "MSG_DIRECT";
-    case InboxMsgType_MSG_WORKER:    return "MSG_WORKER";
+    case InboxMsgType_MSG_REMOTE:    return "MSG_REMOTE";
     case InboxMsgType_WORKER_CLOSED: return "WORKER_CLOSED";
     }
     return "?";

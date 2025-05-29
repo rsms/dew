@@ -375,6 +375,15 @@ static inline WARN_UNUSED_RESULT bool __must_check_unlikely(bool unlikely) {
     __builtin_mul_overflow(a__, b__, dst__); \
 }))
 
+#ifdef DEBUG
+    extern thread_local char g_fmtbufv[8][512];
+    inline static usize fmtbuf_cap() { return sizeof(g_fmtbufv[0]); }
+    char* fmtbuf_get();
+#else
+    #define fmtbuf_cap() ((usize)0)
+    #define fmtbuf_get() ((char*)NULL)
+#endif
+
 isize snprintf_lval(char* buf, usize bufcap, lua_State* L, int i);
 
 #ifdef DEBUG
