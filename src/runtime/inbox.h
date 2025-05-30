@@ -37,8 +37,8 @@ struct InboxMsg {
         } __attribute__((packed)) msg_remote;
         struct { // InboxMsgType_WORKER_CLOSED
             u16      _unused1;
-            u32      worker_sid; // stored since worker->s.sid may be reset async
-            UWorker* worker;     // reference owned by this InboxMsg
+            u32      _unused2;
+            UWorker* worker; // reference owned by this InboxMsg
         } __attribute__((packed)) worker_closed;
     };
 };

@@ -629,13 +629,15 @@ static bool sreg_add(S* s) {
 
 
 static void sreg_del(S* s) {
+	u32 idx = s->sid & 0xffffff;
 	pthread_mutex_lock(&g_sreg_mu);
-	SRegInfo* sinfo = pool_entry(g_sreg, s->sid & 0xffffff, sizeof(SRegInfo));
+	SRegInfo* sinfo = pool_entry(g_sreg, idx, sizeof(SRegInfo));
 	assertf((u8)(s->sid >> 24) == sinfo->gen, "%u, %u", (s->sid >> 24), sinfo->gen);
 	sinfo->gen++; // increment generation so we can detect invalid deref
-	pool_entry_free(g_sreg, s->sid & 0xffff);
+	pool_entry_free(g_sreg, idx);
 	pthread_mutex_unlock(&g_sreg_mu);
-	s->sid = 0;
+	// note: intentionally not setting 's->sid = 0' here so that l_recv_deliver_worker_closed
+	// can access the SID.
 }
 
 
@@ -1436,7 +1438,6 @@ static void t_send_worker_closed_msg(T* t, UWorker* uw) {
 		return;
 	}
 	msg->type = InboxMsgType_WORKER_CLOSED;
-	msg->worker_closed.worker_sid = uw->s.sid; // store, as sid may be reset before delivery
 	msg->worker_closed.worker = uw;
 	worker_retain(&uw->w);
 
@@ -2873,7 +2874,8 @@ static int l_recv_deliver_worker_closed(lua_State* L, InboxMsg* msg) {
 	UWorker* uw = msg->worker_closed.worker;
 
 	// push GTID of worker (main task of worker's S)
-    lua_pushinteger(L, gtid_make(msg->worker_closed.worker_sid, 1));
+	assert(uw->s.sid != 0);
+    lua_pushinteger(L, gtid_make(uw->s.sid, 1));
 
 	if LIKELY(uw->s.exiterr == false) {
 		lua_pushnil(L);

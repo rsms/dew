@@ -27,6 +27,8 @@ __rt.main(function()
     local typ, sender_tid, status = __rt.recv()
     print("task: recv =>", typ, sender_tid, status)
     assert(typ == 4) -- TODO FIXME constant
-    -- print("sender_tid, __rt.tid(W1) = ", sender_tid, __rt.tid(W1))
+    if sender_tid ~= __rt.tid(W1) then
+        print("sender_tid, __rt.tid(W1) = ", sender_tid, __rt.tid(W1))
+    end
     assert(sender_tid == __rt.tid(W1))
 end)
