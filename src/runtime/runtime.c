@@ -2282,18 +2282,6 @@ static bool worker_close(Worker* w) {
 }
 
 
-// uworker_wrap_in_uval steals a reference to uw
-static UWorkerUVal* nullable uworker_wrap_in_uval(lua_State* L, UWorker* uw) {
-	UWorkerUVal* uval = uval_new(L, UValType_UWorker, sizeof(UWorkerUVal), 0);
-	if LIKELY(uval) {
-		lua_rawgetp(L, LUA_REGISTRYINDEX, &g_uworker_uval_luatabkey);
-		lua_setmetatable(L, -2);
-		uval->uw = uw;
-	}
-	return uval;
-}
-
-
 static int l_spawn_worker(lua_State* L) {
 	T* t = REQUIRE_TASK(L);
 	luaL_checktype(L, 1, LUA_TFUNCTION);

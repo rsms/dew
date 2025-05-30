@@ -605,7 +605,6 @@ static void encode_uval(lua_State* L, Encoder* enc, int vi) {
         case UValType_Buf:
             return encode_uval_buf(L, enc, vi, (Buf*)uval);
         case UValType_Timer:
-        case UValType_UWorker:
         case UValType_RemoteTask:
         case UValType_IODesc:
             return codec_error(L, enc, EINVAL,

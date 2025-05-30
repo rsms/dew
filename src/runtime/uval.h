@@ -5,7 +5,6 @@ API_BEGIN
 enum UValType {
     UValType_Buf,
     UValType_Timer,
-    UValType_UWorker,
     UValType_RemoteTask,
     UValType_IODesc,
 };
