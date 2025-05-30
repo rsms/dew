@@ -1587,11 +1587,13 @@ static void s_asyncwork_read_cq(S* s) {
 
 
 static void s_check_notes(S* s, u8 notes) {
-	if (notes & S_NOTE_WEXIT)
-		s_reap_workers(s);
-
+	// note: must check asyncwork before calling s_reap_workers to avoid race condition where
+	// a worker's task send()s a message to the parent S's T1 just before it exits.
 	if (notes & S_NOTE_ASYNCWORK)
 		s_asyncwork_read_cq(s);
+
+	if (notes & S_NOTE_WEXIT)
+		s_reap_workers(s);
 
 	// Clear notes bits.
 	// We are racing with worker threads here, so use a CAS but don't loop to retry since
@@ -3174,6 +3176,8 @@ static int l_send_remotetask(lua_State* L) {
 	int err = structclone_encode(L, &buf, 0, nargs);
 	if (err)
 		return l_errno_error(L, -err);
+
+	trace_sched("send to remotetask S%u T1", dst_s->sid);
 
 	// interpret data at buf.bytes as minibuf
 	MiniBuf* minibuf = (MiniBuf*)buf.bytes;

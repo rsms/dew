@@ -8,30 +8,32 @@ __rt.main(function()
             assert(val1 == i*10)
             assert(val2 == i*100)
 
-            -- TODO: add support for RemoteTask to send()
+            -- echo back to sender
+            print("W1: send(T1)")
+            __rt.send(sender, val1, val2)
 
-            -- echo back
-            print("W1: send(T1, " .. (i*10) .. ") ...")
-            print("W1: send(T1) =>", __rt.send(sender, i*10, i*100))
-
-            i = i + 1
+            -- i = i + 1
         end
-        -- error("lolcat")
         print("worker exiting")
     end)
     print("W1:", W1)
 
-    -- send messages to worker
     for i = 1, 3 do
-        print("T1: send(W1, " .. (i*10) .. ") ...")
-        print("T1: send(W1) =>", __rt.send(W1, i*10, i*100))
+        -- send message to worker
+        print("T1: send(W1)")
+        __rt.send(W1, i*10, i*100)
+
+        -- receive reply from worker
         print("T1: recv ...")
         local typ, sender, val1, val2 = __rt.recv()
         print("T1: recv =>", typ, sender, val1, val2)
+
+        -- check results
         if typ == 4 then -- 4 == REMOTE_TASK_CLOSED
-            print("W1 closed prematurely")
-            break
+            error("W1 closed prematurely")
         end
+        assert(val1 == i*10)
+        assert(val2 == i*100)
     end
 
     print("waiting for worker to exit")
