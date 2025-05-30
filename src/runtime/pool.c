@@ -99,26 +99,20 @@ void pool_entry_free(Pool* p, u32 idx) {
 	assert(idx > 0 && idx <= p->cap);
 	assert((p->freebm[chunk_idx] & ((u64)1 << bit_idx)) == 0);
 
+	// dlog(">> free bit %u in chunk %u", bit_idx, chunk_idx);
+	// dlog("   %016lx | %016lx = %016lx",
+	//      p->freebm[chunk_idx], (u64)1 << bit_idx,
+	//      p->freebm[chunk_idx] | ((u64)1 << bit_idx));
+
 	p->freebm[chunk_idx] |= (u64)1 << bit_idx;
 
 	if (idx != p->maxidx)
 		return;
 
-	// maxidx was freed.
-	// We have three options in this scenario:
-
-	// 1. Do nothing else and leave maxidx as is.
-	//    Unless the free call pattern is "perfect", maxidx will often not be true.
-	//    We will waste time if we do a lot of operations that are bound by maxidx.
-	#if 0
-	p->maxidx--;
-	#endif
-
-	// 2. Scan for the actual maxidx.
-	//    This means looking through every bit of every chunk below current maxidx
-	//    until we find a 0 bit. This can be quite time intensive but is 100% accurate.
-	//    Good if we spend most of our time on operations that are bound by maxidx.
-	#if 1
+	// maxidx was freed -- scan for new maxidx.
+	// This means looking through every bit of every chunk below current maxidx
+	// until we find a 0 bit. This can be quite time intensive but is 100% accurate.
+	// Good if we spend most of our time on operations that are bound by maxidx.
 	for (;;) {
 		u64 chunk = p->freebm[chunk_idx];
 		if (chunk == 0) {
@@ -130,8 +124,8 @@ void pool_entry_free(Pool* p, u32 idx) {
 			// chunk has at least one 0 bit.
 			// Find first 0 bit by first flipping all bits with xor,
 			// then use ffs to find the first 1 bit.
-			// dlog(">> chunk %u has at least one 0 bit: 0x%lx", chunk_idx, chunk);
-			p->maxidx = dew_ffs(chunk) - 1;
+			// dlog(">> chunk %u has at least one 0 bit: 0x%016lx", chunk_idx, chunk);
+			p->maxidx = (sizeof(chunk) * 8) - dew_clz(~chunk);
 			break;
 		} else {
 			// chunk is completely free
@@ -143,22 +137,7 @@ void pool_entry_free(Pool* p, u32 idx) {
 			chunk_idx--;
 		}
 	}
-	#endif
-
-	// dlog("maxidx was freed; it's now: %u", p->maxidx);
-
-	// 3. Something in between: scan for entire free bit chunks.
-	//    Balanced trade off between accuracy and speed.
-	#if 0
-	p->maxidx--;
-	while (p->freebm[chunk_idx] == ~(u64)0) {
-		p->maxidx = chunk_idx << 6;
-		dlog("free chunk %u, setting maxidx %u", chunk_idx, p->maxidx);
-		if (chunk_idx == 0)
-			break;
-		chunk_idx--;
-	}
-	#endif
+	// logmsg("maxidx was freed; it's now: %u", p->maxidx);
 }
 
 
@@ -183,82 +162,3 @@ u32 _pool_find_entry_ptr(const Pool* p, const void* entry_val) {
 	}
 	return 0;
 }
-
-
-#ifdef DEBUG
-__attribute__((constructor)) static void pool_test() {
-	Pool* p;
-	bool ok = pool_init(&p, /*cap*/3, 8); assert(ok);
-
-	u32 N = 200;
-
-	// verify that all slots are free
-	for (u32 idx = 1; idx <= p->cap; idx++)
-		assert(pool_entry_isfree(p, idx));
-
-	// allocate dense range
-	for (u32 idx = 1; idx <= N; idx++) {
-		u32 idx2;
-		u64* vp = pool_entry_alloc(&p, &idx2, 8);
-		assert(vp);
-		assert(idx == idx2); // expect dense sequential index
-		*vp = idx;
-		// dlog("%u, %u", idx, idx2);
-	}
-
-	// verify
-	for (u32 idx = 1; idx <= N; idx++) {
-		assert(!pool_entry_isfree(p, idx));
-		u64* vp = pool_entry(p, idx, 8);
-		assert(*vp == idx);
-	}
-
-	// free every 3rd entry
-	for (u32 idx = 1; idx <= N; idx++) {
-		if (idx % 4 == 3)
-			pool_entry_free(p, idx);
-	}
-
-	// verify
-	for (u32 idx = 1; idx <= N; idx++) {
-		if (idx % 4 == 3) {
-			assert(pool_entry_isfree(p, idx));
-		} else {
-			assert(!pool_entry_isfree(p, idx));
-			u64* vp = pool_entry(p, idx, 8);
-			assert(*vp == idx);
-		}
-	}
-
-	// re-allocate free'd slots
-	for (u32 idx = 1; idx <= N; idx++) {
-		if (idx % 4 == 3) {
-			u32 idx2;
-			u64* vp = pool_entry_alloc(&p, &idx2, 8);
-			assert(vp);
-			assert(idx == idx2); // expect dense sequential index
-			*vp = idx;
-		}
-	}
-
-	// verify
-	for (u32 idx = 1; idx <= N; idx++) {
-		assert(!pool_entry_isfree(p, idx));
-		u64* vp = pool_entry(p, idx, 8);
-		assert(*vp == idx);
-	}
-
-	// free all entries with a pattern that causes idx==maxidx in a few cases
-	for (u32 idx = 10; idx <= N; idx++)
-		if ((idx % 4) != 3) pool_entry_free(p, idx);
-	for (u32 idx = 1; idx <= N; idx++)
-		if ((idx % 4) == 3 || idx < 10) pool_entry_free(p, idx);
-
-	// verify that all slots are free
-	for (u32 idx = 1; idx <= p->cap; idx++)
-		assert(pool_entry_isfree(p, idx));
-
-	pool_free_pool(p);
-	dlog("OK: %s", __FUNCTION__);
-}
-#endif // DEBUG

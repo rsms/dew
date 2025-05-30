@@ -259,19 +259,6 @@ static const char* t_status_str(u8 status) {
 }
 
 
-inline static u64 gtid_make(u32 sid, u32 tid) {
-	return (u64)tid | ((u64)sid << 32);
-}
-
-inline static u32 gtid_sid(GTID gtid) {
-	return (u32)(gtid >> 32);
-}
-
-inline static u32 gtid_tid(GTID gtid) {
-	return (u32)(gtid & 0xfffffffful);
-}
-
-
 S* s_get_thread_local() {
 	return tls_s;
 }
@@ -579,23 +566,41 @@ typedef struct TaskInfo {
 } TaskInfo;
 
 typedef struct SRegInfo {
-	u16 gen;
-	S*  s;
+	u8 gen;
+	S* s;
 } SRegInfo;
-
-enum TaskType {
-	TaskType_LOCAL,  // task on this computer
-	// TaskType_REMOTE, // task on a different comuter
-};
 
 // global scheduler registry
 static Pool*           g_sreg = NULL;
 static pthread_mutex_t g_sreg_mu;
 
+/*
+GTID encoding:
+
+bit 00000000 011111111112222222222333 33333334 444444444555555555566666
+    12345678 901234567890123456789012 34567890 123456789012345678901234
+   ┌───────────────────────────────────────────────────────────────────┐
+   │                              gtid (64)                            │
+   ├─────────────────────────────────┬─────────────────────────────────┤
+   │             tid (32)            │             sid (32)            │
+   ├────────────────────────┬────────┼────────────────────────┬────────┤
+   │         idx (24)       │ gen (8)│         idx (24)       │ gen (8)│
+   └────────────────────────┴────────┴────────────────────────┴────────┘
+
+E.g. {s_gen=0, s_idx=1, t_gen=1, t_idx=3} 0x0000000101000003 in little endian:
+    00000000 000000000000000000000001 00000001 000000000000000000000011
+    └─s_gen┘ └─────────s_idx────────┘ └─t_gen┘ └─────────t_idx────────┘
+*/
+
 
 void dew_runtime_init() {
 	pthread_mutex_init(&g_sreg_mu, NULL);
 }
+
+
+inline static u64 gtid_make(u32 sid, u32 tid) { return (u64)tid | ((u64)sid << 32); }
+inline static u32 gtid_sid(GTID gtid) { return (u32)(gtid >> 32); }
+inline static u32 gtid_tid(GTID gtid) { return (u32)(gtid & 0xfffffffful); }
 
 
 static bool sreg_add(S* s) {
@@ -610,12 +615,12 @@ static bool sreg_add(S* s) {
 		return false;
 	}
 
-	if UNLIKELY(idx > 0xffff) {
+	if UNLIKELY(idx > 0xffffff) {
 		pool_entry_free(g_sreg, idx);
 		sinfo = NULL;
 	} else {
 		sinfo->s = s;
-		s->sid = idx | ((u32)sinfo->gen << 16);
+		s->sid = idx | ((u32)sinfo->gen << 24);
 	}
 	pthread_mutex_unlock(&g_sreg_mu);
 	trace_sched("[sreg] assigned sid %u to S %p", s->sid, s);
@@ -625,8 +630,8 @@ static bool sreg_add(S* s) {
 
 static void sreg_del(S* s) {
 	pthread_mutex_lock(&g_sreg_mu);
-	SRegInfo* sinfo = pool_entry(g_sreg, s->sid & 0xffff, sizeof(SRegInfo));
-	assertf((u16)(s->sid >> 16) == sinfo->gen, "%u, %u", (s->sid >> 16), sinfo->gen);
+	SRegInfo* sinfo = pool_entry(g_sreg, s->sid & 0xffffff, sizeof(SRegInfo));
+	assertf((u8)(s->sid >> 24) == sinfo->gen, "%u, %u", (s->sid >> 24), sinfo->gen);
 	sinfo->gen++; // increment generation so we can detect invalid deref
 	pool_entry_free(g_sreg, s->sid & 0xffff);
 	pthread_mutex_unlock(&g_sreg_mu);
@@ -636,13 +641,13 @@ static void sreg_del(S* s) {
 
 static S* nullable sreg_get(u32 sid) {
 	SRegInfo* sinfo = NULL;
-	u32 idx = sid & 0xffff;
+	u32 idx = sid & 0xffffff;
 	assert(idx != 0); // more helpful error messages than pool_entry, which has the same check
 	pthread_mutex_lock(&g_sreg_mu);
 	if (!pool_idx_isdead(g_sreg, idx))
 		sinfo = pool_entry(g_sreg, idx, sizeof(SRegInfo));
 	pthread_mutex_unlock(&g_sreg_mu);
-	if (sinfo == NULL || sinfo->gen != (u16)(sid >> 16))
+	if (sinfo == NULL || sinfo->gen != (u16)(sid >> 24))
 		return NULL;
 	return sinfo->s;
 }
@@ -1431,6 +1436,7 @@ static void t_send_worker_closed_msg(T* t, UWorker* uw) {
 		return;
 	}
 	msg->type = InboxMsgType_WORKER_CLOSED;
+	msg->worker_closed.worker_sid = uw->s.sid; // store, as sid may be reset before delivery
 	msg->worker_closed.worker = uw;
 	worker_retain(&uw->w);
 
@@ -2561,13 +2567,30 @@ static int l_yield(lua_State* L) {
 // fun tid(task T = nil) uint
 static int l_tid(lua_State* L) {
 	T* t;
+	u32 sid, tid;
 	if (lua_gettop(L) > 0) {
-		if ((t = l_check_task(L, 1)) == NULL)
-			return 0;
+		// We accept both Task and RemoteTask.
+		// Internally Task (T) is represented by a lua "thread" and RemoteTask a uval.
+		lua_State* other_L = lua_tothread(L, 1);
+		if (!other_L) {
+			RemoteTask* rt = uval_check(L, 1, UValType_RemoteTask, "Task");
+			assertnotnull(rt);
+			sid = rt->sid;
+			tid = rt->tid;
+		} else {
+			T* t = L_t(other_L);
+			if UNLIKELY(!t->s)
+				return luaL_typeerror(L, 1, "Task");
+			sid = t->s->sid;
+			tid = t->tid;
+		}
 	} else {
-		t = REQUIRE_TASK(L);
+		// return TID of current task
+		T* t = REQUIRE_TASK(L);
+		sid = t->s->sid;
+		tid = t->tid;
 	}
-	lua_pushinteger(L, gtid_make(t->s->sid, t->tid));
+	lua_pushinteger(L, gtid_make(sid, tid));
 	return 1;
 }
 
@@ -2679,7 +2702,7 @@ static int l_connect(lua_State* L) {
 	if (!addrstr)
 		return 0;
 
-	dlog("addrstr: %s", addrstr);
+	dlog("TODO: get port from addrstr: %s", addrstr);
 
 	// construct network address
 	struct sockaddr_in addr;
@@ -2848,7 +2871,7 @@ static int l_recv_deliver_worker_closed(lua_State* L, InboxMsg* msg) {
 	UWorker* uw = msg->worker_closed.worker;
 
 	// push GTID of worker (main task of worker's S)
-    lua_pushinteger(L, gtid_make(uw->s.sid, 1));
+    lua_pushinteger(L, gtid_make(msg->worker_closed.worker_sid, 1));
 
 	if LIKELY(uw->s.exiterr == false) {
 		lua_pushnil(L);
@@ -3452,7 +3475,7 @@ int luaopen_runtime(lua_State* L) {
 		lua_pushinteger(L, NAME); \
 		lua_setfield(L, -2, #NAME);
 	// address families
-	_(AF_LOCAL)  // Host-internal protocols, formerly called PF_UNIX
+	_(AF_LOCAL)  // Host-internal protocols, formerly called AF_UNIX
 	_(AF_INET)   // Internet version 4 protocols
 	_(AF_INET6)  // Internet version 6 protocols
 	_(AF_ROUTE)  // Internal Routing protocol

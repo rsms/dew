@@ -13,17 +13,20 @@ __rt.main(function()
     -- alive when the task calls recv()
     local W1 = __rt.spawn_worker(function()
         -- use recv to sync with task
-        __rt.recv()
+        -- print("W1: main task TID:", __rt.tid())
+        local typ, sender_tid = __rt.recv()
+        -- print("W1: recv =>", typ, sender_tid)
         print("worker: exiting without send()ing")
     end)
     print("task: worker =", W1)
 
     -- synchronize with worker task
     __rt.send(W1)
-    local typ, sender, status = __rt.recv()
-    print("task: recv =>", typ, sender, status)
 
-    -- should have received "worker closed" message
-    assert(typ == 4) -- TODO FIXME: InboxMsgType_WORKER_CLOSED
-    assert(tostring(sender) == tostring(W1))
+    -- receive "remote task exited" message
+    local typ, sender_tid, status = __rt.recv()
+    print("task: recv =>", typ, sender_tid, status)
+    assert(typ == 4) -- TODO FIXME constant
+    -- print("sender_tid, __rt.tid(W1) = ", sender_tid, __rt.tid(W1))
+    assert(sender_tid == __rt.tid(W1))
 end)

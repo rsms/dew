@@ -29,6 +29,7 @@ DEW_SRCS := \
 	src/runtime/iopoll.c \
 	src/runtime/lutil.c \
 	src/runtime/pool.c \
+	src/runtime/pool_test.c \
 	src/runtime/qsort.c \
 	src/runtime/runtime.c \
 	src/runtime/string_repr.c \
@@ -89,6 +90,10 @@ LUA_SRCS := \
 	src/lua/lutf8lib.c \
 	src/lua/lvm.c \
 	src/lua/lzio.c \
+
+TEST_PROGS := \
+	$(BUILDDIR)/src/runtime/chan_test \
+	$(BUILDDIR)/src/runtime/chan_test.opt \
 
 CFLAGS := \
 	-std=c17 -g -fdebug-compilation-dir=/x/ \
@@ -216,10 +221,6 @@ benchmark-runtime:
 
 run_dew_selftest: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew --selftest$(if $(filter 1,$(V)),=v,)
-
-TEST_PROGS := \
-	$(BUILDDIR)/src/runtime/chan_test \
-	$(BUILDDIR)/src/runtime/chan_test.opt
 
 run_tests: $(TEST_PROGS)
 	$(Q)$(foreach f,$^,echo "RUN   $(f)$(if $(filter 1,$(V)),, > $(f).log)"; $(f) $(if $(filter 1,$(V)),,>$(f).log 2>&1 || { echo "$(f): FAILED"; cat $(f).log; exit 1; }) && ) true

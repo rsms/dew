@@ -9,5 +9,5 @@ __rt.main(function()
     __rt.await(W1)
 
     -- send should fail
-    expect_error("send to closed worker", __rt.send, W1)
+    expect_error("send to dead task", __rt.send, W1)
 end)

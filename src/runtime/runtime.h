@@ -12,7 +12,6 @@ API_BEGIN
 typedef struct S    S;    // scheduler (M+P in Go lingo)
 typedef struct T    T;    // task
 typedef struct RunQ RunQ; // run queue (FIFO)
-typedef struct TID  TID;  // globally unique identifier
 
 // Worker forward declaration since S uses Worker
 typedef struct Worker Worker;
@@ -20,11 +19,6 @@ typedef struct Worker Worker;
 struct RunQ {
 	FIFO fifo;
 	T*   entries[];
-};
-
-struct TID {
-	u32 idx;
-	u32 gen;
 };
 
 enum TStatus {
