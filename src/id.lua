@@ -19,4 +19,3 @@ end
 function id_str(id_idx) return identifiers[id_idx] end
 
 ID__ = id_intern("_")
-ID_REST = id_intern("...")

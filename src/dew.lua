@@ -17,6 +17,8 @@ const ERR_...
 ]]
 
 require("util")
+require("dew_debug")
+require("hash")
 require("unit")
 require("diag")
 require("srcpos")
@@ -33,8 +35,6 @@ DEBUG_PARSER = false
 DEBUG_RESOLVE = false
 DEBUG_CODEGEN = false
 VERBOSE = 1 -- 0=quiet, 1=normal, 2=verbose
-
-
 
 
 ---------------------------------------------------------------------------------------------------
@@ -62,28 +62,30 @@ end
 USAGE = [[
 usage: %s [options] <input> ...
 options:
-    -h, --help       Print help and exit
-    -v, --verbose    Log extra information
-    --version        Print version and exit
-    --debug-tokens   Print details about source tokenization
-    --debug-parse    Print details about parsing
-    --debug-resolve  Print details about identifier & type resolution
-    --debug-codegen  Print details about code generation
-    --debug-all      Print details about all phases
-    --selftest[=v]   Run tests of dew itself (v=verbosely)
+    -h, --help          Print help and exit
+    -v, --verbose       Log extra information
+    --version           Print version and exit
+    --debug-tokens      Print details about source tokenization
+    --debug-parse       Print details about parsing
+    --debug-resolve     Print details about identifier & type resolution
+    --debug-codegen     Print details about code generation
+    --debug-all         Print details about all phases
+    --selftest[=filter] Run tests of dew itself
+    --selftest-verbose  Print details about selftest
 <input>: file path]]
 
 function parse_args(args)
 	local opt = {
 		version = false,
-		selftest = 0,
+		selftest = nil, -- string?
+		selftest_verbose = false,
 		args = {}
 	}
 	local i = 1
 	while i <= #args do
 		local arg = args[i]
 		if arg == "-h" or arg == "--help" then
-			print(fmt(USAGE, args[0]))
+			printf(USAGE, args[0])
 			os.exit(0)
 		elseif arg == "--version" then
 			print("dew version " .. VERSION)
@@ -92,14 +94,16 @@ function parse_args(args)
 			DEBUG_TOKENS = true
 		elseif arg == "--debug-parse" then
 			DEBUG_PARSER = true
-		elseif arg == "--debug-codegen" then
-			DEBUG_CODEGEN = true
 		elseif arg == "--debug-resolve" then
 			DEBUG_RESOLVE = true
+		elseif arg == "--debug-codegen" then
+			DEBUG_CODEGEN = true
 		elseif arg == "--selftest" then
-			opt.selftest = 1
-		elseif arg == "--selftest=v" then
-			opt.selftest = 2
+			opt.selftest = ""
+		elseif string_starts_with(arg, "--selftest=") then
+			opt.selftest = arg:sub(#"--selftest=" + 1)
+		elseif arg == "--selftest-verbose" then
+			opt.selftest_verbose = true
 		elseif arg == "--debug-all" then
 			DEBUG_TOKENS = true
 			DEBUG_PARSER = true
@@ -119,29 +123,30 @@ function parse_args(args)
 end
 
 function compile_and_run(unit)
-	-- tokenize
+	local function stop_if_errors()
+		if unit.errcount > 0 then
+			dlog("stopping after %d error(s)", unit.errcount)
+			return os.exit(1)
+		end
+	end
+
+	-- tokenize (text -> tokens)
 	tokens = tokenize_unit(unit)
+	stop_if_errors()
 
-	-- parse
-	parse_unit(unit, tokens)
-	if unit.errcount > 0 then
-		dlog("stopping after %d error(s)", unit.errcount)
-		return os.exit(1)
-	end
+	-- parse (tokens -> AST)
+	parse_unit(unit, tokens, PARSE_SRCMAP)
+	stop_if_errors()
 
-	-- resolve types & identifiers
+	-- resolve (AST -> IR)
 	resolve_unit(unit)
-	if unit.errcount > 0 then
-		dlog("stopping after %d error(s)", unit.errcount)
-		return os.exit(1)
-	end
+	stop_if_errors()
 
-	-- generate code
+    print("TODO: ... os.exit(1)"); os.exit(1)
+
+	-- generate code (IR -> target)
 	code = codegen_unit(unit)
-	if unit.errcount > 0 then
-		dlog("stopping after %d error(s)", unit.errcount)
-		return os.exit(1)
-	end
+	stop_if_errors()
 
 	-- run program
 	run(unit, code)
@@ -150,8 +155,8 @@ end
 function main(args)
 	local prog = args[0]
 	local opt = parse_args(args)
-	if opt.selftest > 0 then
-		require("selftest")(opt.selftest > 1)
+	if opt.selftest ~= nil then
+		require("selftest")(opt.selftest, opt.selftest_verbose)
 		os.exit(0)
 	end
 	if #opt.args == 0 then
@@ -170,4 +175,18 @@ function main(args)
 	end
 end
 
-main(arg)
+-- -- Runtime dev
+-- require("tests/rt/worker-echo")
+-- require("ast-lab")
+
+if false then
+	dew_debug_calltrace_enable()
+	xpcall(main, function(err)
+		debug.sethook()
+		print("[dew_debug] error: " .. debug.traceback(err, 2))
+		dew_debug_print_calltrace(20)
+		os.exit(3)
+	end, arg)
+else
+	return main(arg)
+end

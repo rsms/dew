@@ -12,7 +12,7 @@ end
 function srcpos_off(p) return p & 0xffffff end
 function srcpos_span(p) return p>>24 & 0xff end
 
-function srcpos_union(srcpos1, srcpos2)
+function srcpos_union(srcpos1, srcpos2) --> srcpos
 	local start1, start2 = srcpos_off(srcpos1), srcpos_off(srcpos2)
 	local end1, end2 = start1 + srcpos_span(srcpos1), start2 + srcpos_span(srcpos2)
 	local start3 = start1 < start2 and start1 or start2
@@ -20,13 +20,13 @@ function srcpos_union(srcpos1, srcpos2)
 	return srcpos_make(start3, end3 - start3)
 end
 
-function srcpos_after(srcpos, span)
+function srcpos_after(srcpos, span) --> srcpos
 	local off = srcpos_off(srcpos) + srcpos_span(srcpos)
 	if span == nil then span = 0 end
 	return srcpos_make(off, span)
 end
 
-function srcpos_linecol(srcpos, src) -- line, col
+function srcpos_linecol(srcpos, src) --> line, col
 	assert(srcpos ~= nil)
 	local off = srcpos_off(srcpos)
 	local i, j, iend, line = 1, 0, off, 1
@@ -48,7 +48,7 @@ function srcpos_linecol(srcpos, src) -- line, col
 	return line, (off - i) + 1
 end
 
-function srcpos_fmt(srcpos, src)
+function srcpos_fmt(srcpos, src) --> str
 	if srcpos == 0 or src == nil or #src == 0 then return "" end
 	local line, col = srcpos_linecol(srcpos, src)
 	return fmt("%d:%d", line, col)

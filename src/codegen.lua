@@ -11,7 +11,7 @@ function codegen_unit(unit) -- code
 		if idx == 0 then return end
 		if flags == nil then flags = 0 end
 		g.idx = idx
-		return ast_visit(ast_stack, src, idx, function(n, a, b, c, d)
+		return ast_visit(ast_stack, idx, function(idx, n, a, b, c, d)
 			depth = depth + 1
 			local k = ast_kind(n)
 			assert(k ~= 0, "encountered <nothing> AST node")
@@ -30,15 +30,15 @@ function codegen_unit(unit) -- code
 	g.codegen = codegen
 	g.diag_err = function(srcpos, format, ...)
 		if srcpos == nil then srcpos = ast_srcpos(ast_stack[g.idx]) end
-		return diag(DIAG_ERR, unit, srcpos, format, ...)
+		return diag(unit, DIAG_ERR, srcpos, format, ...)
 	end
 	g.diag_warn = function(srcpos, format, ...)
 		if srcpos == nil then srcpos = ast_srcpos(ast_stack[g.idx]) end
-		return diag(DIAG_WARN, unit, srcpos, format, ...)
+		return diag(unit, DIAG_WARN, srcpos, format, ...)
 	end
 	g.diag_info = function(srcpos, format, ...)
 		if srcpos == nil then srcpos = ast_srcpos(ast_stack[g.idx]) end
-		return diag(DIAG_INFO, unit, srcpos, format, ...)
+		return diag(unit, DIAG_INFO, srcpos, format, ...)
 	end
 	codegen(unit.ast_root)
 	local code = table.concat(buf, "")

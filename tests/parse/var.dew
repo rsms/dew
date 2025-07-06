@@ -1,0 +1,14 @@
+// variables
+
+// VAR
+a = 1
+
+// MULTIVAR
+b, c, d = 1, 2, 3
+
+// SPREADVAR
+t = (1, 2, 3)
+e, f, g = t
+
+// MULTIVAR swap
+b, c = c, b

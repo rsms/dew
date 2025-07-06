@@ -4,18 +4,18 @@ keywordmin, keywordmax = 1000, 0
 
 function tokname(tok) return token_names[tok] end
 
-function deftok(name)
-	local idx = #token_names + 1; assert(idx <= 0xff)
-	token_names[idx] = name
-	return idx
+do
+local function deftok(name)
+	local tok = #token_names + 1; assert(tok <= 0xff)
+	token_names[tok] = name
+	return tok
 end
-
-function defkeyword(name)
-	local idx = deftok(name)
-	keywords[name] = idx
+local function defkeyword(name)
+	local tok = deftok(name)
+	keywords[name] = tok
 	if #name < keywordmin then keywordmin = #name end
 	if #name > keywordmax then keywordmax = #name end
-	return idx
+	return tok
 end
 
 -- tokens
@@ -47,16 +47,19 @@ TOK_ID                                   = deftok('ID')
 TOK_INT                                  = deftok('INT')
 TOK_FLOAT                                = deftok('FLOAT')
 
+-- keywords
 TOK_FUN    = defkeyword('fun')
 TOK_RETURN = defkeyword('return')
 
-function tokenize_unit(unit, include_comments)
+end
+
+function tokenize_unit(unit)
+	local include_comments = unit.include_comments
 	local src = unit.src
 	local srcidx, srcend = 1, #src + 1
 	local tok, tokstart, tokend = TOK_SEMI, 1, 0
 	local lineidx, lineno = 1, 1, 0
 	local insertsemi = false
-	local numbase = 10
 	local column = function() return (tokstart + 1) - lineidx end
 	local curr_byte = function() return string.byte(src, srcidx) end
 	local value = nil
@@ -65,7 +68,7 @@ function tokenize_unit(unit, include_comments)
 	local function diag_err(format, ...)
 		local srcpos = srcpos_make(tokstart, tokend - tokstart)
 		srcidx = srcend -- stop scanning
-		diag(DIAG_ERR, unit, srcpos, format, ...)
+		diag(unit, DIAG_ERR, srcpos, format, ...)
 		if DEBUG_TOKENS then error("syntax error") end
 	end
 
@@ -321,6 +324,7 @@ function tokenize_unit(unit, include_comments)
 		end
 	end
 
+	-- scan & encode tokens
 	local tokens = {}
 	while true do
 		tok = scan_next()
@@ -334,6 +338,13 @@ function tokenize_unit(unit, include_comments)
 		-- 	     string.sub(src, tokstart, tokend - 1))
 		-- end
 
+		-- Encode token into u64.
+		-- Most tokens need just one u64, where there's no additional value (e.g. punctuation)
+		-- or the value is a small integer (e.g. operator or identifier.)
+		-- Tokens with large or complex values (e.g. floating-point or string literal) have their
+		-- value stored in a second array slot.
+		-- The primary encoding looks like this:
+		--
 		-- bit           1111111111222222222233 333333334444444444555555 55556666
 		--     01234567890123456789012345678901 234567890123456789012345 67890123
 		--     srcpos                           value                    tok
@@ -342,19 +353,16 @@ function tokenize_unit(unit, include_comments)
 		local srcpos = srcpos_make(tokstart, tokend - tokstart)
 		local p1 = tok | (srcpos & 0xffffffff)<<32
 		if value_is_int then
-			if value >= 0 and value < 0xffffff then
+			if value >= 0 and value < 0xfffffff then
 				-- squeeze value into 24 bits of token entry
 				p1 = p1 | value<<8
-				tokens[#tokens + 1] = p1
+				value = nil
 			else
 				p1 = p1 | 0xffffff00
-				tokens[#tokens + 1] = p1
-				tokens[#tokens + 1] = value
 			end
-		else
-			tokens[#tokens + 1] = p1
-			tokens[#tokens + 1] = value
 		end
+		tokens[#tokens + 1] = p1
+		tokens[#tokens + 1] = value -- no-op if value is nil
 	end
 
 	if DEBUG_TOKENS then
@@ -366,7 +374,7 @@ end
 
 
 function token_iterator(tokens)
-	local i, w, tok, srcpos, value = 1, 0, 0, 0, 0
+	local i, tok, srcpos, value = 1, 0, 0, 0, 0
 	local function next()
 		if i > #tokens then
 			return nil, 0, nil
@@ -375,48 +383,42 @@ function token_iterator(tokens)
 		tok = v & 0xff
 		srcpos = v>>32
 		value = v>>8 & 0xffffff
-		assert(value ~= 0 or tok ~= TOK_ID,
-		       "ID with separate value (id_idx larger than 0xffffff)")
-		if tok == TOK_COMMENT or
-		   (tok == TOK_INT and value == 0xffffff) or
-		   tok == TOK_FLOAT
-		then
-			-- value in second array slot
-			i = i + 1
-			w = 2
+		assert(value ~= 0 or tok ~= TOK_ID, "ID with separate value (id_idx > 0xffffff)")
+		if tok == TOK_COMMENT or tok == TOK_FLOAT or (tok == TOK_INT and value == 0xffffff) then
+			i = i + 1 -- value in second array slot
 			value = tokens[i]
-		else
-			w = 1
 		end
 		i = i + 1
 		return tok, srcpos, value
 	end
 	local function save_state()
-		return { i, w, tok, srcpos, value }
+		return { i, tok, srcpos, value }
 	end
 	local function restore_state(snapshot)
-		i, w, tok, srcpos, value = table.unpack(snapshot)
+		i, tok, srcpos, value = table.unpack(snapshot)
 		return tok, srcpos, value
 	end
 	return next, save_state, restore_state
 end
 
 
-function dlog_tokens(tokens, unit)
+function dlog_tokens(tokens, unit, line_prefix)
 	local i = 1
-	local next = token_iterator(tokens)
-	while true do
-		local tok, srcpos, value = next()
-		if tok == nil then break end
-		local srcpos_str = unit == nil and "" or srcpos_fmt(srcpos, unit.src)
+	line_prefix = line_prefix and line_prefix or ""
+	for tok, srcpos, value, meta in token_iterator(tokens) do
+		local srcpos_str = (unit == nil) and "" or srcpos_fmt(srcpos, unit.src)
 		if tok == TOK_INT then
-			value = __rt.intfmt(value, 10) .. "\t0x" .. __rt.intfmt(value, 16, true)
+			-- value = fmt("%8s 0x%s", __rt.intfmt(value, 10), __rt.intfmt(value, 16, true))
+			value = fmt("%8d 0x%x", value, value)
 		elseif tok == TOK_FLOAT then
-			value = fmt("%g", value)
+			value = fmt("%8g", value)
+		elseif tok == TOK_ID then
+			value = id_str(value)
 		else
 			value = tostring(value)
 		end
-		dlog("%3d │ %-5s #%-3d %5d+%-3d  %-8s  %s", i,
+		dlog("%s%3d │ %-8s #%-3d %5d+%-3d  %-8s  %8s",
+		     line_prefix, i,
 		     token_names[tok], tok,
 		     srcpos_off(srcpos), srcpos_span(srcpos), srcpos_str,
 		     value)

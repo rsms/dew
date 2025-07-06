@@ -1,4 +1,3 @@
-local verbose = false
 local fmt = string.format
 
 -- Local Lua implementation of __rt.intconv
@@ -227,9 +226,9 @@ function t(srcval, src_sign, src_bits, dst_sign, dst_bits)
     local expected = expecttab[key]
     if expected == nil then
         -- missing!
-        -- print(fmt("MISSING expecttab[%s]", key))
+        -- printf("MISSING expecttab[%s]", key)
         assert(dstval <= 9223372036854775807)
-        print(fmt("\t['%s'] = %21d, -- %21x", key, dstval, dstval))
+        printf("\t['%s'] = %21d, -- %21x", key, dstval, dstval)
         expected = dstval
     else
         -- assert(expected ~= nil, key)
@@ -241,15 +240,15 @@ function t(srcval, src_sign, src_bits, dst_sign, dst_bits)
     --       dst_sign, dst_bits, dstval, dstval,
     --       dst_sign, dst_bits, expected, expected)
     srcval = srcval & ((1 << src_bits) - 1)
-    if verbose or dstval ~= expected then
-        print(fmt(
+    if test_verbose or dstval ~= expected then
+        printf(
             "   %s%-2d %16x %21"..src_sign.."\n" ..
             "-> %s%-2d %16x %21"..dst_sign.."\n" ..
             "ex %s%-2d %16x %21"..dst_sign.."\n" ..
             "————————————————————————————————————————————————————————",
             src_sign, src_bits, srcval, srcval,
             dst_sign, dst_bits, dstval, dstval,
-            dst_sign, dst_bits, expected, expected))
+            dst_sign, dst_bits, expected, expected)
     end
     if dstval ~= expected then
         error("unexpected: ")
@@ -257,46 +256,44 @@ function t(srcval, src_sign, src_bits, dst_sign, dst_bits)
     return dstval
 end
 
-return function(options)
-    verbose = options.verbose == true
-    local initval = expecttab["s64"]
-    local S, D = 0, 0
 
-    -- fun intconv(value i64, src_bits, dst_bits uint, src_issigned, dst_issigned bool) int
-    -- t(srcval, src_sign, src_bits, dst_sign, dst_bits)
+local initval = expecttab["s64"]
+local S, D = 0, 0
 
-    local valtab = {
-        ["s64"] = initval,
-        ["u64"] = t(initval, "s",64, "u",64),
-    }
-    local testcount = 2
+-- fun intconv(value i64, src_bits, dst_bits uint, src_issigned, dst_issigned bool) int
+-- t(srcval, src_sign, src_bits, dst_sign, dst_bits)
 
-    for S = 63, 2, -1 do
-        valtab["s" .. tostring(S)] = t(initval, "s",64, "s",S)
-        valtab["u" .. tostring(S)] = t(initval, "s",64, "u",S)
-        testcount = testcount + 2
-    end
+local valtab = {
+    ["s64"] = initval,
+    ["u64"] = t(initval, "s",64, "u",64),
+}
+local testcount = 2
 
-    if verbose then print('————————————————————————————————————————————————————————') end
-
-    S = 64
-    while S >= 8 do
-        local srcval_s = valtab["s" .. S]
-        local srcval_u = valtab["u" .. S]
-        D = 64
-        while D >= 8 do
-            if S ~= D then
-                t(srcval_s, "s",S, "s",D)
-                t(srcval_u, "u",S, "u",D)
-                testcount = testcount + 2
-            end
-            t(srcval_s, "s",S, "u",D)
-            t(srcval_u, "u",S, "s",D)
-            testcount = testcount + 2
-            D = D // 2
-        end
-        S = S // 2
-    end
-
-    printf("intconv_test: OK (%d test cases)", testcount)
+for S = 63, 2, -1 do
+    valtab["s" .. tostring(S)] = t(initval, "s",64, "s",S)
+    valtab["u" .. tostring(S)] = t(initval, "s",64, "u",S)
+    testcount = testcount + 2
 end
+
+if test_verbose then print('————————————————————————————————————————————————————————') end
+
+S = 64
+while S >= 8 do
+    local srcval_s = valtab["s" .. S]
+    local srcval_u = valtab["u" .. S]
+    D = 64
+    while D >= 8 do
+        if S ~= D then
+            t(srcval_s, "s",S, "s",D)
+            t(srcval_u, "u",S, "u",D)
+            testcount = testcount + 2
+        end
+        t(srcval_s, "s",S, "u",D)
+        t(srcval_u, "u",S, "s",D)
+        testcount = testcount + 2
+        D = D // 2
+    end
+    S = S // 2
+end
+
+return fmt("%d test cases", testcount)

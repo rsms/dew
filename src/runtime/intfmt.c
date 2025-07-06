@@ -34,8 +34,8 @@ int l_intfmt(lua_State* L) {
 
     u64 uvalue = is_unsigned ? (u64)value : (u64)((value < 0) ? -value : value);
     do {
-        // 0xdf (0b_1101_1111) normalizes the case of letters, i.e. 'a' => 'A'
-        *--str = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"[(uvalue % base) & 0xdf];
+        // 0xdf (0b_1101_1111) normalizes the case of letters, i.e. 'A' => 'a'
+        *--str = "0123456789abcdefghijklmnopqrstuvwxyz"[(uvalue % base) & 0xdf];
         uvalue /= base;
     } while (uvalue);
 

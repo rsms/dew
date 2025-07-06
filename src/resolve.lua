@@ -1,242 +1,236 @@
--- resolve (type resolution & analysis)
+-- ir_node { kind u8; _ u24; typ_idx i32 }
 
-
-function is_type_assignable(unit, dst_typ_idx, src_typ_idx) -- bad_idx (0 if ok)
-	assert(dst_typ_idx ~= nil)
-	assert(src_typ_idx ~= nil)
-	if dst_typ_idx == 0 or src_typ_idx == 0 then
-		if unit.errcount == 0 then
-			if dst_typ_idx ~= 0 then return dst_typ_idx end
-			if src_typ_idx ~= 0 then return src_typ_idx end
-		end
-		return 0
-	end
-
-	-- local dst_typ = ast_node(unit.ast, dst_typ_idx)
-	-- local src_typ = ast_node(unit.ast, src_typ_idx)
-	-- local dst_kind = ast_kind(dst_typ)
-	-- if dst_kind ~= ast_kind(src_typ) then
-	-- 	dlog("dst=%s src=%s", ast_kind_name(dst_typ), ast_kind_name(src_typ))
-	-- 	return false
-	-- end
-
-	dst_typ_idx = AST_ID.unwind(unit.ast, dst_typ_idx)
-	src_typ_idx = AST_ID.unwind(unit.ast, src_typ_idx)
-
-	local dst_kind = ast_kind(ast_node(unit.ast, dst_typ_idx))
-
-	local N_is_type_assignable = ast_nodes[dst_kind].is_type_assignable
-	assert(N_is_type_assignable ~= nil,
-	       fmt("TODO: implement %s.is_type_assignable", astkind_name(dst_kind)))
-	return N_is_type_assignable(unit, dst_typ_idx, src_typ_idx)
+function ir_typeof(ir, idx) --> typ_idx
+    if idx == 0 then
+        return 0
+    end
+    return ir:get_i32(ast_offs_of_idx(idx) + 4)
 end
 
+function ir_is_type_assignable(ir, dst_typ_idx, src_typ_idx) --> issue_idx (0 if ok)
+    if dst_typ_idx == 0 or src_typ_idx == 0 then
+        if dst_typ_idx ~= 0 then return dst_typ_idx end
+        return src_typ_idx
+    end
+    local dst_kind = ir:get_u8(ast_offs_of_idx(dst_typ_idx))
+    local src_kind = ir:get_u8(ast_offs_of_idx(src_typ_idx))
+    local f = ast_info[dst_kind].is_type_assignable
+    if f == nil then
+        if dst_kind == src_kind then
+            return 0
+        end
+        return src_kind
+    end
+    return f(ir, dst_typ_idx, src_typ_idx)
+end
 
 function resolve_unit(unit)
-	if DEBUG_RESOLVE then dlog("\x1b[1;35mresolve %s\x1b[0m", unit.srcfile) end
-	local ast_stack = unit.ast
-	if #ast_stack == 0 then return 0 end
-	local src = unit.src
-	local depth = 0
-	local symstack_id, symstack_val, symstack_len, symstack_scope = {}, {}, 0, 0
-	local ctxtype_stack, ctxtype_stack_len = { TYPE_any }, 1
-	local resmap = unit.resmap -- idx -> (typ_idx, val_idx)
+    unit.ir = __rt.buf_create(#unit.ast)
+    unit.ir_srcmap = {} -- set to nil to not save srcpos
 
-	local function assert_istype(idx)
-		assert(ast_is_type(ast_node(ast_stack, idx)),
-		       fmt("%s is not a type", ast_kind_name(ast_node(ast_stack, idx))) )
-	end
+    local internmap = {} -- (hash u64) => (idx i32) -- TODO: per package? global?
+    local ast = unit.ast
+    local ir = unit.ir
+    local idstack = __rt.buf_create(512) -- [(id_idx u, idx u32)]
+    local idstack_scope_offs = 0 -- bottom of current scope
+    local resolver = {
+        ctxtype = nil,
+        unit = unit,
+        internmap = internmap,
+        fun_idx = 0, -- current function
+    }
 
-	local r; r = {
-		unit = unit,
-		idx = idx,
-		ctxtype = TYPE_any,
-		fun_idx = 0, -- current function, 0 if top-level
-		fun_typ_idx = 0, -- type of fun_idx
-		define_params = false,
-		ast_node = function(idx) assert(idx ~= nil); return ast_node(ast_stack, idx) end,
-		ast_repr = function(idx) assert(idx ~= nil); return ast_repr(ast_stack, src, idx) end,
-		ast_str = function(idx) assert(idx ~= nil); return ast_str(ast_stack, idx) end,
-		ast_typeof = function(idx) return ast_typeof(unit, idx) end, -- typ_idx, val_idx
-		ast_srcpos = function(idx) return ast_srcpos(ast_node(ast_stack, idx)) end,
-		is_type_assignable = function(dst_typ_idx, src_typ_idx) -- bad_idx
-			return is_type_assignable(unit, dst_typ_idx, src_typ_idx)
-		end,
-		id_lookup = function(id_idx)
-			-- print("id_lookup", id_str(id_idx), id_idx)
-			assert(id_idx ~= 0)
-			for i = symstack_len, 1, -1 do
-				if symstack_id[i] == id_idx then
-					return symstack_val[i]
-				end
-			end
-			return builtin_symtab[id_idx]
-		end,
-		id_define = function(id_idx, idx)
-			assert(id_idx ~= 0)
-			if id_idx == ID__ then
-				-- the "hole" identifier '_' is never defined
-				return
-			end
-			local shadows = 0
-			for i = symstack_len, symstack_scope, -1 do
-				if symstack_id[i] == id_idx then
-					shadows = symstack_val[i]
-					r.diag_err(nil, "'%s' redeclared", id_str(id_idx))
-					r.diag_info(r.ast_srcpos(shadows), "'%s' previously defined here", id_str(id_idx))
-					break
-				end
-			end
-			symstack_len = symstack_len + 1
-			symstack_id[symstack_len] = id_idx
-			symstack_val[symstack_len] = idx
-			return shadows
-		end,
-		id_lookup_or_define = function(id_idx, idx) -- existing_idx or nil
-			if id_idx == ID__ then return nil end
-			local existing_idx = r.id_lookup(id_idx)
-			if existing_idx ~= nil then
-				return existing_idx
-			end
-			symstack_len = symstack_len + 1
-			symstack_id[symstack_len] = id_idx
-			symstack_val[symstack_len] = idx
-			return nil
-		end,
-		scope_open = function()
-			symstack_scope = symstack_len
-			return symstack_len
-		end,
-		scope_close = function(scope)
-			symstack_scope = scope
-			symstack_len = scope
-		end,
-		ctxtype_push = function(typ_idx)
-			typ_idx = AST_ID.unwind(ast_stack, typ_idx)
-			dlog("ctxtype_push> %s", ast_repr(ast_stack, src, typ_idx))
-			assert_istype(typ_idx)
-			ctxtype_stack_len = ctxtype_stack_len + 1
-			ctxtype_stack[ctxtype_stack_len] = typ_idx
-			r.ctxtype = typ_idx
-		end,
-		ctxtype_pop = function()
-			assert(ctxtype_stack_len > 0)
-			ctxtype_stack_len = ctxtype_stack_len - 1
-			r.ctxtype = ctxtype_stack[ctxtype_stack_len]
-			dlog("ctxtype_pop>  %s", ast_repr(ast_stack, src, r.ctxtype))
-		end,
-		diag_err = function(srcpos, format, ...)
-			if srcpos == nil then srcpos = ast_srcpos(ast_stack[r.idx]) end
-			return diag(DIAG_ERR, unit, srcpos, format, ...)
-		end,
-		diag_warn = function(srcpos, format, ...)
-			if srcpos == nil then srcpos = ast_srcpos(ast_stack[r.idx]) end
-			return diag(DIAG_WARN, unit, srcpos, format, ...)
-		end,
-		diag_info = function(srcpos, format, ...)
-			if srcpos == nil then srcpos = ast_srcpos(ast_stack[r.idx]) end
-			return diag(DIAG_INFO, unit, srcpos, format, ...)
-		end,
-		resolve = function(idx, flags) -- typ_idx, idx
-			if idx < 0 then
-				-- built-in things have predefined type
-				return ast_typeof(unit, idx)
-			end
-			if idx == 0 then
-				-- nothing/error
-				return 0, idx
-			end
-			local n = r.ast_node(idx)
-			assert(n ~= 0, "encountered <nothing> AST node at idx " .. idx)
+    function resolver.typeof(idx)
+        local ast = ir
+        if idx < 0 then
+            ast = builtin_ir
+            idx = -idx
+        end
+        return idx == 0 and 0 or ast:get_i32(ast_offs_of_idx(idx) + 4)
+    end
 
-			-- check for NREF
-			local nref_idx = 0
-			if ast_kind(n) == AST_NREF.kind then
-				nref_idx = idx
-				idx = AST_NREF.target(n)
-				n = r.ast_node(idx)
-			end
+    function resolver.diag_err(srcpos, format, ...)
+        return diag(unit, DIAG_ERR, srcpos, format, ...)
+    end
 
-			-- check if already resolved
-			local v64 = resmap[idx]
-			if v64 ~= nil then
-				-- already resolved
-				local typ_idx, idx2 = unpack_i32x2(v64)
-				--dlog("resolve> already resolved: #%d %s (#%d %s, #%d %s)",
-				--     idx, ast_kind_name(n),
-				--     typ_idx, ast_kind_name(r.ast_node(typ_idx)),
-				--     idx2, ast_kind_name(r.ast_node(idx2)) )
-				if nref_idx ~= 0 then
-					-- update NREF to point to potentially-new node
-					AST_NREF.update(ast_stack, nref_idx, idx2)
-				end
-				return typ_idx, idx2
-			end
+    function resolver.srcpos(idx)
+        return 0
+    end
 
-			if DEBUG_RESOLVE then
-				dlog("\x1b[1;35mR>\x1b[0m%s %s ...", string.rep("  ", depth), ast_kind_name(n))
-			end
+    function resolver.resolve(idx, flags)
+        assert(idx ~= 0)
+        local offs = ast_offs_of_idx(idx)
+        local kind = ast:get_u8(offs)
+        local info = ast_info[kind]
+        assert(info.resolve ~= nil, "TODO: " .. info.name .. ".resolve")
+        if flags == nil then
+            flags = 0
+        end
+        return info.resolve(ast, idx, ir, resolver, flags)
+    end
 
-			if flags == nil then flags = 0 end
-			r.idx = idx
-			return ast_visit(ast_stack, src, idx, function(n, ...)
-				depth = depth + 1
-				local k = ast_kind(n)
-				if k == 0 then
-					return TYPE_void, idx
-				end
-				local f = ast_nodes[k].resolve
-				if f == nil then
-					error(fmt("TODO: resolve %s", astkind_name(k)))
-				end
+    function resolver.id_scope_open() --> scopestate
+        idstack_scope_offs = #idstack
+        return #idstack
+    end
 
-				local typ_idx, idx2 = f(r, flags, idx, n, ...)
-				if idx2 == nil then
-					idx2 = idx
-				end
+    function resolver.id_scope_close(scope)
+        assert(scope <= #idstack and scope % 8 == 0, tostring(#idstack) .. ", " .. tostring(scope))
+        idstack:resize(scope)
+        idstack_scope_offs = scope
+    end
 
-				assert(typ_idx ~= nil, fmt("resolve %s returned nil", astkind_name(k)))
-				if typ_idx == 0 and unit.errcount == 0 then
-					unit.errcount = unit.errcount + 1
-					dlog("resolver error: %s.resolve did not return a type (returned 0)",
-					     ast_kind_name(n))
-				end
+    local function idstack_lookup(id_idx, base_offs) --> idx (0 if not found)
+        assert(id_idx ~= 0)
+        local offs = idstack:find_u32(#idstack, base_offs, 8, id_idx)
+        return offs ~= nil and idstack:get_i32(offs + 4) or 0
+    end
 
-				depth = depth - 1
+    function resolver.id_lookup(id_idx) --> idx (0 if not found)
+        assert(id_idx ~= 0)
+        local idx = idstack_lookup(id_idx, 0)
+        if idx ~= 0 then
+            return idx
+        end
+        -- fall back to looking for a built-in thing
+        return builtin_idtab_lookup(id_idx)
+    end
 
-				-- print("resolve> memoize resolve(#"..idx..") =>", typ_idx, idx2)
-				r.mark_resolved(idx, typ_idx, idx2)
-				if nref_idx ~= 0 and idx ~= idx2 then
-					-- update NREF to point to new node
-					AST_NREF.update(ast_stack, nref_idx, idx2)
-				end
+    function resolver.id_lookup_def(id_idx) --> idx (0 if not found)
+        assert(id_idx ~= 0)
+        return idstack_lookup(id_idx, 0)
+    end
 
-				if DEBUG_RESOLVE then
-					xpcall(function()
-						dlog("\x1b[1;35mR>\x1b[0m%s %s => (%s, #%s %s)",
-						     string.rep("  ", depth),
-						     ast_kind_name(n),
-						     ast_repr(ast_stack, src, typ_idx, 1),
-						     idx2, ast_repr(ast_stack, src, idx2, 1) )
-					end, function(err)
-						print("[recovered] " .. debug.traceback(err, 2))
-						dlog("\x1b[1;35mR>\x1b[0m%s %s => <ast_repr error>",
-						     string.rep("  ", depth), ast_kind_name(n))
-						-- ast_dump(ast_stack, unit.ast_root); os.exit(1) -- XXX
-					end)
-				end
+    function resolver.id_lookup_def_in_current_scope(id_idx) --> idx (0 if not found)
+        assert(id_idx ~= 0)
+        return idstack_lookup(id_idx, idstack_scope_offs)
+    end
 
-				return typ_idx, idx2
-			end)
-		end,
-		mark_resolved = function(idx, typ_idx, val_idx)
-			resmap[idx] = pack_i32x2(typ_idx, val_idx)
-		end,
-	}
-	r.resolve(unit.ast_root)
-	if DEBUG_RESOLVE then
-		print("ast_stack and AST after resolve_unit:")
-		ast_dump(ast_stack, unit.ast_root)
-		print(ast_repr(unit.ast, src, unit.ast_root, nil, resmap))
-	end
+    function resolver.id_define(id_idx, idx) --> idx
+        if id_idx ~= 0 then
+            idstack:push_u64((id_idx & 0xffffff) | ((idx & 0xffffffff) << 32))
+        end
+        return idx
+    end
+
+    function resolver.record_srcpos(idx, ir_idx)
+    end
+
+    -- map ir_idx => srcpos, if requested
+    if unit.ir_srcmap ~= nil then
+        local resolve_fun = resolver.resolve
+        resolver.resolve = function(idx, flags)
+            local srcpos = ast:get_u32(ast_offs_of_idx(idx) + 4)
+            local ir_idx = resolve_fun(idx, flags)
+            -- trace("unit.ir_srcmap[%u] = 0x%08x", ir_idx, srcpos)
+            if ir_idx ~= 0 and ir_idx ~= nil then
+                unit.ir_srcmap[ir_idx] = srcpos
+            end
+            return ir_idx
+        end
+        function resolver.srcpos(idx) --> srcpos
+            local srcpos = unit.ir_srcmap[idx]
+            return srcpos ~= nil and srcpos or 0
+        end
+        function resolver.record_srcpos(idx, ir_idx)
+            resolver.unit.ir_srcmap[ir_idx] = ast_srcpos(ast, idx)
+        end
+    end
+
+    -- map ir_idx => [comment], if requested
+    if unit.commentmap ~= nil then
+        local resolve_fun = resolver.resolve
+        local commentmap_orig = unit.commentmap
+        unit.commentmap = {}
+        resolver.resolve = function(idx, flags)
+            local ir_idx = resolve_fun(idx, flags)
+            local comments = commentmap_orig[idx]
+            if comments ~= nil and ir_idx ~= 0 then
+                unit.commentmap[ir_idx] = comments
+            end
+            return ir_idx
+        end
+    end
+
+    if not DEBUG_RESOLVE then
+        unit.ir_idx = resolver.resolve(unit.ast_idx, 0)
+        return
+    end
+
+    -- DEBUG_RESOLVE (remainder of function)
+    -- wrap resolve() in trace statements, if DEBUG_RESOLVE is enabled
+    local trace_depth = 0
+    local function trace(format, ...)
+        dlog("\x1b[1;35mresolve⟩\x1b[0m " .. string.rep("    ", trace_depth) .. format, ...)
+    end
+    resolver.trace = trace
+
+    local id_scope_open_orig = resolver.id_scope_open
+    resolver.id_scope_open = function() --> offs
+        local scope = id_scope_open_orig()
+        trace("id_scope_open %d", scope)
+        return scope
+    end
+
+    local id_scope_close_orig = resolver.id_scope_close
+    resolver.id_scope_close = function(scope)
+        trace("id_scope_close %d", scope)
+        local scope = id_scope_close_orig(scope)
+        return scope
+    end
+
+    local id_define_orig = resolver.id_define
+    resolver.id_define = function(id_idx, idx) --> idx
+        trace("define ID %s => #%d [offs %u, scope %d]",
+              id_str(id_idx), idx, #idstack, idstack_scope_offs//8)
+        return id_define_orig(id_idx, idx)
+    end
+
+    local id_lookup_orig = resolver.id_lookup
+    resolver.id_lookup = function(id_idx)
+        trace("lookup ID %s ...", id_str(id_idx))
+        local idx = id_lookup_orig(id_idx)
+        if idx == 0 then
+            trace("lookup ID %s => NOT FOUND [scope %d]", id_str(id_idx), idstack_scope_offs//8)
+        else
+            trace("lookup ID %s => #%d [scope %d]", id_str(id_idx), idx, idstack_scope_offs//8)
+        end
+        return idx
+    end
+
+    local resolve_orig = resolver.resolve
+    resolver.resolve = function(idx, flags)
+        local info = ast_info[ast:get_u8(ast_offs_of_idx(idx))]
+        trace("%s#%d ...", info.name, idx)
+        trace_depth = trace_depth + 1
+        local ir_idx = resolve_orig(idx, flags)
+        trace_depth = trace_depth - 1
+        if ir_idx == 0 or ir_idx == nil then
+            trace("%s#%d => (nothing)", info.name, idx)
+        elseif ir_idx < 0 then
+            trace("%s#%d => builtin#%d %s", info.name, idx, ir_idx, builtin_name(ir_idx))
+        elseif ast_kind(ir, ir_idx) == AST_REF.kind then
+            -- REF is special as it stores its target in the meta slot, unlike other nodes
+            local target_idx = AST_REF.target(ir, ir_idx)
+            local typ_idx = resolver.typeof(target_idx)
+            trace("%s#%d => ir#%d REF -> ir#%d %s (type #%d %s)",
+                  info.name, idx, ir_idx, target_idx, ast_kindname(ir, target_idx),
+                  typ_idx, ast_kindname(ir, typ_idx))
+        else
+            local typ_idx = resolver.typeof(ir_idx)
+            trace("%s#%d => ir#%d %s (type #%d %s)",
+                  info.name, idx, ir_idx, ast_kindname(ir, ir_idx),
+                  typ_idx, ast_kindname(ir, typ_idx))
+        end
+        assert(ir_idx ~= nil, info.name .. ".resolve() returned nil")
+                local offs = ast_offs_of_idx(idx)
+        return ir_idx
+    end
+
+    trace("%s", unit.srcfile)
+
+    unit.ir_idx = resolver.resolve(unit.ast_idx)
+
+    printf("IR after resolve_unit: (%d B)", #unit.ir)
+    print(ir_repr(unit, unit.ir_idx))
 end

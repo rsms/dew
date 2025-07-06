@@ -22,6 +22,7 @@ DEW_SRCS := \
 	src/runtime/buf.c \
 	src/runtime/chan.c \
 	src/runtime/fifo.c \
+	src/runtime/fs_readdir.c \
 	src/runtime/inbox.c \
 	src/runtime/intconv.c \
 	src/runtime/intfmt.c \
@@ -45,6 +46,7 @@ DEW_SRCS := \
 # order matters; "included" through embedding in the order listed here
 DEW_LSRCS := \
 	src/util.lua \
+	src/hash.lua \
 	src/unit.lua \
 	src/diag.lua \
 	src/srcpos.lua \
@@ -199,7 +201,17 @@ dev:
 	autorun src/*.* src/runtime/*.* tests/rt/*.* src/lua/*.* examples/*.dew -- \
 		'$(MAKE) DEBUG=1 EMBED_SRC=0 _dev'
 _dev: $(BUILDDIR)/dew
-	$(BUILDDIR)/dew --debug-tokens --debug-parse --debug-resolve --debug-codegen
+	$(BUILDDIR)/dew --debug-tokens --debug-parse --debug-resolve --debug-codegen \
+	examples/dev.dew
+
+dev-test:
+	autorun src/*.* src/runtime/*.* tests/rt/*.* tests/parse/*.* src/lua/*.* examples/*.dew -- \
+		'$(MAKE) DEBUG=1 EMBED_SRC=0 _dev-test'
+_dev-test: $(BUILDDIR)/dew
+	$(BUILDDIR)/dew --selftest --debug-parse --debug-resolve
+
+dev-run-parse-tests:
+	autorun src/*.lua tests/parse/*.* -- 'o/darwin.debug/dew --selftest=parse_test'
 
 dev-web:
 	autorun *.c *.h *.lua src/lua/*.c examples/*.dew web/*.* -- \

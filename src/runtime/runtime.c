@@ -3336,6 +3336,7 @@ static int l_taskblock_end(lua_State* L) {
 }
 
 
+// fun monotime() uint
 static int l_monotime(lua_State* L) {
 	lua_pushinteger(L, DTimeNow());
 	return 1;
@@ -3377,6 +3378,9 @@ static int l_typename(lua_State* L) {
 }
 
 
+int l_fs_readdir(lua_State* L); // fs_readdir.c
+
+
 static const luaL_Reg dew_lib[] = {
 	{"intscan", l_intscan},
 	{"intfmt", l_intfmt},
@@ -3394,16 +3398,20 @@ static const luaL_Reg dew_lib[] = {
 	{"socket", l_socket},
 	{"connect", l_connect},
 	{"read", l_read},
+
 	{"buf_create", l_buf_create},
 	{"buf_resize", l_buf_resize},
 	{"buf_str", l_buf_str},
+
 	{"timer_start", l_timer_start},
 	{"timer_update", l_timer_update},
 	{"timer_stop", l_timer_stop},
+
 	{"await", l_await},
 	{"recv", l_recv},
 	{"send", l_send},
 	{"tid", l_tid},
+
 	{"structclone_encode", l_structclone_encode},
 	{"structclone_decode", l_structclone_decode},
 
@@ -3414,6 +3422,9 @@ static const luaL_Reg dew_lib[] = {
 	// WIP
 	{"taskblock_begin", l_taskblock_begin},
 	{"taskblock_end", l_taskblock_end},
+
+	// internal
+	{"fs_readdir", l_fs_readdir},
 
 	// wasm experiment
 	#ifdef __wasm__

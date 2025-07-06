@@ -322,6 +322,16 @@ typedef double        float64;
             _assertfail("%s != NULL", #a); \
         val__; \
     })
+
+    // note: can't pass along fmt & args to _panic since lua's printf uses incompatible format,
+    // e.g. %I for u64, which causes compile error with clang (ATTR_FORMAT.)
+    #define _assertlfail(L, fmt, args...) \
+        ( luaL_error((L), "Assertion failed: " fmt, args), \
+          _panic(__FILE__, __LINE__, __FUNCTION__, "Assertion failed") )
+    #define assertl(L, cond) \
+        (UNLIKELY(!(cond)) ? _assertlfail((L), "%s", #cond) : ((void)0))
+    #define assertlf(L, cond, fmt, args...) \
+        (UNLIKELY(!(cond)) ? _assertlfail((L), fmt " (%s)", ##args, #cond) : ((void)0))
 #else
     #define assert(cond) ((void)0)
     #define assertf(cond, fmt, args...) ((void)0)

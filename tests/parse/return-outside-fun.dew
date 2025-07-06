@@ -1,0 +1,1 @@
+return 1 //!error return statement outside function

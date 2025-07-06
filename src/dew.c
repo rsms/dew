@@ -191,7 +191,6 @@ static int pmain(lua_State* L) {
 	status = do_pcall(L, nargs, LUA_MULTRET);
 	if (status != LUA_OK) {
 		check_status(L, status);
-		dlog("returning early from check_status");
 		return 0; // interrupt in case of error
 	}
 

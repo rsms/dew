@@ -1,5 +1,11 @@
-function parse_unit(unit, tokens)
-	local ast_stack = unit.ast
+-- flags for parse_unit
+PARSE_SRCMAP = 1 -- enable populating unit.ast_srcmap
+
+function parse_unit(unit, tokens, flags) --> void
+	unit.ast = __rt.buf_create(2048)
+	unit.ast_srcmap = {}
+
+	local ast = unit.ast
 	local exprtab_prefix = {}
 	local exprtab_infix = {}
 	local typetab_prefix = {}
@@ -7,34 +13,19 @@ function parse_unit(unit, tokens)
 	local tok_iter, save_tokenizer_state, tok_iter_restore = token_iterator(tokens)
 	local tok, srcpos_curr, tok_value = 0, 0, nil
 
+	local function ast_make(N, srcpos, ...)
+		return N.cons(ast, N.alloc(ast), srcpos, ...)
+	end
+
+
+	-- tokenizer functions
 	local function next_token()
-		if tok == nil then error("next_token called after already encountering END") end
+		assert(tok ~= nil, "next_token called after already encountering END")
 		tok, srcpos_curr, tok_value = tok_iter()
 	end
 	local function restore_tokenizer_state(snapshot)
 		tok, srcpos_curr, tok_value = tok_iter_restore(snapshot)
 	end
-
-	local function diag_err(srcpos, format, ...)
-		unit.errcount = unit.errcount + 1
-		if srcpos == nil then srcpos = srcpos_curr end
-		return diag(DIAG_ERR, unit, srcpos, format, ...)
-	end
-
-	local function mkast(t)
-		t._srcbegin = tokstart
-		t._srcend = tokend
-		return t
-	end
-
-	local function syntax_error(format, ...)
-		if unit.errcount == 0 or tok ~= nil then -- avoid cascading errors after EOF
-			diag_err(srcpos_curr, format, ...)
-		end
-		-- error("syntax_error")
-		return false
-	end
-
 	local function tok_fastforward(stoptok)
 		-- advance to next semicolon or stoptok, whichever comes first
 		if tok == TOK_SEMI or tok == stoptok then
@@ -46,8 +37,73 @@ function parse_unit(unit, tokens)
 		end
 	end
 
+
+	-- comment-handling shims
+	local commentq = {}
+	local commentq_flush
+	if unit.include_comments then
+		-- enable handling of comments
+		unit.commentmap = {} -- idx => [comment]
+		next_token = function()
+			while true do
+				assert(tok ~= nil, "next_token called after already encountering END")
+				tok, srcpos_curr, tok_value = tok_iter()
+				if tok ~= TOK_COMMENT then
+					return
+				end
+				local comment = { tok = tok, value = tok_value, srcpos = srcpos_curr}
+				commentq[#commentq + 1] = comment
+			end
+		end
+		commentq_flush = function(idx)
+			-- if DEBUG_PARSER then
+			-- 	dlog("parse> associating %d comment%s with %s#%d:",
+			-- 	     #commentq, #commentq == 1 and "" or "s", ast_kindname(ast, idx), idx)
+			-- end
+			for i = 1, #commentq do
+				local comments = unit.commentmap[idx]
+				if comments == nil then
+					comments = {}
+					unit.commentmap[idx] = comments
+				end
+				comments[#comments + 1] = commentq[i]
+				commentq[i] = nil
+				-- if DEBUG_PARSER then
+				-- 	local c = comments[#comments]
+				-- 	local line, col = srcpos_linecol(c.srcpos, unit.src)
+				-- 	dlog("  %s\t%s:%d\t%s", tokname(c.tok), line, col, c.value)
+				-- end
+			end
+		end
+	end
+
+
+	-- diagnostics functions
+	local function diag_err(srcpos, format, ...)
+		if (flags & PARSE_SRCMAP) == 0 then
+			dlog("[diag] re-parsing with srcmap enabled")
+			return parse_unit(unit, tokens, flags | PARSE_SRCMAP)
+		end
+		unit.errcount = unit.errcount + 1
+		if srcpos == nil then srcpos = srcpos_curr end
+		return diag(unit, DIAG_ERR, srcpos, format, ...)
+	end
+
+	local function syntax_error(format, ...)
+		if unit.errcount == 0 or tok ~= nil then -- avoid cascading errors after EOF
+			diag_err(srcpos_curr, format, ...)
+		end
+		return false
+	end
+
 	local function syntax_error_unexpected(expected_tok)
-		syntax_error("unexpected '%s', expected '%s'", tokname(tok), tokname(expected_tok))
+		if expected_tok == TOK_RBRACE then
+			return syntax_error(
+				"unexpected '%s' (expected '%s' or ';')", tokname(tok), tokname(expected_tok))
+		else
+			return syntax_error(
+				"unexpected '%s' (expected '%s')", tokname(tok), tokname(expected_tok))
+		end
 	end
 
 	local function expect(expected_tok)
@@ -58,13 +114,9 @@ function parse_unit(unit, tokens)
 		tok_fastforward(expected_tok)
 	end
 
-	local function parse_parselet(prec, tab_prefix, tab_infix)
-		-- -- consume comments
-		-- while tok == TOK_COMMENT do
-		-- 	-- dlog("comment>%s", tok_value)
-		-- 	next_token()
-		-- end
 
+	-- parselets
+	local function parselet(prec, tab_prefix, tab_infix)
 		-- check for end of input
 		if tok == nil then
 			return nil
@@ -81,109 +133,115 @@ function parse_unit(unit, tokens)
 		end
 		assert(type(parselet) == 'function', fmt("tok='%s'", tokname(tok)))
 		local idx = parselet()
-		-- dlog("parse_parselet> tab_prefix(%s) => %s", tokname(tok), tostring(idx))
+		-- dlog("parselet> tab_prefix(%s) => %s", tokname(tok), tostring(idx))
 
 		-- infix
 		assert(prec ~= nil)
-		while true do
+		while tok ~= TOK_SEMI do
 			local t = tab_infix[tok] -- { parselet, parselet_prec }
 			if t == nil or t[2] < prec then
-				return idx
+				break
 			end
 			idx = t[1](idx, t[2], tok)
 		end
+
+		return idx
 	end
 
-	local function parse_expr(prec) return parse_parselet(prec, exprtab_prefix, exprtab_infix) end
-	local function parse_type(prec) return parse_parselet(prec, typetab_prefix, typetab_infix) end
+	local function parse_expr(prec)
+		return parselet(prec, exprtab_prefix, exprtab_infix)
+	end
+
+	local function parse_type(prec)
+		return parselet(prec, typetab_prefix, typetab_infix)
+	end
 
 	local function parse_id_type()
 		local id_idx = tok_value
 		local srcpos = srcpos_curr
 		expect(TOK_ID)
-		ast_push64(ast_stack, 0) -- placeholder for target
-		return ast_add(ast_stack, AST_ID, id_idx - 1, srcpos)
+		return AST_ID.make(ast, srcpos, id_idx)
 	end
 	typetab_prefix[TOK_ID] = parse_id_type
 
-	local function parse_id_assign(id_idx, srcpos, rest) -- e.g. "x = 1" or "x, y, z = 1, 2, 3"
-		next_token() -- consume "="
-		local stack_start = #ast_stack
+	local function parse_multivar(id_idx, srcpos, count)
+		-- e.g. "x, y, z = 1, 2, 3" or "x, y, z = source"
 
-		-- parse first value (e.g. "1" in "x, y = 1, 2")
-		parse_expr(PREC_MIN)
+		-- make list up front, create VARs by reading all IDs
+		local list_offs = AST_MULTIVAR.alloc(ast, srcpos, count)
+		local var_offs = list_offs + 8 -- VARs follow immediately
+		AST_VAR.cons(ast, var_offs, srcpos, id_idx, 0)
+		for i = 1, count - 1 do
+			assert(tok == TOK_COMMA)
+			next_token() -- consume ","
+			AST_VAR.cons(ast, var_offs + AST_VAR.size*i, srcpos_curr, tok_value, 0)
+			next_token() -- consume ID
+		end
 
-		-- Parse remaining vars.
-		-- 'rest' is an array of interleaved id_idx and srcpos of additional names,
-		-- e.g. {id_idx,srcpos,id_idx,srcpos ...}
+		assert(tok == TOK_EQ)
+		next_token() -- consume '='
 
-		-- Check for spread assignment, e.g. "x, y, z = expr"
-		if tok ~= TOK_COMMA and rest ~= nil then
-			AST_VAR.create(ast_stack, srcpos, id_idx, AST_VAR.SUBTYPE_SPREADDEF)
-			for i = 1, #rest, 2 do
-				local id_idx2, srcpos2 = rest[i], rest[i + 1]
-				AST_VAR.create(ast_stack, srcpos2, id_idx2, AST_VAR.SUBTYPE_SPREADDEF)
+		-- read values
+		for i = 0, count - 1 do
+			local value_idx = parse_expr(PREC_MIN)
+			AST_VAR.set_value(ast, var_offs + AST_VAR.size*i, value_idx)
+			if i == count - 1 then
+				if tok == TOK_COMMA then -- e.g. "a, b = 1, 2, 3"
+					syntax_error("too many values in multi assignment")
+					tok_fastforward()
+				end
+				break
 			end
-			local count = 1 + (#rest // 2)
-			return AST_SPREADVAR.create(ast_stack, stack_start, count, srcpos)
-		end
 
-		-- One or more variable assignments.
-		-- Return a single VAR early if it's just one name on the left (rest == nil)
-		local idx = AST_VAR.create(ast_stack, srcpos, id_idx, AST_VAR.SUBTYPE_VARDEF)
-		if rest == nil then
-			return idx
-		end
-
-		for i = 1, #rest, 2 do
-			local id_idx2, srcpos2 = rest[i], rest[i + 1]
-			-- expecting another value, preceeded by a comma
-			if tok ~= TOK_COMMA then
-				-- -- There are fewer expressions on the right-hand side than on the left-hand side.
-				-- -- This either means that the user forgot a value or that one of the
-				-- -- RHS expressions is a tuple. So we need to wait until typecheck pass to check.
-				-- ast_push64(ast_stack, 0) -- placeholder for "no value"
-				diag_err(srcpos_curr, "missing value for '%s'", id_str(id_idx2))
-				return idx
-			end
-			next_token()
-			parse_expr(PREC_MIN)
-			AST_VAR.create(ast_stack, srcpos2, id_idx2, AST_VAR.SUBTYPE_VARDEF)
-		end
-		-- customized error message for when too many values are provided
-		if tok == TOK_COMMA then
-			next_token()
-			if tok ~= TOK_SEMI and tok ~= nil then
-				diag_err(srcpos_curr, "too many values in variable assignment")
-				tok_fastforward()
+			-- check next token
+			if tok == TOK_COMMA then
+				next_token() -- consume ","
+			elseif i == 0 then -- e.g. "x, y, z = tuple"
+				-- Convert AST_MULTIVAR to AST_SPREADVAR and process remaining identifiers
+				ast:set_u8(list_offs, AST_SPREADVAR.kind)
+				while i < count - 1 do
+					i = i + 1
+					AST_VAR.set_value(ast, var_offs + AST_VAR.size*i, 0)
+				end
+				break
+			elseif i < count - 1 then
+				local id_idx = ast:get_u32(var_offs + AST_VAR.size*(i + 1)) >> 8
+				if tok == TOK_SEMI then
+					syntax_error("missing value for '%s'", id_str(id_idx))
+				else
+					syntax_error_unexpected(TOK_COMMA)
+					tok_fastforward(TOK_COMMA)
+				end
+				break
 			end
 		end
 
-		local count = 1 + (#rest // 2)
-		return AST_LIST.create(ast_stack, AST_MULTIVAR, stack_start, count, srcpos)
+		return ast_idx_of_offs(list_offs)
 	end
 
 	local function parse_id_expr()
-		local id_idx = tok_value
 		local srcpos = srcpos_curr
-		expect(TOK_ID)
+		local id_idx = tok_value
+		next_token() -- consume ID
 
-		-- check for assignment, e.g. "x = 1"
-		if tok == TOK_COMMA or tok == TOK_EQ then
-			if tok == TOK_EQ then
-				-- single-value assignment or variable definition, e.g. "x = 1"
-				return parse_id_assign(id_idx, srcpos, nil)
-			end
-			-- maybe multi-value assignment or variable definition, e.g. "x, y = 1, 2"
+		-- check for variable assignment, e.g. "x = 1"
+		if tok == TOK_EQ then -- single assignment, e.g. "x = 1"
+			next_token() -- consume "="
+			local value_idx = parse_expr(PREC_MIN)
+			return AST_VAR.make(ast, srcpos, id_idx, value_idx)
+		end
+
+		-- if we see a comma after id, look ahead for multi-var assignment, e.g. "x, y = 1, 2"
+		if tok == TOK_COMMA then
 			local tokstate = save_tokenizer_state()
-			local rest = {}
-			next_token()
+			local count = 1
+			next_token() -- consume ","
 			while tok == TOK_ID do
-				rest[#rest + 1] = tok_value
-				rest[#rest + 1] = srcpos_curr
-				next_token()
+				count = count + 1
+				next_token() -- consume ID
 				if tok == TOK_EQ then
-					return parse_id_assign(id_idx, srcpos, rest)
+					restore_tokenizer_state(tokstate)
+					return parse_multivar(id_idx, srcpos, count)
 				elseif tok ~= TOK_COMMA then
 					break
 				end
@@ -193,12 +251,12 @@ function parse_unit(unit, tokens)
 			restore_tokenizer_state(tokstate)
 		end
 
-		ast_push64(ast_stack, 0) -- placeholder for target
-		return ast_add(ast_stack, AST_ID, id_idx - 1, srcpos)
+		return AST_ID.make(ast, srcpos, id_idx)
 	end
 	exprtab_prefix[TOK_ID] = parse_id_expr
 
 	local function parse_rest_expr()
+		error("TODO: convert to new AST")
 		local srcpos = srcpos_curr
 		expect(TOK_DOTDOTDOT)
 		return ast_add(ast_stack, AST_REST, 0, srcpos)
@@ -206,6 +264,7 @@ function parse_unit(unit, tokens)
 	exprtab_prefix[TOK_DOTDOTDOT] = parse_rest_expr
 
 	local function parse_rest_type() -- "... type"
+		error("TODO: convert to new AST")
 		local srcpos = srcpos_curr
 		local type_idx
 		expect(TOK_DOTDOTDOT)
@@ -213,7 +272,7 @@ function parse_unit(unit, tokens)
 			-- must handle special case of "... ..." here
 			syntax_error("unexpected '...', expected a type")
 			tok_fastforward()
-			type_idx = TYPE_void
+			type_idx = TYPE_nil
 		else
 			type_idx = parse_type(PREC_MIN)
 		end
@@ -221,12 +280,23 @@ function parse_unit(unit, tokens)
 	end
 	typetab_prefix[TOK_DOTDOTDOT] = parse_rest_type
 
-	-- parse_many is a helper function that parses one or more nodes separated by sep_tok.
+	local function parse_array_type() -- "[type]"
+		error("TODO: convert to new AST")
+		local srcpos = srcpos_curr
+		next_token() -- consume '['
+		parse_type(PREC_MIN)
+		expect(TOK_RBRACK)
+		return AST_ARRAYTYPE.create(ast_stack, srcpos)
+	end
+	typetab_prefix[TOK_LBRACK] = parse_array_type
+
+	-- parse_list and parse_list_elems parses one or more nodes separated by sep_tok.
 	-- Supports trailing sep_tok if stop_tok is provided.
-	local function parse_many(sep_tok, stop_tok, parse_elem_fn) -- count
-		local count = 0
+	local function parse_list_elems(sep_tok, stop_tok, parse_elem_fn) --> idxv_i32
+		local idxv_i32 = __rt.buf_create(64)
 		while tok ~= stop_tok and tok ~= nil do
-			if parse_elem_fn(PREC_MIN) == nil then
+			local idx = parse_elem_fn(PREC_MIN)
+			if idx == nil then
 				if stop_tok ~= nil and unit.errcount == 0 then
 					if tok == nil then
 						syntax_error("unexpected end of input")
@@ -236,29 +306,38 @@ function parse_unit(unit, tokens)
 				end
 				break
 			end
-			count = count + 1
+			idxv_i32:push_u32(idx)
 			if tok ~= sep_tok then
 				if stop_tok == nil then
-					syntax_error("unexpected '%s', expected '%s'", tokname(tok), tokname(sep_tok))
+					syntax_error_unexpected(sep_tok)
 					tok_fastforward()
 				end
 				break
 			end
 			next_token() -- consume sep_tok
+			if #commentq > 0 then
+				commentq_flush(idx)
+			end
 		end
-		return count
+		return idxv_i32
 	end
 
-	local function parse_tuple_body(N, parse_elem_fn, srcpos)
+	local function parse_list(N, srcpos, sep_tok, stop_tok, parse_elem_fn, elide_if_empty) --> idx
+		local idxv_i32 = parse_list_elems(sep_tok, stop_tok, parse_elem_fn)
+		if #idxv_i32 == 0 and elide_if_empty then
+			return 0
+		end
+		-- if there's just one item in the list, return that item instead of creating a list
+		if #idxv_i32 == 4 then
+			return idxv_i32:get_u32(0)
+		end
+		return ast_list_add(ast, N.kind, srcpos, idxv_i32)
+	end
+
+	local function parse_tuple_body(N, srcpos, parse_elem_fn, elide_if_empty)
 		-- tuple_body = [ elem ("," elem)* ","? ]
 		-- e.g. "1" "1,2" "1,2,"
-		assert(N == AST_TUPLE or N == AST_TUPLETYPE, fmt("N=%d", N.kind))
-		local stack_start = #ast_stack
-		local count = parse_many(TOK_COMMA, TOK_RPAREN, parse_elem_fn)
-		if count == 1 then
-			return #ast_stack
-		end
-		return AST_LIST.create(ast_stack, N, stack_start, count, srcpos)
+		return parse_list(N, srcpos, TOK_COMMA, TOK_RPAREN, parse_elem_fn, elide_if_empty)
 	end
 
 	local function parse_tuple(N, parse_elem_fn)
@@ -266,7 +345,8 @@ function parse_unit(unit, tokens)
 		-- e.g. "()" "(1)" "(1,2)" "(1,2,)"
 		local srcpos = srcpos_curr
 		expect(TOK_LPAREN)
-		local idx = parse_tuple_body(N, parse_elem_fn, srcpos)
+		local elide_if_empty = false
+		local idx = parse_tuple_body(N, srcpos, parse_elem_fn, elide_if_empty)
 		expect(TOK_RPAREN)
 		return idx
 	end
@@ -282,15 +362,8 @@ function parse_unit(unit, tokens)
 	local function parse_block_body(srcpos, stoptok)
 		-- block_body = [ expr (";" expr)* ";"? ]
 		-- e.g. "1;" "1;2" "1;2;"
-		local stack_start = #ast_stack
-		local count = parse_many(TOK_SEMI, stoptok, parse_expr)
-		if count <= 1 then
-			return #ast_stack
-		end
-		-- store precomputed stack span in val24 field
-		local span = (#ast_stack - stack_start) + 1
-		if span > 0xffffff then syntax_error("block too large") end
-		return ast_add(ast_stack, AST_BLOCK, span, srcpos)
+		local elide_if_empty = true
+		return parse_list(AST_BLOCK, srcpos, TOK_SEMI, stoptok, parse_expr, elide_if_empty)
 	end
 
 	local function parse_block()
@@ -301,167 +374,155 @@ function parse_unit(unit, tokens)
 		expect(TOK_RBRACE)
 		return idx
 	end
+	exprtab_prefix[TOK_LBRACE] = parse_block
 
-	local function parse_params(allow_only_types) -- count
+	local function parse_params(allow_only_types) --> idx
+		-- Save token & ast state so that we can support only types.
+		-- e.g. undo when we discover "(T, T)" rather than "(name, name T)"
+		local tokstate = allow_only_types and save_tokenizer_state() or nil
+		local aststate = #ast
+
 		local srcpos = srcpos_curr
-		local tokstate, ast_stack_start = nil, #ast_stack
-		if allow_only_types then
-			tokstate = save_tokenizer_state()
-		end
-		expect(TOK_LPAREN)
-		local stack_start = #ast_stack
-		local count = 0
-		local type_pending = {}
-		local type_idx
-		local param_srcpos = srcpos_curr
+		local idxv_i32 = __rt.buf_create(64)
+		local type_pending_start = -1 -- offset in idxv_i32
 
-		local function flush_type_pending()
-			if #type_pending > 0 then
-				-- apply type to preceeding parameters which are missing type
-				-- e.g. "(x, y, z int)" => "(x int, y int, z int)"
-				local type_n = ast_stack[type_idx]
-				if ast_stack_span(ast_stack, type_idx) > 1 then
-					-- use a node reference instead of copying type
-					type_n = AST_NREF.create(ast_stack, type_idx, 0)
+		expect(TOK_LPAREN)
+
+		local function report_err(name_id_idx)
+			if builtins_idtab[name_id_idx] ~= nil then
+				-- handle common case of built-in named types
+				if type_pending_start > -1 then -- "(int, float)"
+					syntax_error("missing name of parameters (use '_' for no name)")
+				else -- "(x int, float)"
+					syntax_error("missing name of parameter (use '_' for no name)")
 				end
-				for _, idx in ipairs(type_pending) do
-					ast_stack[idx] = type_n
+			else
+				if type_pending_start > -1 then -- "(x, y)"
+					syntax_error("missing type of parameters")
+				else -- "(x int, y)"
+					syntax_error("missing type of parameter '%s'", id_str(name_id_idx))
 				end
-				type_pending = {}
 			end
 		end
 
 		while tok ~= TOK_RPAREN do
-			-- accept "..." as last argument
-			if tok == TOK_DOTDOTDOT then
-				next_token()
-				type_idx = parse_type(PREC_MIN)
-				flush_type_pending()
-				AST_PARAM.create(ast_stack, ID_REST, param_srcpos)
-				count = count + 1
-				break
-			end
-
-			-- Parse name, but don't add it to ast_stack until we have parsed type.
-			-- This is essentially a specialized infix parselet.
-			local param_id_idx = tok_value
+			local srcpos = srcpos_curr
+			local name_id_idx = tok_value
+			local typ_idx = 0
+			local value_idx = 0
 			expect(TOK_ID)
+
 			if tok == TOK_COMMA then
-				-- add type placeholder to stack
-				local idx = ast_push64(ast_stack, 0)
-				type_pending[#type_pending + 1] = idx
+				-- Type not yet known, e.g. parsing "x" in "(x, y T)"
+				if type_pending_start == -1 then
+					type_pending_start = #idxv_i32
+				end
 			elseif tok ~= TOK_RPAREN then
-				type_idx = parse_type(PREC_MIN)
+				typ_idx = parse_type(PREC_MIN)
 				allow_only_types = false -- "t,t" no longer allowed when we've seen "x t"
-				flush_type_pending()
-			elseif allow_only_types then
-				-- oh, actually it's just a list of types, e.g. "(int, float)"
-				for _ = 1, (#ast_stack - ast_stack_start) do table.remove(ast_stack) end
-				restore_tokenizer_state(tokstate)
-				return parse_type_tuple()
+				-- fixup pending types
+				if type_pending_start > -1 then
+					if tok == TOK_EQ then
+						-- disallow ambiguous situation, e.g.
+						-- "f(x, y int = 2)"; does x have a default value?
+						syntax_error("ambiguous default value only applies to last parameter." ..
+						             " Use explicit type for other parameters")
+					end
+					for offs = type_pending_start, #idxv_i32 - 4, 4 do
+						local param_offs = ast_offs_of_idx(idxv_i32:get_u32(offs))
+						ast:set_u32(param_offs + 8, typ_idx)
+					end
+					type_pending_start = -1
+				end
 			else
-				-- e.g. "(x, y)"
-				if builtin_symtab[param_id_idx] ~= nil then
-					if #type_pending > 0 then
-						-- e.g. "(int, float)"
-						syntax_error("missing name of parameters (use '_' for no name)")
-					else
-						-- e.g. "(x int, float)"
-						syntax_error("missing name of parameter (use '_' for no name)")
-					end
+				if allow_only_types then
+					-- Oh, actually it's just a list of types, e.g. "(int, float)"
+					ast:resize(aststate) -- remove anything we added to the AST
+					restore_tokenizer_state(tokstate)
+					return parse_type_tuple() -- AST_TUPLETYPE
 				else
-					if #type_pending > 0 then
-						-- e.g. "(x, y)"
-						syntax_error("missing type of parameters")
-					else
-						-- e.g. "(x int, y)"
-						syntax_error("missing type of parameter '%s'", id_str(param_id_idx))
-					end
+					-- e.g. "(x, y)" missing type at end (while requiring types)
+					report_err(name_id_idx)
 				end
 			end
-			AST_PARAM.create(ast_stack, param_id_idx, param_srcpos)
-			count = count + 1
+
+			-- optional initial value, e.g. "x int = 3"
+			if tok == TOK_EQ then
+				next_token() -- consume "="
+				value_idx = parse_expr(PREC_MIN)
+			end
+
+			idxv_i32:push_u32(AST_PARAM.make(ast, srcpos, name_id_idx, typ_idx, value_idx))
+
+			-- If we get something else than a comma here, we are done
 			if tok ~= TOK_COMMA then break end
 			next_token() -- consume ","
-			param_srcpos = srcpos_curr
+			srcpos = srcpos_curr
 			-- note: this supports trailing comma by virtue of the loop condition
 		end
+
 		expect(TOK_RPAREN)
-		if count > 1 then
-			AST_LIST.create(ast_stack, AST_TUPLE, stack_start, count, srcpos)
+
+		-- return nothing, just one param or a tuple of params
+		if #idxv_i32 == 0 then
+			return 0
 		end
-		return count
+		if #idxv_i32 == 4 then
+			return idxv_i32:get_u32(0)
+		end
+		return ast_list_add(ast, AST_TUPLE.kind, srcpos, idxv_i32)
 	end
 
 	local function parse_fun(as_type)
 		local srcpos = srcpos_curr -- position of "fun" keyword
-		local val24 = 0 -- bottom 8 bits for flags, top 16 for name id
-		local id_idx, id_srcpos = 0, 0
-		if as_type then val24 = AST_FUN.AS_TYPE end
 		next_token() -- consume "fun" keyword
+
+		local name_id_idx = 0
+		local params_idx = 0
+		local result_idx = 0
+		local body_idx = 0
 
 		-- Name
 		if tok == TOK_ID then
-			id_srcpos = srcpos_curr
-			id_idx = tok_value
-			val24 = val24 | AST_FUN.HAS_NAME
-			if id_idx > 0xffff then
-				-- Store name (ID index) in separate node.
-				-- (Top 16 bits of val24 being zero communicates this)
-				ast_add(ast_stack, AST_ID, id_idx - 1, id_srcpos)
-			else
-				val24 = val24 | ((id_idx & 0xffff) << 8)
-			end
-			srcpos = srcpos_union(srcpos, id_srcpos)
+			name_id_idx = tok_value
+			srcpos = srcpos_union(srcpos, srcpos_curr)
 			next_token()
 		end
 
 		-- Parameters, e.g. "(x, y int)" or "()"
-		if tok == TOK_LPAREN and parse_params(as_type) > 0 then
-			val24 = val24 | AST_FUN.HAS_PARAMS
+		if tok == TOK_LPAREN then
+			params_idx = parse_params(as_type)
 		end
 
 		-- Return type, e.g. "int", or "(x, y int, z str)".
 		-- Thus, return type can be TUPLE or PARAM, in addition to some TYPE. I.e.
-		--   fun f() int                     -- PRIMTYPE
-		--   fun f() (x int)                 -- PARAM
-		--   fun f() (x int, y float, z int) -- TUPLE of PARAMs
-		--   fun f() (int, float, int)       -- TUPLETYPE
-		if tok ~= TOK_LBRACE and tok ~= TOK_SEMI then
-			if tok == TOK_LPAREN then
-				parse_params(--[[allow_only_types]]true)
-			else
-				parse_type(PREC_MIN)
-			end
-			val24 = val24 | AST_FUN.HAS_RETTYPE
+		--   fun f() int                     -- (PRIMTYPE)
+		--   fun f() (x int)                 -- (PARAM)
+		--   fun f() (x int, y float, z int) -- (TUPLE (PARAM ...))
+		--   fun f() (int, float, int)       -- (TUPLETYPE (TYPE ...))
+		if tok == TOK_LPAREN then -- "fun() (int, int)"
+			result_idx = parse_params(true)
+		elseif tok ~= TOK_LBRACE and tok ~= TOK_SEMI then -- "fun() int"
+			result_idx = parse_type(PREC_MIN)
 		end
 
 		-- Body, e.g. "{ x; y }", "x;" (equivalent to "{x}")
 		if as_type ~= true and tok ~= TOK_SEMI then
-			parse_block()
-			val24 = val24 | AST_FUN.HAS_BODY
+			body_idx = parse_block()
 		end
 
-		return ast_add(ast_stack, AST_FUN, val24, srcpos)
+		return AST_FUN.make(ast, srcpos, name_id_idx, params_idx, result_idx, body_idx)
 	end
 	exprtab_prefix[TOK_FUN] = parse_fun
 
 	local function parse_fun_type() return parse_fun(true) end
 	typetab_prefix[TOK_FUN] = parse_fun_type
 
-	local function parse_int_literal(neg_srcpos)
+	local function parse_int_literal()
 		local srcpos = srcpos_curr
 		local value = tok_value
-		if neg_srcpos ~= nil then
-			-- has leading '-'; negate (must check for overflow first)
-			srcpos = srcpos_union(neg_srcpos, srcpos)
-			if value < 0 and value ~= -9223372036854775808 then
-				diag_err(srcpos, "integer literal overflows i64")
-			end
-			value = -value
-		end
 		next_token()
-		return ast_add_1val(ast_stack, AST_INT, srcpos, value)
+		return AST_INT.make(ast, srcpos, value)
 	end
 	exprtab_prefix[TOK_INT] = parse_int_literal
 
@@ -474,28 +535,36 @@ function parse_unit(unit, tokens)
 			value = -value
 		end
 		next_token()
-		ast_push64(ast_stack, value)
-		return ast_add(ast_stack, AST_FLOAT, 0, srcpos)
+		return AST_FLOAT.make(ast, srcpos, value)
 	end
 	exprtab_prefix[TOK_FLOAT] = parse_float_literal
 
 	local function parse_return()
 		-- return_stmt = "return" [expr ("," expr)*]
 		local srcpos = srcpos_curr
-		local val24 = 0
 		next_token()
-		if tok ~= TOK_SEMI and tok ~= TOK_RBRACE then
-			parse_tuple_body(AST_TUPLE, parse_expr, srcpos)
-			val24 = 1 -- has value
+		local value_idx = 0
+		if tok ~= TOK_SEMI then
+			local val_srcpos = srcpos_curr
+			local in_parens = tok == TOK_LPAREN
+			if in_parens then
+				next_token()
+			end
+			local elide_if_empty = true
+			value_idx = parse_tuple_body(AST_TUPLE, val_srcpos, parse_expr, elide_if_empty)
+			if in_parens then
+				expect(TOK_RPAREN)
+			end
 		end
-		return ast_add(ast_stack, AST_RETURN, val24, srcpos)
+		return AST_RETURN.make(ast, srcpos, value_idx)
 	end
 	exprtab_prefix[TOK_RETURN] = parse_return
 
 	local function parse_assign(left_idx, prec, tok)
+		error("TODO: convert to new AST")
 		local left_kind = ast_kind(ast_stack[left_idx])
 		if left_kind ~= AST_ID.kind then
-			syntax_error("cannot assign to %s", ast_nodes[left_kind].name)
+			syntax_error("cannot assign to %s", ast_info[left_kind].name)
 		end
 		local srcpos = srcpos_curr
 		next_token()
@@ -505,19 +574,22 @@ function parse_unit(unit, tokens)
 	exprtab_infix[TOK_EQ] = { parse_assign, PREC_MIN }
 
 	local function parse_call(recv_idx)
+		error("TODO: convert to new AST")
 		local srcpos = srcpos_curr
 		next_token()
-		parse_tuple_body(AST_TUPLE, parse_expr, srcpos)
+		local elide_if_empty = true
+		args_idx = parse_tuple_body(AST_TUPLE, srcpos, parse_expr, elide_if_empty)
 		expect(TOK_RPAREN)
 		return ast_add_1op(ast_stack, AST_CALL, 0, srcpos, recv_idx)
 	end
 	exprtab_infix[TOK_LPAREN] = { parse_call, PREC_MIN }
 
-	local function parse_binop(left_idx, prec, tok)
+	local function parse_binop(left_idx, prec, op)
 		local srcpos = srcpos_curr
 		next_token()
-		parse_expr(prec)
-		return ast_add_1op(ast_stack, AST_BINOP, tok, srcpos, left_idx)
+		local right_idx = parse_expr(prec)
+		-- return ast_make(AST_BINOP, srcpos, op, left_idx, right_idx)
+		return AST_BINOP.cons(ast, AST_BINOP.alloc(ast), srcpos, op, left_idx, right_idx)
 	end
 	-- precedence level 5
 	exprtab_infix[TOK_STAR] = { parse_binop, PREC_BIN5 }
@@ -544,31 +616,30 @@ function parse_unit(unit, tokens)
 	exprtab_infix[TOK_OROR] = { parse_binop, PREC_BIN1 }
 
 	local function parse_prefixop()
-		local op = tok
-		local srcpos = srcpos_curr
+		local op, srcpos = tok, srcpos_curr
+		local offs = AST_PREFIXOP.alloc(ast)
 		next_token()
-		-- special case for negative numeric literal
-		if tok == TOK_INT then
-			return parse_int_literal(srcpos)
-		elseif tok == TOK_FLOAT then
+		if tok == TOK_FLOAT then
 			return parse_float_literal(srcpos)
 		end
-		parse_expr(PREC_MIN)
-		return ast_add(ast_stack, AST_PREFIXOP, op, srcpos)
+		local operand_idx = parse_expr(PREC_UNPRE)
+		return AST_PREFIXOP.cons(ast, offs, srcpos, op, operand_idx)
 	end
 	exprtab_prefix[TOK_MINUS] = parse_prefixop
+	exprtab_prefix[TOK_NOT] = parse_prefixop
+	exprtab_prefix[TOK_TILDE] = parse_prefixop
 
 	-- parse unit
 	next_token()
 	if tok ~= nil then
-		parse_block_body(srcpos_curr)
+		unit.ast_idx = parse_block_body(srcpos_curr)
 		-- assert(tok == nil, "stopped before EOF, at " .. tokname(tok))
+	else
+		unit.ast_idx = 0
 	end
-	unit.ast_root = #ast_stack
 
 	if DEBUG_PARSER then
-		dlog("AST of unit %s:", unit.srcfile)
-		ast_dump(ast_stack, unit.ast_root)
-		print(ast_repr(unit.ast, unit.src))
+		dlog("AST of unit %s: (%u B)", unit.srcfile, #unit.ast)
+		print(ast_repr(unit, unit.ast_idx))
 	end
 end
