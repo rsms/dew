@@ -71,7 +71,14 @@ local function _(name, descr, visit)
     ast_info[info.kind] = info
     return info
 end
+ast_info[0] = {
+    name = "<?>",
+    descr = "<?>",
+    kind = 0,
+    is_type = false,
+}
 
+AST_NOOP      = _('NOOP',      'NOOP',                  nil) -- <ignored>
 AST_NIL       = _('NIL',       'nil',                   nil) -- nil
 AST_BOOL      = _('BOOL',      'boolean',               nil) -- true
 AST_INT       = _('INT',       'integer',               nil) -- 123
@@ -89,18 +96,18 @@ AST_TUPLE     = _('TUPLE',     'tuple',                 visit_list) -- (x, 3)
 AST_BLOCK     = _('BLOCK',     'block',                 visit_list) -- { ... }
 AST_FUN       = _('FUN',       'function',              visit_i32x3) -- fun f(x, y T) T
 AST_RETURN    = _('RETURN',    'return statement',      visit_i32) -- return 3
+AST_CALL      = _('CALL',      'function call',         visit_i32x2) -- x(y, z)
+AST_TYPECONS  = _('TYPECONS',  'type construction',     visit_i32x2) -- T(y, z)
 
 AST_PRIMTYPE  = _('PRIMTYPE',     'PRIMTYPE',      nil) -- int
 AST_TUPLETYPE = _('TUPLETYPE',    'tuple type',    visit_list) -- (T, T)
 AST_FUNTYPE   = _('FUNTYPE',      'function type', visit_list_2d) -- (T, T) (T, T)
+AST_RESTTYPE  = _('RESTTYPE',     'rest type',     visit_i32) -- ...T
 
 -- TODO:
-AST_CALL      = _('CALL', 'function call', visit_TODO) -- x(y, z)
-AST_REST      = _('REST', 'rest') -- ...
-
+AST_REST         = _('REST', 'rest') -- ...
 AST_TUPLEREFTYPE = _('TUPLEREFTYPE', 'TUPLEREFTYPE',  nil)
 AST_ARRAYTYPE    = _('ARRAYTYPE',    'array type',    visit_TODO) -- [T]
-AST_RESTTYPE     = _('RESTTYPE',     'rest type',     visit_TODO) -- ...T
 
 --[[
 Node {
@@ -119,26 +126,73 @@ function AST_BOOL.repr(ast, idx, write)
     write(ast:get_u8(ast_offs_of_idx(idx) + 1) == 1 and " true" or " false")
 end
 -------------------------------------------------------
--- Int24 { kind u8; value u24; meta u32 } -- when value < 0xffffff
--- Int64 { kind u8; MAX u24;   meta u32;
---         value u64 }
-function AST_INT.make(ast, meta, value)
-    if value < 0xffffff then
-        return ast_add_u24(ast, AST_INT.kind, meta, value)
-    end
-    return ast_add_u24_u64(ast, AST_INT.kind, meta, 0xffffff, value)
+-- Int { kind u8; base u8; is_neg u8; _ u8; meta u32; value u64 }
+function AST_INT.make(ast, meta, base, is_neg, value)
+    local v24 = base | (is_neg and 0x100 or 0x000)
+    return ast_add_u24_u64(ast, AST_INT.kind, meta, v24, value)
 end
-function AST_INT.value(ast, idx)
-    idx = ast_offs_of_idx(idx)
-    local v = ast:get_u32(idx) >> 8
-    return v < 0xffffff and v or ast:get_i64(idx + 8)
+function AST_INT.load(ast, idx) --> base, is_neg, value
+    local offs = ast_offs_of_idx(idx)
+    local h = ast:get_u32(offs)
+    return ((h>>8) & 0xff), (h>>16 & 0xff) == 1, ast:get_i64(offs + 8)
+end
+function AST_INT.str(ast, idx) --> string
+    local base, is_neg, value = AST_INT.load(ast, idx)
+    local prefix = base == 10 and "" or base == 16 and "0x" or base == 8 and "0o" or "0b"
+    return prefix .. __rt.intfmt(value, base, not is_neg)
 end
 function AST_INT.repr(ast, idx, write, repr)
-    return write(fmt(" %u", AST_INT.value(ast, idx)))
+    return write(" " .. AST_INT.str(ast, idx))
 end
-function AST_INT.resolve(ast, idx, ir, resolver)
-    local typ_idx = resolver.ctxtype ~= nil and resolver.ctxtype or TYPE_int
-    return AST_INT.make(ir, typ_idx, AST_INT.value(ast, idx))
+function AST_INT.fmt(ast, idx, write, fmtchild)
+    return AST_INT.str(ast, idx)
+end
+function AST_INT.resolve(ast, idx, ir, resolver, flags)
+    -- if flags & RVALUE == 0 then
+    --     resolver.diag_warn(ast_srcpos(ast, idx), "unused %s", ast_descr(ast, idx))
+    -- end
+    local base, is_neg, value = AST_INT.load(ast, idx)
+
+    -- select type
+    local typ_idx = resolver.ctxtype
+    if not ast_is_inttype(typ_idx) then
+        typ_idx = TYPE_int
+    end
+
+    -- check for overflow
+    local nbits, is_signed = inttype_info(typ_idx)
+    local function err_overflow()
+        resolver.diag_err(ast_srcpos(ast, idx), "integer literal overflows %s",
+                          ast_descr(ast, typ_idx))
+    end
+    if is_signed then
+        local smin = -(1 << (nbits - 1))
+        local smax = (1 << (nbits - 1)) - 1
+        -- dlog("AST_INT.resolve> %s nbits=%d is_signed=%s\n" ..
+        --      "  smin  %20d 0x%016x\n" ..
+        --      "  smax  %20d 0x%016x\n" ..
+        --      "  value " .. (is_neg and "%20d" or "%20u") .. " 0x%016x",
+        --      ast_descr(ast, typ_idx), nbits, tostring(is_signed),
+        --      smin, smin, smax, smax, value, value)
+        if (value < 0 and value < smin) or
+           (value > 0 and value > smax) or
+           (nbits == 64 and not is_neg and value < 0)
+        then
+            err_overflow()
+        end
+    else
+        local umax = (1 << nbits) - 1
+        -- dlog("AST_INT.resolve> %s nbits=%d is_signed=%s\n" ..
+        --      "  umax  %20u 0x%016x\n" ..
+        --      "  value " .. (is_neg and "%20d" or "%20u") .. " 0x%016x",
+        --      ast_descr(ast, typ_idx), nbits, tostring(is_signed),
+        --      umax, umax, value, value)
+        if nbits < 64 and (value < 0 or value > umax) then
+            err_overflow()
+        end
+    end
+
+    return AST_INT.make(ir, typ_idx, base, is_neg, value)
 end
 -------------------------------------------------------
 -- Float { kind u8; _ u24; meta u32;
@@ -150,7 +204,7 @@ function AST_FLOAT.repr(ast, idx, write, repr)
     return write(fmt(" %g", ast:get_f64(ast_offs_of_idx(idx) + 8)))
 end
 function AST_FLOAT.resolve(ast, idx, ir, resolver)
-    local typ_idx = resolver.ctxtype ~= nil and resolver.ctxtype or TYPE_float
+    local typ_idx = resolver.ctxtype ~= 0 and resolver.ctxtype or TYPE_float
     return AST_FLOAT.make(ir, typ_idx, ast:get_f64(ast_offs_of_idx(idx) + 8))
 end
 -------------------------------------------------------
@@ -175,22 +229,26 @@ function AST_ID.resolve(ast, idx, ir, resolver, flags)
     local target_idx = resolver.id_lookup(id_idx)
     if target_idx == 0 then
         resolver.diag_err(ast_srcpos(ast, idx), "undefined '%s'", id_str(id_idx))
-        return 0
+        -- return AST_ID.make(ir, 0, id_idx)
+    elseif target_idx > 0 then
+        -- increment load_count
+        local target_kind = ast_kind(ir, target_idx)
+        if target_kind == AST_VAR.kind or
+           target_kind == AST_PARAM.kind or
+           target_kind == AST_FUN.kind
+        then
+            AST_VAR.load_inc(ir, target_idx, 1)
+        elseif not ast_info[target_kind].is_type then
+            printf("TODO: #%d %s.load_inc (in AST_ID.resolve)",
+                   target_idx, ast_info[target_kind].name)
+        end
     end
-    -- use a REF node if this is the top-level node
-    if #ir == 0 then
-        return AST_REF.make(ir, target_idx)
-    end
-    return target_idx
-    -- -- return the target when resolving an rvalue
-    -- if (flags & RVALUE) ~= 0 then
-    --     return target_idx
-    -- end
     -- return AST_REF.make(ir, target_idx)
+    return target_idx
 end
 -------------------------------------------------------
 -- Var { kind u8; id_idx u24; meta u32;
---       value_idx i32; _ i32; }
+--       value_idx i32; load_count u16; store_count u16 }
 AST_VAR.size = 16
 function AST_VAR.make(ast, meta, id_idx, value_idx)
     return ast_add_u24_i32(ast, AST_VAR.kind, meta, id_idx, value_idx)
@@ -201,37 +259,85 @@ end
 function AST_VAR.set_value(ast, offs, value_idx) --> offs+size
     ast:set_i32(offs + 8, value_idx)
 end
+function AST_VAR.load_inc(ast, idx, additional_count)
+    return ast:inc_u16(ast_offs_of_idx(idx) + 12, additional_count)
+end
+function AST_VAR.store_inc(ast, idx, additional_count)
+    return ast:inc_u16(ast_offs_of_idx(idx) + 14, additional_count)
+end
 function AST_VAR.repr(ast, idx, write, repr)
     local offs = ast_offs_of_idx(idx)
     local id_idx = ast:get_u32(offs) >> 8
     write(" " .. id_str(id_idx))
+    if id_idx ~= ID__ then
+        local load_count = ast:get_u16(offs + 12)
+        local store_count = ast:get_u16(offs + 14)
+        write(fmt(" \x1b[1;34m{stores=%d loads=%d}\x1b[0m", store_count, load_count))
+    end
     local value_idx = ast:get_i32(offs + 8)
     return repr(value_idx)
+end
+function AST_VAR.fmt(ast, idx, write, fmt)
+    local offs = ast_offs_of_idx(idx)
+    local id_idx = ast:get_u32(offs) >> 8
+    return write("'" .. id_str(id_idx) .. "'")
 end
 function AST_VAR.resolve_cons(ast, ir, ast_offs, ir_offs, resolver, flags) --> idx
     local id_idx = ast:get_u32(ast_offs) >> 8
     local value_idx = ast:get_i32(ast_offs + 8)
     local ir_value_idx = resolver.resolve(value_idx, flags | RVALUE)
-    local typ_idx = resolver.typeof(ir_value_idx)
+    local value_typ_idx = resolver.typeof(ir_value_idx)
+    if value_typ_idx == TYPE_nil then
+        -- e.g. "x = nil", or "x = f()" where f does not return any values
+        -- TODO: when/if we support optional values, allow use of 'nil' to signify "empty."
+        resolver.diag_err(ast_srcpos(ast, value_idx),
+            "%s has no value (nil)", ast_descr(ir, ir_value_idx))
+    end
+
     local def_idx = resolver.id_lookup_def(id_idx)
     if def_idx == 0 then
         -- variable definition
-        AST_VAR.cons(ir, ir_offs, typ_idx, id_idx, ir_value_idx)
+        AST_VAR.cons(ir, ir_offs, value_typ_idx, id_idx, ir_value_idx)
         return resolver.id_define(id_idx, ast_idx_of_offs(ir_offs))
     end
+
     -- assignment
+    local def_kind = ast_kind(ir, def_idx)
     local def_typ_idx = resolver.typeof(def_idx)
-    if typ_idx ~= def_typ_idx then
+    if def_idx == ir_value_idx then
+        -- e.g. "x = x"
+        resolver.diag_err(
+            srcpos_union(ast_srcpos(ast, ast_idx_of_offs(ast_offs)),
+                         ast_srcpos(ast, value_idx)),
+            "cannot assign %s to itself", ast_descr(ir, def_idx))
+    elseif def_kind ~= AST_VAR.kind and def_kind ~= AST_PARAM.kind then
+        -- e.g. "myfun = 3"
+        resolver.diag_err(ast_srcpos(ast, ast_idx_of_offs(ast_offs)),
+            "cannot assign to %s", ast_descr(ir, def_idx))
+    elseif value_typ_idx ~= def_typ_idx then
+        -- e.g. "x = true; x = 3"
         resolver.diag_err(ast_srcpos(ast, value_idx),
             "cannot assign value of type %s to %s of type %s",
-            ast_fmt(ir, typ_idx), ast_descr(ir, def_idx), ast_fmt(ir, def_typ_idx))
+            ast_fmt(ir, value_typ_idx), ast_descr(ir, def_idx), ast_fmt(ir, def_typ_idx))
     end
-    AST_ASSIGN.cons(ir, ir_offs, typ_idx, def_idx, ir_value_idx)
+    -- increment store_count
+    local target_kind = ast_kind(ir, def_idx)
+    if target_kind == AST_VAR.kind or target_kind == AST_PARAM.kind then
+        AST_VAR.store_inc(ir, def_idx, 1)
+    elseif not ast_info[target_kind].is_type then
+        printf("TODO: #%d %s.store_inc", def_idx, ast_kindname(ast, def_idx))
+    end
+    AST_ASSIGN.cons(ir, ir_offs, value_typ_idx, def_idx, ir_value_idx)
     return ast_idx_of_offs(ir_offs)
 end
 function AST_VAR.resolve(ast, idx, ir, resolver, flags)
     local ast_offs = ast_offs_of_idx(idx)
     local ir_offs = ir:alloc(AST_VAR.size)
+    -- "_ = x" => "x"
+    if (ast:get_u32(ast_offs) >> 8) == ID__ then
+        -- note: only for plain VAR, not for MULTIVAR
+        return ir_value_idx
+    end
     return AST_VAR.resolve_cons(ast, ir, ast_offs, ir_offs, resolver, flags)
 end
 -------------------------------------------------------
@@ -333,35 +439,51 @@ function AST_SPREADVAR.resolve(ast, idx, ir, resolver, flags)
     return ir_idx
 end
 -------------------------------------------------------
--- Param { kind u8; id_idx u24; meta u32;
---         typ_idx i32; value_idx i32 }
-function AST_PARAM.make(ast, meta, id_idx, typ_idx, value_idx)
-    return ast_add_u24_i32x2(ast, AST_PARAM.kind, meta, id_idx, typ_idx, value_idx)
+-- AstParam { kind u8; id_idx u24; meta u32;
+--            initval_idx i32; typ_idx i32; }
+-- IRParam = Var
+function AST_PARAM.make(ast, meta, id_idx, initval_idx, typ_idx)
+    return ast_add_u24_i32x2(ast, AST_PARAM.kind, meta, id_idx, initval_idx, typ_idx)
 end
-function AST_PARAM.repr(ast, idx, write, repr)
+function AST_PARAM.set_type(ast, offs, typ_idx)
+    return ast:set_i32(offs + 12, typ_idx)
+end
+function AST_PARAM.repr(ast, idx, write, repr, as_ir)
     local offs = ast_offs_of_idx(idx)
-    write(" " .. id_str(ast:get_u32(offs) >> 8))
-    repr(ast:get_i32(offs + 8))
-    local value_idx = ast:get_i32(offs + 12)
-    if value_idx ~= 0 then
-        return repr(value_idx)
+    local id_idx = ast:get_u32(offs) >> 8
+    write(" " .. id_str(id_idx))
+    if as_ir then
+        if id_idx ~= ID__ then
+            local load_count = ast:get_u16(offs + 12)
+            local store_count = ast:get_u16(offs + 14)
+            write(fmt(" \x1b[1;34m{stores=%d loads=%d}\x1b[0m", store_count, load_count))
+        end
+    else -- typ_idx
+        repr(ast:get_i32(offs + 12))
     end
+    local initval_idx = ast:get_i32(offs + 8)
+    if initval_idx ~= 0 then
+        return repr(initval_idx)
+    end
+end
+function AST_PARAM.fmt(ast, idx, write, fmt)
+    return AST_VAR.fmt(ast, idx, write, fmt)
 end
 function AST_PARAM.resolve(ast, idx, ir, resolver, flags)
     local offs = ast_offs_of_idx(idx)
     local id_idx = ast:get_u32(offs) >> 8
-    local typ_idx = ast:get_i32(offs + 8)
-    local value_idx = ast:get_i32(offs + 12)
+    local initval_idx = ast:get_i32(offs + 8)
+    local typ_idx = ast:get_i32(offs + 12)
     typ_idx = resolver.resolve(typ_idx, flags | RVALUE)
-    if value_idx ~= 0 then
-        value_idx = resolver.resolve(value_idx, flags | RVALUE)
-        dlog("TODO: PARAM.resovle: check type match of value_idx vs typ_idx")
+    if initval_idx ~= 0 then
+        initval_idx = resolver.resolve(initval_idx, flags | RVALUE)
+        dlog("TODO: PARAM.resovle: check type match of initval_idx vs typ_idx")
     end
     local collision = resolver.id_lookup_def_in_current_scope(id_idx)
     if collision ~= 0 then
         resolver.diag_err(ast_srcpos(ast, idx), "duplicate parameter '%s'", id_str(id_idx))
     end
-    idx = AST_PARAM.make(ir, typ_idx, id_idx, typ_idx, value_idx)
+    idx = AST_PARAM.make(ir, typ_idx, id_idx, initval_idx, 0)
     return resolver.id_define(id_idx, idx)
 end
 -------------------------------------------------------
@@ -374,7 +496,8 @@ end
 function AST_BLOCK.resolve(ast, idx, ir, resolver, flags)
     local param_scope = resolver.id_scope_open()
     idx = ast_list_resolve(ast, idx, ir, resolver, flags)
-    resolver.id_scope_close(param_scope)
+    local warn_unused = true
+    resolver.id_scope_close(param_scope, warn_unused)
     return idx
 end
 -------------------------------------------------------
@@ -383,6 +506,9 @@ function AST_TUPLE.make(ast, meta, idxv_i32)
     return ast_list_add(ast, AST_TUPLE.kind, meta, idxv_i32)
 end
 function AST_TUPLE.resolve(ast, idx, ir, resolver, flags)
+    return ast_list_resolve(ast, idx, ir, resolver, flags)
+end
+function AST_TUPLE.srcpos(ast, idx, get_srcpos) --> srcpos
     return ast_list_resolve(ast, idx, ir, resolver, flags)
 end
 -------------------------------------------------------
@@ -417,25 +543,94 @@ function AST_TUPLETYPE.fmt(ast, idx, write, fmt)
     return ast_list_fmt(ast, idx, write, fmt)
 end
 -------------------------------------------------------
--- Return { kind u8; _ u24; meta u32; value_idx i32; _ u32; }
+-- Return { kind u8; _ u24; meta u32;
+--          value_idx i32; _ u32; }
+function AST_RETURN.alloc(ast) --> offs
+    return ast:alloc(16)
+end
+function AST_RETURN.cons(ast, offs, meta, value_idx) --> idx
+    ast_set_node(ast, offs, AST_RETURN.kind, meta, 0)
+    ast:set_i32(offs + 8, value_idx)
+    return offs // 8 + 1
+end
 function AST_RETURN.make(ast, meta, value_idx)
-    return ast_add_u24_i32(ast, AST_RETURN.kind, meta, 0, value_idx)
+    return AST_RETURN.cons(ast, AST_RETURN.alloc(ast), meta, value_idx)
 end
 function AST_RETURN.resolve(ast, idx, ir, resolver, flags)
-    local offs = ast_offs_of_idx(idx)
-    local value_idx = ast:get_i32(offs + 8)
-    value_idx = resolver.resolve(value_idx)
-    local typ_idx = resolver.typeof(value_idx)
-    local ir_idx = AST_RETURN.make(ir, typ_idx, value_idx)
+    local ir_offs = AST_RETURN.alloc(ir)
+    local typ_idx = TYPE_nil
 
-    resolver.record_srcpos(idx, ir_idx)
+    local value_idx = ast:get_i32(ast_offs_of_idx(idx) + 8)
+    if value_idx ~= 0 then
+        value_idx = resolver.resolve(value_idx)
+        typ_idx = resolver.typeof(value_idx)
+    end
+
+    local ir_idx = AST_RETURN.cons(ir, ir_offs, typ_idx, value_idx)
+
+    resolver.record_srcpos(ir_idx, ast_srcpos(ast, idx))
     if resolver.fun_idx == 0 then
-        resolver.diag_err(ast_srcpos(ast, idx),
-            "return statement outside function body")
+        resolver.diag_err(ast_srcpos(ast, idx), "return statement outside function body")
         return ir_idx
     end
     AST_FUN.check_result_type(ir, resolver.fun_idx, ir_idx, resolver)
     return ir_idx
+end
+-------------------------------------------------------
+-- Call { kind u8; _ u24; meta u32;
+--        recv_idx i32; args_idx i32; }
+--
+-- TypeCons { kind u8; arg_count u24; typ_idx u32;  -- List
+--            args i32[.arg_count] }
+--
+function AST_CALL.make(ast, meta, recv_idx, args_idx)
+    return ast_add_u24_i32x2(ast, AST_CALL.kind, meta, 0, recv_idx, args_idx)
+end
+function AST_CALL.resolve(ast, idx, ir, resolver, flags)
+    local offs = ast_offs_of_idx(idx)
+    local recv_idx = ast:get_i32(offs + 8)
+    local args_idx = ast:get_i32(offs + 12)
+    recv_idx = resolver.resolve(recv_idx, flags | RVALUE)
+    args_idx = resolver.resolve(args_idx, flags | RVALUE)
+    -- TODO: check if recv is type, and is so make AST_TYPECONS instead of AST_CALL
+    dlog("TODO: AST_CALL.resolve: check recv & types of args")
+    typ_idx = TYPE_nil
+    dlog("TODO: AST_CALL.resolve: use result type of function as type of call")
+    return AST_CALL.make(ir, typ_idx, recv_idx, args_idx)
+end
+-------------------------------------------------------
+-- RestType { kind u8; _ u24; meta u32;
+--            elem_typ_idx i32; _ u32; }
+function AST_RESTTYPE.alloc(ast) --> offs
+    return ast:alloc(16)
+end
+function AST_RESTTYPE.cons(ast, offs, meta, elem_typ_idx) --> idx
+    ast_set_node(ast, offs, AST_RESTTYPE.kind, meta, 0)
+    ast:set_i32(offs + 8, elem_typ_idx)
+    return offs // 8 + 1
+end
+function AST_RESTTYPE.make(ast, meta, elem_typ_idx)
+    return AST_RESTTYPE.cons(ast, AST_RESTTYPE.alloc(ast), meta, elem_typ_idx)
+end
+function AST_RESTTYPE.resolve(ast, idx, ir, resolver, flags)
+    local ir_offs = AST_RESTTYPE.alloc(ir)
+
+    local elem_typ_idx = ast:get_i32(ast_offs_of_idx(idx) + 8)
+    elem_typ_idx = resolver.resolve(elem_typ_idx)
+    local typ_idx = resolver.typeof(elem_typ_idx)
+
+    idx = AST_RESTTYPE.cons(ir, ir_offs, typ_idx, elem_typ_idx)
+
+    -- intern type
+    local typ_hash = ir:hash(AST_RESTTYPE.kind, ir_offs, ir_offs+4)
+    local other_idx = resolver.internmap[typ_hash]
+    if other_idx == nil then
+        resolver.internmap[typ_hash] = idx
+        return idx
+    else
+        ir:resize(ir_offs) -- undo additions to IR stack
+        return other_idx
+    end
 end
 -------------------------------------------------------
 -- FunType { kind u8; intype_count u24; outtype_count u32;
@@ -453,7 +648,7 @@ function AST_FUNTYPE.make(ir, resolver, params_idx, result_idx) --> idx
     end
     local function process_operands(dst_offs, operands_idx) --> dst_offs
         if operands_idx == 0 then
-            return
+            return dst_offs
         end
         local kind = ast_kind(ir, operands_idx)
         if not ast_info[kind].is_type then
@@ -512,14 +707,14 @@ function AST_FUNTYPE.repr(ast, idx, write, repr)
     write(")")
 end
 -------------------------------------------------------
--- Fun { kind u8; id_idx u24; meta u32;
---       params_idx i32; result_idx i32;
---       body_idx i32; _ u32; }
-function AST_FUN.make(ast, meta, id_idx, params_idx, result_idx, body_idx)
+-- Fun { kind u8; id_idx u24; meta u32;       ╮_ binary compat. with Var
+--       body_idx i32; load_count u16; _ u16; ╯
+--       params_idx i32; result_idx i32; }
+function AST_FUN.make(ast, meta, id_idx, body_idx, params_idx, result_idx)
     local header = AST_FUN.kind | (id_idx & 0xffffff)<<8 | ((meta & 0xffffffff) << 32)
     local offs = ast:push_u64(header)
-    local a = (params_idx & 0xffffffff) | (result_idx & 0xffffffff)<<32
-    local b = body_idx & 0xffffffff
+    local a = body_idx & 0xffffffff
+    local b = (params_idx & 0xffffffff) | (result_idx & 0xffffffff)<<32
     ast:push_u64x2(a, b)
     return ast_idx_of_offs(offs)
 end
@@ -528,22 +723,26 @@ function AST_FUN.alloc(ast, id_idx) --> offs
     ast:set_u32(offs, AST_FUN.kind | (id_idx & 0xffffff)<<8)
     return offs
 end
-function AST_FUN.load(ast, idx) --> id_idx, params_idx, result_idx, body_idx
+function AST_FUN.load(ast, idx) --> id_idx, body_idx, params_idx, result_idx
     local offs = ast_offs_of_idx(idx)
     local id_idx = ast:get_u32(offs) >> 8
-    local params_idx = ast:get_i32(offs + 8)
-    local result_idx = ast:get_i32(offs + 12)
-    local body_idx = ast:get_i32(offs + 16)
-    return id_idx, params_idx, result_idx, body_idx
+    local body_idx = ast:get_i32(offs + 8)
+    local params_idx = ast:get_i32(offs + 16)
+    local result_idx = ast:get_i32(offs + 20)
+    return id_idx, body_idx, params_idx, result_idx
 end
 function AST_FUN.result(ast, idx) --> result_idx
-    local offs = ast_offs_of_idx(idx)
-    return ast:get_i32(offs + 12)
+    return ast:get_i32(ast_offs_of_idx(idx) + 20)
+end
+function AST_FUN.body(ast, idx) --> body_idx
+    return ast:get_i32(ast_offs_of_idx(idx) + 8)
 end
 function AST_FUN.repr(ast, idx, write, repr)
-    local id_idx, params_idx, result_idx, body_idx = AST_FUN.load(ast, idx)
-    if id_idx ~= 0 then
+    local id_idx, body_idx, params_idx, result_idx = AST_FUN.load(ast, idx)
+    if id_idx ~= 0 and id_idx ~= ID__ then
         write(" " .. id_str(id_idx))
+        local load_count = ast:get_u16(ast_offs_of_idx(idx) + 12)
+        write(fmt(" \x1b[1;34m{uses=%d}\x1b[0m", load_count))
     else
         write(" _")
     end
@@ -554,8 +753,12 @@ function AST_FUN.repr(ast, idx, write, repr)
     if body_idx == 0 then return end
     return repr(body_idx)
 end
+function AST_FUN.fmt(ast, idx, write, fmt)
+    -- TODO: custom
+    return AST_VAR.fmt(ast, idx, write, fmt)
+end
 function AST_FUN.resolve(ast, idx, ir, resolver, flags)
-    local id_idx, params_idx, result_idx, body_idx = AST_FUN.load(ast, idx)
+    local id_idx, body_idx, params_idx, result_idx = AST_FUN.load(ast, idx)
 
     -- make & define function up front, since its params and body may reference it
     local offs = AST_FUN.alloc(ir, id_idx)
@@ -564,61 +767,62 @@ function AST_FUN.resolve(ast, idx, ir, resolver, flags)
     local child_flags = flags & ~RVALUE
     local param_scope = resolver.id_scope_open()
     params_idx = params_idx == 0 and 0 or resolver.resolve(params_idx, child_flags)
-    result_idx = result_idx == 0 and 0 or resolver.resolve(result_idx, child_flags)
+    result_idx = result_idx == 0 and TYPE_nil or resolver.resolve(result_idx, child_flags)
 
     local typ_idx = AST_FUNTYPE.make(ir, resolver, params_idx, result_idx)
     ir:set_i32(offs + 4, typ_idx)
-    ir:set_i32(offs + 8, params_idx)
-    ir:set_i32(offs + 12, result_idx)
-    ir:set_i32(offs + 16, 0) -- body_idx
+    ir:set_i64(offs + 8, 0) -- body_idx i32, load_count u16; _ u16;
+    ir:set_i32(offs + 16, params_idx)
+    ir:set_i32(offs + 20, result_idx) -- body_idx
 
     local ir_idx = ast_idx_of_offs(offs)
+    local warn_unused = false -- don't warn about unused params unless there's a body
 
     if body_idx ~= 0 then
-        resolver.record_srcpos(idx, ir_idx)
+        warn_unused = true
+        resolver.record_srcpos(ir_idx, ast_srcpos(ast, idx))
 
         local body_scope = resolver.id_scope_open()
         local outer_fun_idx = resolver.fun_idx
         resolver.fun_idx = ir_idx
 
-        local body_ir_idx = resolver.resolve(body_idx, child_flags | RVALUE)
+        if result_idx ~= TYPE_nil then
+            child_flags = child_flags | RVALUE
+        end
+        local body_ir_idx = resolver.resolve(body_idx, child_flags)
 
         resolver.fun_idx = outer_fun_idx
-        resolver.id_scope_close(body_scope)
+        resolver.id_scope_close(body_scope, warn_unused)
 
-        local res_typ_idx = AST_FUN.check_result_type(ir, ir_idx, body_ir_idx, resolver)
-        -- convert implicit return to actual return
-        local body_kind = ast_kind(ir, body_ir_idx)
-        if res_typ_idx ~= 0 and body_kind ~= AST_RETURN.kind then
-            if body_kind ~= AST_BLOCK.kind then
-                -- single expression
-                print("LOLCAT!!")
-                -- body_ir_idx = AST_RETURN.make(ir, res_typ_idx, body_ir_idx)
-            end
+        if result_idx ~= TYPE_nil then
+            AST_FUN.check_result_type(ir, ir_idx, body_ir_idx, resolver)
         end
 
-        ir:set_i32(offs + 16, body_ir_idx)
+        ir:set_i32(offs + 8, body_ir_idx)
     end
 
-    resolver.id_scope_close(param_scope)
+    resolver.id_scope_close(param_scope, warn_unused)
 
     return ir_idx
 end
-function AST_FUN.check_result_type(ir, fun_idx, val_idx, resolver) --> res_typ_idx_if_match
+function AST_FUN.check_result_type(ir, fun_idx, val_idx, resolver)
     local val_typ_idx = resolver.typeof(val_idx)
     local res_idx = AST_FUN.result(ir, fun_idx)
     local res_typ_idx = ast_istype(ir, res_idx) and res_idx or resolver.typeof(res_idx)
-    if val_typ_idx == res_typ_idx then
-        return res_typ_idx
+    if val_typ_idx == res_typ_idx or val_typ_idx == 0 then
+        return
     end
-    if val_typ_idx ~= 0 then
-        resolver.diag_err(resolver.srcpos(val_idx),
-            "cannot use value of type %s as result type %s",
-            ast_fmt(ir, val_typ_idx), ast_fmt(ir, res_typ_idx))
-        -- clear type of value, to avoid reporting more errors about its type
-        ast_set_meta(ir, ast_offs_of_idx(val_idx), 0)
+    -- error
+    local focus_idx = val_idx
+    if ast_kind(ir, val_idx) == AST_BLOCK.kind and ast_list_count(ir, val_idx) > 0 then
+        -- use srcpos of last expression of block
+        focus_idx = ast_list_elem(ir, val_idx, ast_list_count(ir, val_idx) - 1)
     end
-    return 0
+    resolver.diag_err(resolver.srcpos(focus_idx),
+        "cannot use value of type %s as result type %s",
+        ast_fmt(ir, val_typ_idx), ast_fmt(ir, res_typ_idx))
+    -- clear type of value, to avoid reporting more errors about its type
+    ast_set_meta(ir, ast_offs_of_idx(val_idx), 0)
 end
 -------------------------------------------------------
 -- BinOp { kind u8; op u8; _ u16; meta u32; -- op is token for AST, opcode for IR
@@ -630,6 +834,10 @@ function AST_BINOP.cons(ast, offs, meta, op, left_idx, right_idx) --> idx
     ast_set_node(ast, offs, AST_BINOP.kind, meta, op)
     ast:set_i64(offs + 8, (left_idx & 0xffffffff) | (right_idx & 0xffffffff)<<32)
     return offs // 8 + 1
+end
+function AST_BINOP.load(ast, idx) --> op, left_idx, right_idx
+    local offs = ast_offs_of_idx(idx)
+    return ast:get_u8(offs + 1), ast:get_i32(offs + 8), ast:get_i32(offs + 12)
 end
 function AST_BINOP.repr(ast, idx, write, repr, as_ir)
     local offs = ast_offs_of_idx(idx)
@@ -643,10 +851,18 @@ function AST_BINOP.resolve(ast, idx, ir, resolver)
     local offs = ast_offs_of_idx(idx)
     local op = ast:get_u8(offs + 1)
     local ir_offs = AST_BINOP.alloc(ir)
+
     local lval = resolver.resolve(ast:get_i32(offs + 8), RVALUE)
-    local rval = resolver.resolve(ast:get_i32(offs + 12), RVALUE)
     local ltyp = ir_typeof(ir, lval)
+
+    local outer_ctxtype = resolver.ctxtype
+    resolver.ctxtype = ltyp
+
+    local rval = resolver.resolve(ast:get_i32(offs + 12), RVALUE)
     local rtyp = ir_typeof(ir, rval)
+
+    resolver.ctxtype = outer_ctxtype
+
     if ltyp ~= rtyp then
         if ltyp ~= 0 and rtyp ~= 0 then
             resolver.diag_err(ast_srcpos(ast, idx),
@@ -662,7 +878,7 @@ function AST_BINOP.resolve(ast, idx, ir, resolver)
     return AST_BINOP.cons(ir, ir_offs, ltyp, op, lval, rval)
 end
 -------------------------------------------------------
--- PrefixOp { kind u8; op u8; _ u16; meta u32; -- op is token for AST, opcode for IR
+-- PrefixOp { kind u8; op u8; _ u16; meta u32;   -- op is token for AST, opcode for IR
 --            operand_idx i32; _ i32 }
 function AST_PREFIXOP.alloc(ast) --> offs
     return ast:alloc(16)
@@ -671,6 +887,10 @@ function AST_PREFIXOP.cons(ast, offs, meta, op, operand_idx) --> idx
     ast_set_node(ast, offs, AST_PREFIXOP.kind, meta, op)
     ast:set_i64(offs + 8, operand_idx & 0xffffffff)
     return offs // 8 + 1
+end
+function AST_PREFIXOP.load(ast, idx) --> op, operand_idx
+    local offs = ast_offs_of_idx(idx)
+    return ast:get_u8(offs + 1), ast:get_i32(offs + 8)
 end
 function AST_PREFIXOP.repr(ast, idx, write, repr, as_ir)
     local offs = ast_offs_of_idx(idx)
@@ -773,10 +993,13 @@ TYPE_float = builtin_primtype_add("float", 64, 0)
 TYPE_int   = builtin_primtype_add("int",   64, BUILTIN_TYPE_FLAG_INT|BUILTIN_TYPE_FLAG_SIGNED)
 TYPE_uint  = builtin_primtype_add("uint",  64, BUILTIN_TYPE_FLAG_INT)
 -- Built-in primitive types, explicit-size integers
-for bitsize = 2, 64 do
-    builtin_primtype_add("int"..tostring(bitsize), bitsize,
-                         BUILTIN_TYPE_FLAG_INT|BUILTIN_TYPE_FLAG_SIGNED)
-    builtin_primtype_add("uint"..tostring(bitsize), bitsize, BUILTIN_TYPE_FLAG_INT)
+-- Note: If order or stride changes, remember to update inttype_info
+TYPE_last_int_type = TYPE_uint
+for bitsize = 64, 2, -1 do
+    builtin_primtype_add(
+        "int"..tostring(bitsize), bitsize, BUILTIN_TYPE_FLAG_INT|BUILTIN_TYPE_FLAG_SIGNED)
+    TYPE_last_int_type = builtin_primtype_add(
+        "uint"..tostring(bitsize), bitsize, BUILTIN_TYPE_FLAG_INT)
 end
 
 -- Built-in constants
@@ -864,7 +1087,7 @@ end
 
 --------------------------------------------------------------------------------------------------
 
-function ast_srcpos(ast, idx) -- u32
+function ast_srcpos(ast, idx) --> srcpos
     return ast:get_u32(ast_offs_of_idx(idx) + 4)
 end
 
@@ -891,6 +1114,17 @@ function ast_istype(ast, idx) -- bool
         return false
     end
     return ast_info[ast_kind(ast, idx)].is_type
+end
+
+function ast_is_inttype(idx) --> bool
+    return idx < 0 and (idx <= TYPE_int and idx >= TYPE_last_int_type)
+end
+
+function inttype_info(idx) --> nbits, is_signed
+    assert(ast_is_inttype(idx))
+    local nbits = idx >= TYPE_uint and 64 or (64 - ((TYPE_uint-1 - idx) // 2))
+    local is_signed = (idx - TYPE_int) % 2 == 0
+    return nbits, is_signed
 end
 
 --------------------------------------------------------------------------------------------------
@@ -966,11 +1200,14 @@ function ast_repr(unit, idx, as_ir)
         if depth > 0 then write("\n" .. string.rep("    ", depth)) end
 
         -- get info
+        -- dlog("VISIT #%d offs=%u", idx_orig, ast_offs_of_idx(idx))
         local offs = ast_offs_of_idx(idx)
-        -- dlog("VISIT #%d offs=%u", idx_orig, offs)
         local kind = ast1:get_u8(offs)
         local info = ast_info[kind]
-        -- dlog("%srepr> #%d [%u] %s", string.rep("    ", depth), idx_orig, offs, info.name)
+
+        -- dlog("%srepr> #%d [%u] %s",
+        --      string.rep("    ", depth), idx_orig, offs,
+        --      info == nil and fmt("<kind?%d>", kind) or info.name)
 
         -- node kind name
         local style = info.is_type and "1;36" or "1"
@@ -989,17 +1226,17 @@ function ast_repr(unit, idx, as_ir)
 
         depth = depth + 1
 
-        -- visit type
-        if as_ir and not ast_istype(ast1, idx) then
-            local typ_idx = ast1:get_i32(offs + 4)
-            visit(typ_idx)
-        end
-
         -- visit children
         if info.repr ~= nil then
             info.repr(ast1, idx, write, visit, as_ir)
         elseif info.visit ~= nil then
             info.visit(ast1, idx, visit)
+        end
+
+        -- visit type
+        if as_ir and not ast_istype(ast1, idx) then
+            local typ_idx = ast1:get_i32(offs + 4)
+            visit(typ_idx)
         end
 
         -- comments
@@ -1118,13 +1355,15 @@ function ast_list_resolve(ast, idx, ir, resolver, flags)
     -- allocate temporary storage for element types
     local typ_idxv
     local typ_idxv_offs = 0
+    local typ_idxv_has_zero = false
     if kind == AST_TUPLE.kind or (kind == AST_RETURN.kind and count > 1) then
         typ_idxv = __rt.buf_create(count * 4)
         typ_idxv:alloc(count * 4)
     end
 
     -- create list up front
-    local list_offs = ast_list_add_upfront(ir, kind, TYPE_nil, count)
+    local list_offs = ast_list_add_upfront(ir, kind, 0, count)
+    local srcpos = resolver.unit.ir_srcmap ~= nil and 0 or nil
 
     -- resolve children
     local end_offs = offs + 4 + (count * 4)
@@ -1137,6 +1376,9 @@ function ast_list_resolve(ast, idx, ir, resolver, flags)
         end
 
         elem_idx = ast:get_i32(offs)
+        if srcpos ~= nil then
+            srcpos = srcpos_union(srcpos, ast_srcpos(ast, elem_idx))
+        end
         elem_idx = resolver.resolve(elem_idx, child_flags)
 
         -- set list element value
@@ -1145,8 +1387,18 @@ function ast_list_resolve(ast, idx, ir, resolver, flags)
 
         if typ_idxv ~= nil then
             -- set list element type
-            typ_idxv:set_i32(typ_idxv_offs, resolver.typeof(elem_idx))
-            typ_idxv_offs = typ_idxv_offs + 4
+            local elem_typ_idx = resolver.typeof(elem_idx)
+            if elem_typ_idx == 0 then
+                -- If any type is invalid, make the list's type invalid.
+                -- For example in "(x, y, ze)" say "ze" is undefined which means its type is 0,
+                -- then we want the type of the tuple to also be 0. Otherwise we would produce
+                -- cascading (confusing) error messages.
+                typ_idxv_has_zero = true
+                typ_idxv = nil
+            else
+                typ_idxv:set_i32(typ_idxv_offs, elem_typ_idx)
+                typ_idxv_offs = typ_idxv_offs + 4
+            end
         end
     end
 
@@ -1160,12 +1412,15 @@ function ast_list_resolve(ast, idx, ir, resolver, flags)
             resolver.internmap[typ_hash] = typ_idx
         end
         ir:set_i32(list_offs + 4, typ_idx)
-    elseif child_flags & RVALUE ~= 0 then
+    elseif not typ_idxv_has_zero and child_flags & RVALUE ~= 0 then
         -- When a block is used as an rvalue, its type is the type of the last expression
         ir:set_i32(list_offs + 4, resolver.typeof(elem_idx))
     end
 
-    return ast_idx_of_offs(list_offs)
+    idx = ast_idx_of_offs(list_offs)
+    resolver.record_srcpos(idx, srcpos)
+
+    return idx
 end
 
 -- VarList = { kind u8; count u24; meta u32;

@@ -315,9 +315,16 @@ static int l_buf_tostring(lua_State* L) {
              offs % size == 0 && \
              offs < 0xffffffffffffffff - size && \
              offs + size <= buf->len, \
-             "offs: %I %p (size: %d)", offs, offs, size)
+             "offs: %I %p (size: %d, buf.len: %I)", offs, offs, size, buf->len)
 
 
+int l_buf_get_i64(lua_State* L) {
+    Buf* buf = l_buf_check(L, 1);
+    u64 offs = lua_tointegerx(L, 2, NULL);
+    assert_buf_offs(L, buf, offs, 8);
+    lua_pushinteger(L, *(i64*)&buf->bytes[offs]);
+    return 1;
+}
 int l_buf_set_i64(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
@@ -326,15 +333,15 @@ int l_buf_set_i64(lua_State* L) {
     *(i64*)&buf->bytes[offs] = val;
     return 0;
 }
-int l_buf_get_i64(lua_State* L) {
+
+
+int l_buf_get_f64(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
     assert_buf_offs(L, buf, offs, 8);
-    lua_pushinteger(L, *(i64*)&buf->bytes[offs]);
+    lua_pushnumber(L, *(float64*)&buf->bytes[offs]);
     return 1;
 }
-
-
 int l_buf_set_f64(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
@@ -343,15 +350,15 @@ int l_buf_set_f64(lua_State* L) {
     *(float64*)&buf->bytes[offs] = val;
     return 0;
 }
-int l_buf_get_f64(lua_State* L) {
+
+
+int l_buf_get_u32(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
-    assert_buf_offs(L, buf, offs, 8);
-    lua_pushnumber(L, *(float64*)&buf->bytes[offs]);
+    assert_buf_offs(L, buf, offs, 4);
+    lua_pushinteger(L, *(u32*)&buf->bytes[offs]);
     return 1;
 }
-
-
 int l_buf_set_u32(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
@@ -360,15 +367,15 @@ int l_buf_set_u32(lua_State* L) {
     *(u32*)&buf->bytes[offs] = val;
     return 0;
 }
-int l_buf_get_u32(lua_State* L) {
+
+
+int l_buf_get_i32(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
     assert_buf_offs(L, buf, offs, 4);
-    lua_pushinteger(L, *(u32*)&buf->bytes[offs]);
+    lua_pushinteger(L, *(i32*)&buf->bytes[offs]);
     return 1;
 }
-
-
 int l_buf_set_i32(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
@@ -377,15 +384,15 @@ int l_buf_set_i32(lua_State* L) {
     *(i32*)&buf->bytes[offs] = val;
     return 0;
 }
-int l_buf_get_i32(lua_State* L) {
+
+
+int l_buf_get_u16(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
-    assert_buf_offs(L, buf, offs, 4);
-    lua_pushinteger(L, *(i32*)&buf->bytes[offs]);
+    assert_buf_offs(L, buf, offs, 2);
+    lua_pushinteger(L, *(u16*)&buf->bytes[offs]);
     return 1;
 }
-
-
 int l_buf_set_u16(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
@@ -394,12 +401,14 @@ int l_buf_set_u16(lua_State* L) {
     *(u16*)&buf->bytes[offs] = val;
     return 0;
 }
-int l_buf_get_u16(lua_State* L) {
+int l_buf_inc_u16(lua_State* L) {
     Buf* buf = l_buf_check(L, 1);
     u64 offs = lua_tointegerx(L, 2, NULL);
+    i32 incr = lua_tointegerx(L, 3, NULL);
     assert_buf_offs(L, buf, offs, 2);
-    lua_pushinteger(L, *(u16*)&buf->bytes[offs]);
-    return 1;
+    i32 value = ((i32)*(u16*)&buf->bytes[offs]) + incr;
+    *(u16*)&buf->bytes[offs] = (u16)value;
+    return 0;
 }
 
 
@@ -705,23 +714,24 @@ void luaopen_buf(lua_State* L) {
     lua_pushcfunction(L, l_buf_hash); lua_setfield(L, -2, "hash");
     lua_pushcfunction(L, l_buf_find_u32); lua_setfield(L, -2, "find_u32");
 
-    lua_pushcfunction(L, l_buf_set_u8); lua_setfield(L, -2, "set_u8");
     lua_pushcfunction(L, l_buf_get_u8); lua_setfield(L, -2, "get_u8");
+    lua_pushcfunction(L, l_buf_set_u8); lua_setfield(L, -2, "set_u8");
 
-    lua_pushcfunction(L, l_buf_set_u16); lua_setfield(L, -2, "set_u16");
     lua_pushcfunction(L, l_buf_get_u16); lua_setfield(L, -2, "get_u16");
+    lua_pushcfunction(L, l_buf_set_u16); lua_setfield(L, -2, "set_u16");
+    lua_pushcfunction(L, l_buf_inc_u16); lua_setfield(L, -2, "inc_u16");
 
-    lua_pushcfunction(L, l_buf_set_u32); lua_setfield(L, -2, "set_u32");
     lua_pushcfunction(L, l_buf_get_u32); lua_setfield(L, -2, "get_u32");
+    lua_pushcfunction(L, l_buf_set_u32); lua_setfield(L, -2, "set_u32");
 
-    lua_pushcfunction(L, l_buf_set_i32); lua_setfield(L, -2, "set_i32");
     lua_pushcfunction(L, l_buf_get_i32); lua_setfield(L, -2, "get_i32");
+    lua_pushcfunction(L, l_buf_set_i32); lua_setfield(L, -2, "set_i32");
 
-    lua_pushcfunction(L, l_buf_set_i64); lua_setfield(L, -2, "set_i64");
     lua_pushcfunction(L, l_buf_get_i64); lua_setfield(L, -2, "get_i64");
+    lua_pushcfunction(L, l_buf_set_i64); lua_setfield(L, -2, "set_i64");
 
-    lua_pushcfunction(L, l_buf_set_f64); lua_setfield(L, -2, "set_f64");
     lua_pushcfunction(L, l_buf_get_f64); lua_setfield(L, -2, "get_f64");
+    lua_pushcfunction(L, l_buf_set_f64); lua_setfield(L, -2, "set_f64");
 
     lua_pushcfunction(L, l_buf_alloc); lua_setfield(L, -2, "alloc");
     lua_pushcfunction(L, l_buf_push_u32); lua_setfield(L, -2, "push_u32");

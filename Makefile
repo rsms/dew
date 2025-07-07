@@ -213,6 +213,9 @@ _dev-test: $(BUILDDIR)/dew
 dev-run-parse-tests:
 	autorun src/*.lua tests/parse/*.* -- 'o/darwin.debug/dew --selftest=parse_test'
 
+dev-run-parse-tests-debug:
+	autorun src/*.lua tests/parse/*.* -- 'o/darwin.debug/dew --selftest=parse_test --debug-parse --debug-resolve'
+
 dev-web:
 	autorun *.c *.h *.lua src/lua/*.c examples/*.dew web/*.* -- \
 	'$(MAKE) DEBUG=1 TARGET=web'

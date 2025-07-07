@@ -18,13 +18,19 @@ local function _print_table(tbl, indent, seen)
     end
     seen[tbl] = true
     print(indent_str .. "{ " .. tostring(tbl))
+    -- print(indent_str .. "{")
     local keys = {}
-    for k in pairs(tbl) do table.insert(keys, k) end
+    for k in pairs(tbl) do table.insert(keys, tostring(k)) end
     table.sort(keys)
     for _, k in ipairs(keys) do
         local key = tostring(k)
         local v = tbl[k]
-        io.write(indent_str .. indent_chunk .. "[" .. key .. "] = ")
+        if v == nil then
+            io.write(indent_str .. indent_chunk)
+            v = k
+        else
+            io.write(indent_str .. indent_chunk .. "[" .. key .. "] = ")
+        end
         if type(v) == "table" then
             _print_table(v, indent + 1, seen)
         else

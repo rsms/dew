@@ -1,4 +1,29 @@
 // basic arithmetic
+// -32768 // int16 min
+// 32767 // int16 max
+// 32768 // int16 max + 1
+
+// ——— TODO ———
+// - note that "f(_,_ int) -> (TUPLE int int)" and "f(_ int) -> int"
+// - change FUNTTYPE to be simply pointers to two types, so we can compare directly with CALL
+//
+
+// fun f(_, _ int)
+int32(1234)
+
+// -2305843009213693952 // int63 min
+// 2305843009213693951 // int63 max
+// 2305843009213693952 // int63 max + 1
+
+// -9223372036854775808 // int64 min
+// 9223372036854775807 // int64 max
+// -9223372036854775808 // int64 min - 1
+// 9223372036854775808 // int64 max + 1
+
+// 9223372036854775808 // int64 max + 1
+// -9223372036854775808
+// 18446744073709551615 // uint
+// 1 + -9223372036854775809
 // 1 + 2 * -3 / 4
 // (1 + 2) * -3 / 4
 // 5.0 + 6.7 + 8.0
@@ -9,19 +34,19 @@
 // c = 3 + b
 
 // functions
-fun f(x bool, y float, z int) (int, int) {
-	return 1, 2
-}
-// fun a(x int) int {
-// 	{};1
+// fun _(x int, y float, z int) (int, int) {
+// 	1, z
 // }
+// fun _(v [int]) [int] { return v }
+// fun _(v int) int { return v }
+// fun _ int { 1 }
+// fun _ int {}
+// fun print(args ...any)
 
-
-// cannot use 1.2 (untyped float constant) as int value in return statement (truncated)
-// resolver.diag_err(ast_srcpos(ast, idx),
-//     "invalid operation; mismatched types %s and %s",
-//     ast_fmt(ir, ltyp), ast_fmt(ir, rtyp))
-
+// rest parameters
+// fun _(v ...int) ...int { return v }
+// fun _(v ...int) [int] { [v] } // create array
+// fun _(v [int]) ...int { return ...v } // spread array
 
 // fun f(x, y, z int) (int, int) {
 // 	// a = x // VAR
@@ -46,7 +71,7 @@ fun f(x bool, y float, z int) (int, int) {
 // x := i32(-2147483648)
 
 // fun tuples {
-// 	t = (1, 2.0, 3, (4, 5.5))
+//     t = (1, 2.0, 3, (4, 5.5))
 // }
 
 // fun int16.bitcast(self, v any) int16
@@ -59,7 +84,7 @@ fun f(x bool, y float, z int) (int, int) {
 // // fun f(a, b int) (x int, y float, z int) {
 // fun f(x, y int) (r int, g float, b int) {
 // // fun f(x, y int) (int, float, int) {
-// 	return 1, 2.2, 2
+//     return 1, 2.2, 2
 // }
 // // print(f())
 
@@ -72,7 +97,8 @@ fun f(x bool, y float, z int) (int, int) {
 // fun f(v ...int) ...int { return ...v }
 // fun f(v ...int) [int] { return v }
 // fun f(v [int]) [int] { return v }
-// fun f(v int) int { return v } // --------------------------------------
+// fun f(v int) int { return v }
+// --------------------------------------
 
 // fun f(v [int]) [int] { return v }
 
@@ -83,9 +109,9 @@ fun f(x bool, y float, z int) (int, int) {
 // fun f(x, ... int) [int] { return ... }
 
 // fun example(f fun(int)int) {
-// 	return fun(x int)int {
-// 		return x*x
-// 	}
+//     return fun(x int)int {
+//         return x*x
+//     }
 // }
 
 // fun main {
@@ -121,37 +147,37 @@ fun f(x bool, y float, z int) (int, int) {
 // main()
 
 // fun main() {
-// 	a := uint(12345)
-// 	b := int16.bitcast(z)
+//     a := uint(12345)
+//     b := int16.bitcast(z)
 // }
 
 // TODO: unsigned-int to float conversion:
 // fun main(x any) { float(uint(12345)) }
 
 // fun main(x any) {
-// 	f := float(-12345)
-// 	i64 := int64(f)
-// 	u64 := uint64(i64)
-// 	i16 := int16(u64)
-// 	u16 := uint16(u64)
-// 	i12 := int12(u16)
-// 	u12 := uint12(u16)
+//     f := float(-12345)
+//     i64 := int64(f)
+//     u64 := uint64(i64)
+//     i16 := int16(u64)
+//     u16 := uint16(u64)
+//     i12 := int12(u16)
+//     u12 := uint12(u16)
 
-// 	print(i64); print(u64); print(i16); print(u16); print(i12); print(u12)
+//     print(i64); print(u64); print(i16); print(u16); print(i12); print(u12)
 // }
 // main(3.3)
 
 // // variables
 // fun main(x, y int) int {
-// 	// z := x * y
-// 	// return z
+//     // z := x * y
+//     // return z
 // }
 // // print(main(2))
 // // main(2) // TODO: check argument arity
 
 // // variables
 // fun f(x int) int {
-// 	z := x * 2
-// 	return x + z
+//     z := x * 2
+//     return x + z
 // }
 // print(f(2))

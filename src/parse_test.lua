@@ -1,6 +1,7 @@
 local function test_parse(unit) --> diag_errors, diag_messages
     local diag_errors = {}
     local diag_messages = {}
+    unit.errcount = 0
     unit.include_comments = true
     unit.diag_handler = function(unit, kind, srcpos, msg_format, ...)
         diag_messages[#diag_messages + 1] = diag_fmt(unit, kind, srcpos, msg_format, ...)
@@ -13,8 +14,8 @@ local function test_parse(unit) --> diag_errors, diag_messages
     -- Tokenize (text -> tokens)
     tokens = tokenize_unit(unit)
 
-    -- parser tests should tokenize correctly (see tokenize_test for tokenization tests)
-    assert(unit.errcount == 0)
+    -- Note: Do not stop for errcount here since it may include "integer literal overflows"
+    -- diagnostics which we want to check for
 
     -- Parse (tokens -> AST)
     parse_unit(unit, tokens, PARSE_SRCMAP)

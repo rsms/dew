@@ -34,7 +34,7 @@ function resolve_unit(unit)
     local idstack = __rt.buf_create(512) -- [(id_idx u, idx u32)]
     local idstack_scope_offs = 0 -- bottom of current scope
     local resolver = {
-        ctxtype = nil,
+        ctxtype = 0,
         unit = unit,
         internmap = internmap,
         fun_idx = 0, -- current function
@@ -53,14 +53,17 @@ function resolve_unit(unit)
         return diag(unit, DIAG_ERR, srcpos, format, ...)
     end
 
+    function resolver.diag_warn(srcpos, format, ...)
+        return diag(unit, DIAG_WARN, srcpos, format, ...)
+    end
+
     function resolver.srcpos(idx)
         return 0
     end
 
     function resolver.resolve(idx, flags)
         assert(idx ~= 0)
-        local offs = ast_offs_of_idx(idx)
-        local kind = ast:get_u8(offs)
+        local kind = ast:get_u8(ast_offs_of_idx(idx))
         local info = ast_info[kind]
         assert(info.resolve ~= nil, "TODO: " .. info.name .. ".resolve")
         if flags == nil then
@@ -74,8 +77,39 @@ function resolve_unit(unit)
         return #idstack
     end
 
-    function resolver.id_scope_close(scope)
+    function report_unused(idx, offs, kind)
+        -- TODO: for top-level (scope==0), ignore "pub" storage, exported from package
+        local load_and_store_count = ir:get_u32(offs + 12)
+        if load_and_store_count ~= 0 then
+            return
+        end
+        if kind == AST_FUN.kind and AST_FUN.body(ir, idx) == 0 then
+            return resolver.diag_warn(resolver.srcpos(idx),
+                                      "unused function declaration %s", ast_fmt(ir, idx))
+        end
+        return resolver.diag_warn(resolver.srcpos(idx),
+                                  "unused %s %s (use '_' to silence)",
+                                  ast_descr(ir, idx), ast_fmt(ir, idx))
+    end
+
+    function resolver.id_scope_close(scope, warn_unused)
         assert(scope <= #idstack and scope % 8 == 0, tostring(#idstack) .. ", " .. tostring(scope))
+        if #idstack - scope == 0 then
+            return
+        end
+
+        -- check for unused storage (vars, params, local functions)
+        if warn_unused ~= false then
+            for idstack_offs = scope, #idstack - 8, 8 do
+                local idx = idstack:get_i32(idstack_offs + 4)
+                local offs = ast_offs_of_idx(idx)
+                local kind = ir:get_u8(offs)
+                if kind == AST_VAR.kind or kind == AST_PARAM.kind or kind == AST_FUN.kind then
+                    report_unused(idx, offs, kind)
+                end
+            end
+        end
+
         idstack:resize(scope)
         idstack_scope_offs = scope
     end
@@ -107,13 +141,13 @@ function resolve_unit(unit)
     end
 
     function resolver.id_define(id_idx, idx) --> idx
-        if id_idx ~= 0 then
+        if id_idx ~= 0 and id_idx ~= ID__ then
             idstack:push_u64((id_idx & 0xffffff) | ((idx & 0xffffffff) << 32))
         end
         return idx
     end
 
-    function resolver.record_srcpos(idx, ir_idx)
+    function resolver.record_srcpos(ir_idx, srcpos)
     end
 
     -- map ir_idx => srcpos, if requested
@@ -123,7 +157,7 @@ function resolve_unit(unit)
             local srcpos = ast:get_u32(ast_offs_of_idx(idx) + 4)
             local ir_idx = resolve_fun(idx, flags)
             -- trace("unit.ir_srcmap[%u] = 0x%08x", ir_idx, srcpos)
-            if ir_idx ~= 0 and ir_idx ~= nil then
+            if ir_idx ~= 0 and ir_idx ~= nil and unit.ir_srcmap[ir_idx] == nil then
                 unit.ir_srcmap[ir_idx] = srcpos
             end
             return ir_idx
@@ -132,9 +166,12 @@ function resolve_unit(unit)
             local srcpos = unit.ir_srcmap[idx]
             return srcpos ~= nil and srcpos or 0
         end
-        function resolver.record_srcpos(idx, ir_idx)
-            resolver.unit.ir_srcmap[ir_idx] = ast_srcpos(ast, idx)
+        function resolver.record_srcpos(ir_idx, srcpos)
+            resolver.unit.ir_srcmap[ir_idx] = srcpos
         end
+        -- function resolver.record_srcpos(idx, ir_idx)
+        --     resolver.unit.ir_srcmap[ir_idx] = ast_srcpos(ast, idx)
+        -- end
     end
 
     -- map ir_idx => [comment], if requested
@@ -173,9 +210,9 @@ function resolve_unit(unit)
     end
 
     local id_scope_close_orig = resolver.id_scope_close
-    resolver.id_scope_close = function(scope)
+    resolver.id_scope_close = function(scope, ...)
         trace("id_scope_close %d", scope)
-        local scope = id_scope_close_orig(scope)
+        local scope = id_scope_close_orig(scope, ...)
         return scope
     end
 
@@ -200,6 +237,7 @@ function resolve_unit(unit)
 
     local resolve_orig = resolver.resolve
     resolver.resolve = function(idx, flags)
+        assert(idx ~= 0, "resolver.resolve(0)")
         local info = ast_info[ast:get_u8(ast_offs_of_idx(idx))]
         trace("%s#%d ...", info.name, idx)
         trace_depth = trace_depth + 1
@@ -229,7 +267,9 @@ function resolve_unit(unit)
 
     trace("%s", unit.srcfile)
 
+    local unit_scope = resolver.id_scope_open()
     unit.ir_idx = resolver.resolve(unit.ast_idx)
+    resolver.id_scope_close(unit_scope, true)
 
     printf("IR after resolve_unit: (%d B)", #unit.ir)
     print(ir_repr(unit, unit.ir_idx))

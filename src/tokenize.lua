@@ -44,7 +44,10 @@ TOK_TILDE                                = deftok('~')
 
 TOK_COMMENT                              = deftok('COMMENT')
 TOK_ID                                   = deftok('ID')
-TOK_INT                                  = deftok('INT')
+TOK_INT                                  = deftok('INT')   -- base 10
+TOK_INT2                                 = deftok('INT2')  -- base 2
+TOK_INT8                                 = deftok('INT8')  -- base 8
+TOK_INT16                                = deftok('INT16') -- base 16
 TOK_FLOAT                                = deftok('FLOAT')
 
 -- keywords
@@ -67,9 +70,12 @@ function tokenize_unit(unit)
 
 	local function diag_err(format, ...)
 		local srcpos = srcpos_make(tokstart, tokend - tokstart)
-		srcidx = srcend -- stop scanning
 		diag(unit, DIAG_ERR, srcpos, format, ...)
 		if DEBUG_TOKENS then error("syntax error") end
+	end
+
+	local function stop_scanning()
+		srcidx = srcend
 	end
 
 	local function next_byte(byte1, byte2)
@@ -100,6 +106,7 @@ function tokenize_unit(unit)
 
 	local function scan_block_comment()
 		diag_err("block comments not implemented")
+		stop_scanning()
 	end
 
 	local function byte_is_sep(byte)
@@ -185,13 +192,16 @@ function tokenize_unit(unit)
 			value, err = __rt.intscan(value, base, 0xffffffffffffffff)
 			if err ~= 0 then
 				if err == __rt.ERR_RANGE then
-					err_invalid("; too large, overflows i64")
+					diag_err("integer literal overflows uint64")
 				else
 					local errname, errdesc = __rt.errstr(err)
 					err_invalid("; %s", errdesc)
 				end
 			end
-			return TOK_INT
+			return base == 10 and TOK_INT or
+			       base ==  2 and TOK_INT2 or
+			       base ==  8 and TOK_INT8 or
+			       base == 16 and TOK_INT16
 		else
 			if need_tr then
 				if string.byte(value, #value - 1) == B('_') then
@@ -207,6 +217,12 @@ function tokenize_unit(unit)
 		end
 	end
 
+	local function scan_charlit()
+		error("scan_charlit not implemented")
+	end
+	local function scan_strlit()
+		error("scan_strlit not implemented")
+	end
 	local function scan_num0()
 		-- e.g. 0xBEEF, 0o0644, 0b01011, 0.12, 0123
 		local base = 10
@@ -384,7 +400,9 @@ function token_iterator(tokens)
 		srcpos = v>>32
 		value = v>>8 & 0xffffff
 		assert(value ~= 0 or tok ~= TOK_ID, "ID with separate value (id_idx > 0xffffff)")
-		if tok == TOK_COMMENT or tok == TOK_FLOAT or (tok == TOK_INT and value == 0xffffff) then
+		if tok == TOK_COMMENT or tok == TOK_FLOAT or
+		   (tok >= TOK_INT and tok <= TOK_INT16 and value == 0xffffff)
+		then
 			i = i + 1 -- value in second array slot
 			value = tokens[i]
 		end
@@ -406,10 +424,16 @@ function dlog_tokens(tokens, unit, line_prefix)
 	local i = 1
 	line_prefix = line_prefix and line_prefix or ""
 	for tok, srcpos, value, meta in token_iterator(tokens) do
-		local srcpos_str = (unit == nil) and "" or srcpos_fmt(srcpos, unit.src)
+		local srcpos_str = (unit == nil) and "" or srcpos_fmt(srcpos, unit, true)
 		if tok == TOK_INT then
-			-- value = fmt("%8s 0x%s", __rt.intfmt(value, 10), __rt.intfmt(value, 16, true))
-			value = fmt("%8d 0x%x", value, value)
+			value = fmt("%8s", __rt.intfmt(value, 10, true))
+			-- value = fmt("%8d 0x%x", value, value)
+		elseif tok == TOK_INT2 then
+			value = fmt("0b%-8s", __rt.intfmt(value, 2, true))
+		elseif tok == TOK_INT8 then
+			value = fmt("0o%-8s", __rt.intfmt(value, 8, true))
+		elseif tok == TOK_INT16 then
+			value = fmt("0x%-8s", __rt.intfmt(value, 16, true))
 		elseif tok == TOK_FLOAT then
 			value = fmt("%8g", value)
 		elseif tok == TOK_ID then

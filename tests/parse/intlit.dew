@@ -1,0 +1,4 @@
+-9223372036854775808 // ok
+-9223372036854775809 //!error integer literal overflows
+18446744073709551615 // ok
+18446744073709551616 //!error integer literal overflows

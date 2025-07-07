@@ -59,6 +59,7 @@ end
 ---------------------------------------------------------------------------------------------------
 
 
+
 USAGE = [[
 usage: %s [options] <input> ...
 options:
@@ -142,14 +143,14 @@ function compile_and_run(unit)
 	resolve_unit(unit)
 	stop_if_errors()
 
-    print("TODO: ... os.exit(1)"); os.exit(1)
+    -- print("TODO: ... os.exit(1)"); os.exit(1)
 
 	-- generate code (IR -> target)
-	code = codegen_unit(unit)
+	code = codegen_lua(unit)
 	stop_if_errors()
 
 	-- run program
-	run(unit, code)
+	run(unit, "print(" .. code .. ")")
 end
 
 function main(args)

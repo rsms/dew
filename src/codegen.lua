@@ -1,73 +1,93 @@
-function codegen_unit(unit) -- code
-	if DEBUG_CODEGEN then dlog("\x1b[1;34mcodegen %s\x1b[0m", unit.srcfile) end
-	local ast_stack = unit.ast
-	if #ast_stack == 0 then return "" end
-	local src = unit.src
-	local depth = 0
-	local buf = {}
-	local function write(s) table.insert(buf, s) end
-	local g = {}
-	local function codegen(idx, flags)
-		if idx == 0 then return end
-		if flags == nil then flags = 0 end
-		g.idx = idx
-		return ast_visit(ast_stack, idx, function(idx, n, a, b, c, d)
-			depth = depth + 1
-			local k = ast_kind(n)
-			assert(k ~= 0, "encountered <nothing> AST node")
-			local f = ast_nodes[k].codegen
-			if f == nil then error(fmt("TODO: %s", astkind_name(k))) end
-			f(g, flags, n, a, b, c, d)
-			depth = depth - 1
-		end)
-	end
-	g.unit = unit
-	g.idx = idx
-	g.write = write
-	g.ast_node = function(idx) assert(idx ~= nil); return ast_node(ast_stack, idx) end
-	g.ast_typeof = function(idx) return ast_typeof(unit, idx) end -- typ_idx, val_idx
-	g.ast_str = function(idx) assert(idx ~= nil); return ast_str(ast_stack, idx) end
-	g.codegen = codegen
-	g.diag_err = function(srcpos, format, ...)
-		if srcpos == nil then srcpos = ast_srcpos(ast_stack[g.idx]) end
-		return diag(unit, DIAG_ERR, srcpos, format, ...)
-	end
-	g.diag_warn = function(srcpos, format, ...)
-		if srcpos == nil then srcpos = ast_srcpos(ast_stack[g.idx]) end
-		return diag(unit, DIAG_WARN, srcpos, format, ...)
-	end
-	g.diag_info = function(srcpos, format, ...)
-		if srcpos == nil then srcpos = ast_srcpos(ast_stack[g.idx]) end
-		return diag(unit, DIAG_INFO, srcpos, format, ...)
-	end
-	codegen(unit.ast_root)
-	local code = table.concat(buf, "")
-	if DEBUG_CODEGEN then
-		print("\x1b[2m——————————————————————————————————————————————————\x1b[0;1m")
-		print(code)
-		print("\x1b[0;2m——————————————————————————————————————————————————\x1b[0m")
-	end
-	return code
+local gen = {}
+
+function AST_INT.codegen_lua(ir, idx, g, flags)
+    local _, is_neg, value = AST_INT.load(ir, idx)
+    if (not is_neg and value < 0) or (is_neg and value > -9223372036854775807) then
+        -- must encode as hex or lua will convert to float
+        return g.write("0x" .. __rt.intfmt(value, 16, true))
+    end
+    return g.write(__rt.intfmt(value, 10, not is_neg))
+end
+
+function AST_PREFIXOP.codegen_lua(ir, idx, g, flags)
+    local op, operand_idx = AST_PREFIXOP.load(ir, idx)
+    g.write(tokname(op))
+    return g.codegen(operand_idx, RVALUE)
+end
+
+function AST_BINOP.codegen_lua(ir, idx, g, flags)
+    local op, left_idx, right_idx = AST_BINOP.load(ir, idx)
+    g.write("("); g.codegen(left_idx, RVALUE); g.write(" ")
+    if op == TOK_SLASH then
+        g.write('//') -- intdiv is different in Lua
+    else
+        g.write(tokname(op))
+    end
+    g.write(" "); g.codegen(right_idx, RVALUE); g.write(")")
+end
+
+function codegen_lua(unit) -- code
+    if DEBUG_CODEGEN then dlog("\x1b[1;34mcodegen %s\x1b[0m", unit.srcfile) end
+
+    local ir = unit.ir
+    local depth = 0
+    local buf = __rt.buf_create(512)
+    local g = {
+        unit = unit,
+    }
+
+    function g.write(s) buf:append(s) end
+
+    function g.typeof(idx)
+        local ast = ir
+        if idx < 0 then
+            ast = builtin_ir
+            idx = -idx
+        end
+        return ast:get_i32(ast_offs_of_idx(idx) + 4)
+    end
+
+    function g.codegen(idx, flags)
+        assert(idx ~= 0)
+        local kind = ir:get_u8(ast_offs_of_idx(idx))
+        local info = ast_info[kind]
+        assert(info.codegen_lua ~= nil, "TODO: " .. info.name .. ".codegen_lua")
+        if flags == nil then
+            flags = 0
+        end
+        return info.codegen_lua(ir, idx, g, flags == nil and 0 or flags)
+    end
+
+    g.codegen(unit.ir_idx, 0)
+
+    local code = buf:str()
+
+    if DEBUG_CODEGEN then
+        print("\x1b[2m——————————————————————————————————————————————————\x1b[0;1m")
+        print(code)
+        print("\x1b[0;2m——————————————————————————————————————————————————\x1b[0m")
+    end
+    return code
 end
 
 
 function codegen_intconv(g, src_issigned, src_bits, dst_issigned, dst_bits, src_expr_gen)
-	if src_bits == dst_bits --[[and src_issigned == dst_issigned]] then
-		return src_expr_gen()
-	end
-	if not src_issigned and not dst_issigned then
-		g.write("(")
-		src_expr_gen()
-		local mask = (1 << math.min(src_bits, dst_bits)) - 1
-		g.write(fmt(" & 0x%x)", mask))
-	else
-		-- __rt.intconv(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
-		g.write("__rt.intconv(")
-		src_expr_gen()
-		g.write(fmt(",%d,%d,%s,%s)",
-		            src_bits,
-		            dst_bits,
-		            src_issigned and "true" or "false",
-		            dst_issigned and "true" or "false"))
-	end
+    if src_bits == dst_bits --[[and src_issigned == dst_issigned]] then
+        return src_expr_gen()
+    end
+    if not src_issigned and not dst_issigned then
+        g.write("(")
+        src_expr_gen()
+        local mask = (1 << math.min(src_bits, dst_bits)) - 1
+        g.write(fmt(" & 0x%x)", mask))
+    else
+        -- __rt.intconv(srcval, src_bits, dst_bits, src_issigned, dst_issigned)
+        g.write("__rt.intconv(")
+        src_expr_gen()
+        g.write(fmt(",%d,%d,%s,%s)",
+                    src_bits,
+                    dst_bits,
+                    src_issigned and "true" or "false",
+                    dst_issigned and "true" or "false"))
+    end
 end
