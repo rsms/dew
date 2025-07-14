@@ -1,32 +1,7 @@
 // basic arithmetic
-// -32768 // int16 min
-// 32767 // int16 max
-// 32768 // int16 max + 1
-
-// ——— TODO ———
-// - note that "f(_,_ int) -> (TUPLE int int)" and "f(_ int) -> int"
-// - change FUNTTYPE to be simply pointers to two types, so we can compare directly with CALL
-//
-
-// fun f(_, _ int)
-int32(1234)
-
-// -2305843009213693952 // int63 min
-// 2305843009213693951 // int63 max
-// 2305843009213693952 // int63 max + 1
-
-// -9223372036854775808 // int64 min
-// 9223372036854775807 // int64 max
-// -9223372036854775808 // int64 min - 1
-// 9223372036854775808 // int64 max + 1
-
-// 9223372036854775808 // int64 max + 1
-// -9223372036854775808
-// 18446744073709551615 // uint
-// 1 + -9223372036854775809
 // 1 + 2 * -3 / 4
 // (1 + 2) * -3 / 4
-// 5.0 + 6.7 + 8.0
+// 5.0 + 6.7 + 8e+19
 
 // variables
 // a = 1 * 2
@@ -39,9 +14,55 @@ int32(1234)
 // }
 // fun _(v [int]) [int] { return v }
 // fun _(v int) int { return v }
-// fun _ int { 1 }
-// fun _ int {}
+// fun _(x, y int) { x * y }
+// fun _ { 1 }
+// fun _ int { 2 }
+// fun _ int { 1; return { 2 } }
 // fun print(args ...any)
+
+// contextual type inference
+// _ = uint8({ 1; 2 }) // type of "1" is "int" but type of "2" is uint8
+// fun _() uint8 { return 3 } // return type inferred as uint8
+// fun _() uint8 { 3 } // result type inferred as uint8
+// fun _() uint8 { 2; 3 } // type of "2" is "int" but type of "3" is uint8
+// fun _() (uint8, int16) { return 2, 3 } // return type inferred as (uint8,int16)
+// fun _() (uint8, int16) { 2, 3 } // result type inferred as (uint8,int16)
+// x = (int8(1), uint16(2))
+// x = (3, 4) // type of "3" is "int8", type of "4" is uint16
+
+// fun _() (int, int) { return 2, 3 }
+// fun _() ((uint8, uint8), int16) { return (2, 3), 4 } // broken
+
+// int8(3)
+// type(3)
+// type(3)(int8(4))
+// int8(int32(12349))
+// int32(int8(-123))
+// int8(uint8(223))
+
+// int8(1234.9) // -46
+// uint8(1234.9) // 210
+// int8(123.9) // 123
+// uint8(234.9) // 234
+// int8(-123.9) // -123
+uint8(-234.9) // 22
+
+// fun f(x int8) int8
+// fun f(x, y int) int
+// f(1,2)
+// f((1,(2,3)))
+
+// fun _(x (int, int)) int
+// fun _() (int, int)
+// fun _() (int, int)
+// fun _() (x (int, int))
+// fun _(x, y int) ((int, int), (int, int))
+
+// _ = int8(-120) * int8(43)
+// k = fun(v int) int { v }
+// k = 3; _ = k(12349)
+// int8(int32(12349), 2)
+// fun f(v int) int { v };f(123)
 
 // rest parameters
 // fun _(v ...int) ...int { return v }

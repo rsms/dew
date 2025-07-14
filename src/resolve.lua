@@ -1,29 +1,3 @@
--- ir_node { kind u8; _ u24; typ_idx i32 }
-
-function ir_typeof(ir, idx) --> typ_idx
-    if idx == 0 then
-        return 0
-    end
-    return ir:get_i32(ast_offs_of_idx(idx) + 4)
-end
-
-function ir_is_type_assignable(ir, dst_typ_idx, src_typ_idx) --> issue_idx (0 if ok)
-    if dst_typ_idx == 0 or src_typ_idx == 0 then
-        if dst_typ_idx ~= 0 then return dst_typ_idx end
-        return src_typ_idx
-    end
-    local dst_kind = ir:get_u8(ast_offs_of_idx(dst_typ_idx))
-    local src_kind = ir:get_u8(ast_offs_of_idx(src_typ_idx))
-    local f = ast_info[dst_kind].is_type_assignable
-    if f == nil then
-        if dst_kind == src_kind then
-            return 0
-        end
-        return src_kind
-    end
-    return f(ir, dst_typ_idx, src_typ_idx)
-end
-
 function resolve_unit(unit)
     unit.ir = __rt.buf_create(#unit.ast)
     unit.ir_srcmap = {} -- set to nil to not save srcpos
@@ -31,22 +5,18 @@ function resolve_unit(unit)
     local internmap = {} -- (hash u64) => (idx i32) -- TODO: per package? global?
     local ast = unit.ast
     local ir = unit.ir
-    local idstack = __rt.buf_create(512) -- [(id_idx u, idx u32)]
+    local idstack = __rt.buf_create(256) -- [(id_idx u, idx u32)]
     local idstack_scope_offs = 0 -- bottom of current scope
     local resolver = {
         ctxtype = 0,
         unit = unit,
         internmap = internmap,
         fun_idx = 0, -- current function
+        fun_restyp_idx = 0, -- current function's result type
     }
 
     function resolver.typeof(idx)
-        local ast = ir
-        if idx < 0 then
-            ast = builtin_ir
-            idx = -idx
-        end
-        return idx == 0 and 0 or ast:get_i32(ast_offs_of_idx(idx) + 4)
+        return ast_typeof(ir, idx)
     end
 
     function resolver.diag_err(srcpos, format, ...)
@@ -61,7 +31,7 @@ function resolve_unit(unit)
         return 0
     end
 
-    function resolver.resolve(idx, flags)
+    function resolver.resolve(idx, flags) --> ir_idx
         assert(idx ~= 0)
         local kind = ast:get_u8(ast_offs_of_idx(idx))
         local info = ast_info[kind]
@@ -116,6 +86,9 @@ function resolve_unit(unit)
 
     local function idstack_lookup(id_idx, base_offs) --> idx (0 if not found)
         assert(id_idx ~= 0)
+        if id_idx == ID__ then
+            return 0
+        end
         local offs = idstack:find_u32(#idstack, base_offs, 8, id_idx)
         return offs ~= nil and idstack:get_i32(offs + 4) or 0
     end
@@ -148,6 +121,42 @@ function resolve_unit(unit)
     end
 
     function resolver.record_srcpos(ir_idx, srcpos)
+    end
+
+    function resolver.is_type_assignable(dst_typ_idx, src_typ_idx) --> bool
+        if dst_typ_idx == src_typ_idx then
+            return true
+        elseif (dst_typ_idx == 0 or src_typ_idx == 0) and unit.errcount > 0 then
+            return true -- avoid cascading errors
+        end
+        -- types differ; delegate to AST-kind-specific is_type_assignable function
+        local f = ast_info[ast_kind(ir, dst_typ_idx)].is_type_assignable
+        if f == nil then
+            return false
+        end
+        return f(ir, dst_typ_idx, src_typ_idx)
+    end
+
+    function resolver.check_type_assignable(dst_typ_idx, src_typ_idx, src_idx) --> bool
+        if resolver.is_type_assignable(dst_typ_idx, src_typ_idx) then
+            return true
+        end
+        resolver.diag_err(resolver.srcpos(src_idx ~= 0 and src_idx or src_typ_idx),
+            "value of type '%s' is not assignable to type '%s'",
+            ast_fmt(ir, src_typ_idx), ast_fmt(ir, dst_typ_idx))
+        return false
+    end
+
+    function resolver.intern_type(idx, kind, offs, hash_offs, hash_size) --> idx
+        assert(hash_offs >= offs)
+        local hash = ir:hash(kind, hash_offs, hash_offs + hash_size)
+        local other_idx = internmap[hash]
+        if other_idx ~= nil then
+            ir:resize(offs) -- undo additions to IR stack
+            return other_idx
+        end
+        internmap[hash] = idx
+        return idx
     end
 
     -- map ir_idx => srcpos, if requested
@@ -248,7 +257,7 @@ function resolve_unit(unit)
         elseif ir_idx < 0 then
             trace("%s#%d => builtin#%d %s", info.name, idx, ir_idx, builtin_name(ir_idx))
         elseif ast_kind(ir, ir_idx) == AST_REF.kind then
-            -- REF is special as it stores its target in the meta slot, unlike other nodes
+            -- ID & REF are special: stores target in the meta slot (unlike other nodes)
             local target_idx = AST_REF.target(ir, ir_idx)
             local typ_idx = resolver.typeof(target_idx)
             trace("%s#%d => ir#%d REF -> ir#%d %s (type #%d %s)",
@@ -268,7 +277,11 @@ function resolve_unit(unit)
     trace("%s", unit.srcfile)
 
     local unit_scope = resolver.id_scope_open()
-    unit.ir_idx = resolver.resolve(unit.ast_idx)
+    if unit.ast_idx ~= 0 then
+        unit.ir_idx = resolver.resolve(unit.ast_idx)
+    else
+        unit.ir_idx = 0
+    end
     resolver.id_scope_close(unit_scope, true)
 
     printf("IR after resolve_unit: (%d B)", #unit.ir)

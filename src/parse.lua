@@ -87,6 +87,14 @@ function parse_unit(unit, tokens, flags) --> void
 		if srcpos == nil then srcpos = srcpos_curr end
 		return diag(unit, DIAG_ERR, srcpos, format, ...)
 	end
+	local function diag_info(srcpos, format, ...)
+		if (flags & PARSE_SRCMAP) == 0 then
+			dlog("[diag] re-parsing with srcmap enabled")
+			return parse_unit(unit, tokens, flags | PARSE_SRCMAP)
+		end
+		if srcpos == nil then srcpos = srcpos_curr end
+		return diag(unit, DIAG_INFO, srcpos, format, ...)
+	end
 
 	local function syntax_error(format, ...)
 		if unit.errcount == 0 or tok ~= nil then -- avoid cascading errors after EOF
@@ -383,7 +391,12 @@ function parse_unit(unit, tokens, flags) --> void
 	local function parse_block_body(srcpos, stoptok, elide_if_empty)
 		-- block_body = [ expr (";" expr)* ";"? ]
 		-- e.g. "1;" "1;2" "1;2;"
-		return parse_list(AST_BLOCK, srcpos, TOK_SEMI, stoptok, parse_expr, elide_if_empty)
+		local idxv_i32 = parse_list_elems(TOK_SEMI, stoptok, parse_expr)
+		if #idxv_i32 == 0 and elide_if_empty then
+			return 0
+		end
+		return ast_list_add(ast, AST_BLOCK.kind, srcpos, idxv_i32)
+		-- return parse_list(AST_BLOCK, srcpos, TOK_SEMI, stoptok, parse_expr, elide_if_empty)
 	end
 	local function parse_block(elide_if_empty)
 		-- block = "{" [ expr (";" expr)* ";"? ] "}"
@@ -436,7 +449,7 @@ function parse_unit(unit, tokens, flags) --> void
 			-- expect(TOK_ID)
 			if tok == TOK_ID then
 				next_token()
-			elseif allow_only_types and tok == TOK_DOTDOTDOT then
+			elseif allow_only_types and tok == TOK_DOTDOTDOT then -- ...
 				name_id_idx = ID__
 				typ_idx = parse_type(PREC_MIN)
 				-- ...T must be last parameter
@@ -445,6 +458,9 @@ function parse_unit(unit, tokens, flags) --> void
 					tok_fastforward(TOK_RPAREN)
 					break
 				end
+			elseif allow_only_types then -- T
+				name_id_idx = ID__
+				typ_idx = parse_type(PREC_MIN)
 			else
 				syntax_error_unexpected("parameter name or type")
 				tok_fastforward(TOK_RPAREN)
@@ -506,9 +522,6 @@ function parse_unit(unit, tokens, flags) --> void
 		if #idxv_i32 == 0 then
 			return 0
 		end
-		if #idxv_i32 == 4 then
-			return idxv_i32:get_u32(0)
-		end
 		return ast_list_add(ast, AST_TUPLE.kind, list_srcpos, idxv_i32)
 	end
 
@@ -543,6 +556,12 @@ function parse_unit(unit, tokens, flags) --> void
 			result_idx = parse_params(true)
 		elseif tok ~= TOK_LBRACE and tok ~= TOK_SEMI then -- "fun() int"
 			result_idx = parse_type(PREC_MIN)
+			if tok == TOK_COMMA and not as_type then
+				-- handle common error "f () T, Y { ... }"
+				syntax_error("unexpected '%s'; expected '{' or ';'", tokname(tok))
+				diag_info(srcpos_curr, "Wrap multiple results in '(…)'")
+				tok_fastforward()
+			end
 		end
 
 		-- Body, e.g. "{ x; y }", "x;" (equivalent to "{x}")
@@ -569,7 +588,9 @@ function parse_unit(unit, tokens, flags) --> void
 			-- has leading '-'; negate (must check for overflow first)
 			srcpos = srcpos_union(neg_srcpos, srcpos)
 			if value < 0 and value > -9223372036854775808 then
-				diag_err(srcpos, "integer literal overflows int64")
+				-- diag_err(srcpos, "integer literal overflows int64")
+				-- communicate to resolver that this value is out of range
+				base = 0
 			end
 			value = -value
 		end
@@ -580,6 +601,11 @@ function parse_unit(unit, tokens, flags) --> void
 	exprtab_prefix[TOK_INT2] = parse_int_literal
 	exprtab_prefix[TOK_INT8] = parse_int_literal
 	exprtab_prefix[TOK_INT16] = parse_int_literal
+	exprtab_prefix[TOK_INTBIG] = function()
+		local srcpos = srcpos_curr
+		next_token()
+		return AST_INT.make(ast, srcpos, 0, false, 0)
+	end
 
 	local function parse_float_literal(neg_srcpos)
 		local srcpos = srcpos_curr
@@ -601,15 +627,8 @@ function parse_unit(unit, tokens, flags) --> void
 		local value_idx = 0
 		if tok ~= TOK_SEMI and tok ~= TOK_RBRACE then
 			local val_srcpos = srcpos_curr
-			local in_parens = tok == TOK_LPAREN
-			if in_parens then
-				next_token()
-			end
 			local elide_if_empty = true
 			value_idx = parse_tuple_body(AST_TUPLE, val_srcpos, parse_expr, elide_if_empty, nil)
-			if in_parens then
-				expect(TOK_RPAREN)
-			end
 		end
 		return AST_RETURN.make(ast, srcpos, value_idx)
 	end
@@ -631,12 +650,15 @@ function parse_unit(unit, tokens, flags) --> void
 	local function parse_call(recv_idx)
 		local srcpos = srcpos_curr
 		next_token() -- consume "("
-		local elide_if_empty = true
-		local args_idx = parse_tuple_body(AST_TUPLE, srcpos, parse_expr, elide_if_empty)
-		expect(TOK_RPAREN)
-		return AST_CALL.make(ast, srcpos, recv_idx, args_idx)
+		local idxv_i32 = parse_list_elems(TOK_COMMA, TOK_RPAREN, parse_expr, recv_idx)
+		local idx = ast_list_add(ast, AST_CALL.kind, srcpos, idxv_i32)
+        -- local args_idx = ast_list_add(ast, AST_TUPLE.kind, srcpos, idxv_i32)
+        -- local idx = AST_CALL.make(ast, srcpos, recv_idx, idxv_i32)
+		expect(TOK_RPAREN) -- expect ")"
+		-- return AST_CALL.make(ast, srcpos, recv_idx, args_idx)
+		return idx
 	end
-	exprtab_infix[TOK_LPAREN] = { parse_call, PREC_MIN }
+	exprtab_infix[TOK_LPAREN] = { parse_call, PREC_UNPOST }
 
 	local function parse_binop(left_idx, prec, op)
 		local srcpos = srcpos_curr
@@ -647,6 +669,7 @@ function parse_unit(unit, tokens, flags) --> void
 	end
 	-- precedence level 5
 	exprtab_infix[TOK_STAR] = { parse_binop, PREC_BIN5 }
+	exprtab_infix[TOK_STARSTAR] = exprtab_infix[TOK_STAR]
 	exprtab_infix[TOK_SLASH] = exprtab_infix[TOK_STAR]
 	exprtab_infix[TOK_PERCENT] = exprtab_infix[TOK_STAR]
 	exprtab_infix[TOK_LTLT] = exprtab_infix[TOK_STAR]
@@ -673,10 +696,12 @@ function parse_unit(unit, tokens, flags) --> void
 		local op, srcpos = tok, srcpos_curr
 		local offs = AST_PREFIXOP.alloc(ast)
 		next_token()
-		if tok >= TOK_INT and tok <= TOK_INT16 then
-			return parse_int_literal(srcpos)
-		elseif tok == TOK_FLOAT then
-			return parse_float_literal(srcpos)
+		if op == TOK_MINUS then
+			if tok >= TOK_INT and tok <= TOK_INT16 then
+				return parse_int_literal(srcpos)
+			elseif tok == TOK_FLOAT then
+				return parse_float_literal(srcpos)
+			end
 		end
 		local operand_idx = parse_expr(PREC_UNPRE)
 		return AST_PREFIXOP.cons(ast, offs, srcpos, op, operand_idx)

@@ -52,6 +52,7 @@ DEW_LSRCS := \
 	src/srcpos.lua \
 	src/tokenize.lua \
 	src/id.lua \
+	src/runtime.lua \
 	src/ast.lua \
 	src/parse.lua \
 	src/resolve.lua \
@@ -204,11 +205,13 @@ _dev: $(BUILDDIR)/dew
 	$(BUILDDIR)/dew --debug-tokens --debug-parse --debug-resolve --debug-codegen \
 	examples/dev.dew
 
+# dev-test runs tests as sources change.
+# Set TEST_FILTER to run just some, e.g. make dev-test TEST_FILTER=intconv
 dev-test:
 	autorun src/*.* src/runtime/*.* tests/rt/*.* tests/parse/*.* src/lua/*.* examples/*.dew -- \
 		'$(MAKE) DEBUG=1 EMBED_SRC=0 _dev-test'
 _dev-test: $(BUILDDIR)/dew
-	$(BUILDDIR)/dew --selftest --debug-parse --debug-resolve
+	$(BUILDDIR)/dew --selftest=$(TEST_FILTER) $(if $(filter 1,$(V)),--selftest-verbose,)
 
 dev-run-parse-tests:
 	autorun src/*.lua tests/parse/*.* -- 'o/darwin.debug/dew --selftest=parse_test'
@@ -284,7 +287,7 @@ $(BUILDDIR)/dew.lua: $(DEW_LSRCS) src/dew.lua
 	$(Q)rm -f $@
 	$(Q)$(foreach f,$^,cat $(f) >> $@;)
 	$(Q)sed -i '' -E \
-		-e 's/\s*([^\(]require\()/--\1/' \
+		-e 's/\s*(require\()/--\1/' \
 		$@
 
 $(BUILDDIR)/dew.lua.o: $(BUILDDIR)/dew.lua $(LUAC)

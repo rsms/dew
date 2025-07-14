@@ -337,6 +337,8 @@ typedef double        float64;
     #define assertf(cond, fmt, args...) ((void)0)
     #define assertnull(cond) ((void)0)
     #define assertnotnull(expr) ({ expr; })
+    #define assertl(L, cond) ((void)0)
+    #define assertlf(L, cond, fmt, args...) ((void)0)
 #endif
 
 API_BEGIN

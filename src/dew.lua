@@ -24,6 +24,7 @@ require("diag")
 require("srcpos")
 require("tokenize")
 require("id")
+require("runtime")
 require("ast")
 require("parse")
 require("resolve")
@@ -44,6 +45,7 @@ VERBOSE = 1 -- 0=quiet, 1=normal, 2=verbose
 
 function run(unit, code)
 	print("—— run")
+	code = "print(" .. code .. ")" -- XXX TEMP
 	local env = _ENV
 	local func, err = load(code, unit.srcfile, "t", env)
 	if not func then
@@ -150,7 +152,7 @@ function compile_and_run(unit)
 	stop_if_errors()
 
 	-- run program
-	run(unit, "print(" .. code .. ")")
+	run(unit, code)
 end
 
 function main(args)

@@ -384,6 +384,13 @@ int l_buf_set_i32(lua_State* L) {
     *(i32*)&buf->bytes[offs] = val;
     return 0;
 }
+int l_buf_pop_i32(lua_State* L) {
+    Buf* buf = l_buf_check(L, 1);
+    assertlf(L, buf->len % 4 == 0 && buf->len >= 4, "buf.len: %I", buf->len);
+    lua_pushinteger(L, *(i32*)&buf->bytes[buf->len - 4]);
+    buf->len -= 4;
+    return 1;
+}
 
 
 int l_buf_get_u16(lua_State* L) {
@@ -726,6 +733,7 @@ void luaopen_buf(lua_State* L) {
 
     lua_pushcfunction(L, l_buf_get_i32); lua_setfield(L, -2, "get_i32");
     lua_pushcfunction(L, l_buf_set_i32); lua_setfield(L, -2, "set_i32");
+    lua_pushcfunction(L, l_buf_pop_i32); lua_setfield(L, -2, "pop_i32");
 
     lua_pushcfunction(L, l_buf_get_i64); lua_setfield(L, -2, "get_i64");
     lua_pushcfunction(L, l_buf_set_i64); lua_setfield(L, -2, "set_i64");

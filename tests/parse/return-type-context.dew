@@ -1,0 +1,16 @@
+// explicit return
+fun _() uint8 {
+    return 300 //!error integer literal overflows uint8
+}
+
+// implicit return
+fun _() uint8 {
+    300 // no error; interpreted as 'int'
+    300 //!error integer literal overflows uint8
+}
+
+// block expression
+_ = uint8({
+    300 // no error; interpreted as 'int'
+    300 //!error integer literal overflows uint8
+})

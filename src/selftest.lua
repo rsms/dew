@@ -3,6 +3,7 @@ test_verbose = false
 all_tests = {
     "tokenize_test",
     "parse_test",
+    "intconv_test",
     "runtime/intscan_test",
     "runtime/intconv_test",
 }

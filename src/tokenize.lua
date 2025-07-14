@@ -34,7 +34,7 @@ TOK_EQ,      TOK_EQEQ                    = deftok('='),  deftok('==')
 TOK_NOT,     TOK_NOTEQ                   = deftok('!'),  deftok('!=')
 TOK_PLUS,    TOK_PLUSPLUS,   TOK_PLUSEQ  = deftok('+'),  deftok('++'), deftok('+=')
 TOK_MINUS,   TOK_MINUSMINUS, TOK_MINUSEQ = deftok('-'),  deftok('--'), deftok('-=')
-TOK_STAR,    TOK_STAREQ                  = deftok('*'),  deftok('*=')
+TOK_STAR,    TOK_STARSTAR,   TOK_STAREQ  = deftok('*'),  deftok('**'), deftok('*=')
 TOK_SLASH,   TOK_SLASHEQ                 = deftok('/'),  deftok('/=')
 TOK_PERCENT, TOK_PERCENTEQ               = deftok('%'),  deftok('%=')
 TOK_HAT,     TOK_HATEQ                   = deftok('^'),  deftok('^=')
@@ -42,13 +42,14 @@ TOK_AND,     TOK_ANDAND,     TOK_ANDEQ   = deftok('&'),  deftok('&&'), deftok('&
 TOK_OR,      TOK_OROR,       TOK_OREQ    = deftok('|'),  deftok('||'), deftok('|=')
 TOK_TILDE                                = deftok('~')
 
-TOK_COMMENT                              = deftok('COMMENT')
-TOK_ID                                   = deftok('ID')
-TOK_INT                                  = deftok('INT')   -- base 10
-TOK_INT2                                 = deftok('INT2')  -- base 2
-TOK_INT8                                 = deftok('INT8')  -- base 8
-TOK_INT16                                = deftok('INT16') -- base 16
-TOK_FLOAT                                = deftok('FLOAT')
+TOK_COMMENT = deftok('COMMENT')
+TOK_ID      = deftok('ID')
+TOK_INT     = deftok('INT')   -- base 10
+TOK_INT2    = deftok('INT2')  -- base 2
+TOK_INT8    = deftok('INT8')  -- base 8
+TOK_INT16   = deftok('INT16') -- base 16
+TOK_INTBIG  = deftok('INTBIG') -- too big
+TOK_FLOAT   = deftok('FLOAT')
 
 -- keywords
 TOK_FUN    = defkeyword('fun')
@@ -163,7 +164,9 @@ function tokenize_unit(unit)
 					break
 				end
 			elseif byte == B('+') or byte == B('-') then
-				if base ~= 10 or not allowsign then break end
+				if base ~= 10 or not allowsign then
+					break
+				end
 				value_is_int = false
 			elseif byte == B('.') then
 				if not allowdot then
@@ -192,7 +195,9 @@ function tokenize_unit(unit)
 			value, err = __rt.intscan(value, base, 0xffffffffffffffff)
 			if err ~= 0 then
 				if err == __rt.ERR_RANGE then
-					diag_err("integer literal overflows uint64")
+					-- diag_err("integer literal overflows uint64")
+					value = 0
+					return TOK_INTBIG
 				else
 					local errname, errdesc = __rt.errstr(err)
 					err_invalid("; %s", errdesc)
@@ -305,7 +310,12 @@ function tokenize_unit(unit)
 			if next_byte(B('-')) then insertsemi = true; return TOK_MINUSMINUS end
 			if next_byte(B('=')) then return TOK_MINUSEQ end
 			return TOK_MINUS
-		elseif byte == B('*') then return next_byte(B('=')) and TOK_STAREQ or TOK_STAR
+		elseif byte == B('*') then
+			if next_byte(B('*')) then return TOK_STARSTAR end
+			if next_byte(B('=')) then return TOK_STAREQ end
+			return TOK_STAR
+		-- elseif byte == 0xC3 and next_byte(0x97) then -- U+00D7 "×"
+		-- 	return TOK_STAR
 		elseif byte == B('/') then
 			if next_byte(B('/')) then
 				insertsemi = insertsemi_prev
@@ -369,7 +379,7 @@ function tokenize_unit(unit)
 		local srcpos = srcpos_make(tokstart, tokend - tokstart)
 		local p1 = tok | (srcpos & 0xffffffff)<<32
 		if value_is_int then
-			if value >= 0 and value < 0xfffffff then
+			if value >= 0 and value < 0xffffff then
 				-- squeeze value into 24 bits of token entry
 				p1 = p1 | value<<8
 				value = nil

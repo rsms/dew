@@ -1,0 +1,4 @@
+fun _ int {}              //!error missing return value (of type int)
+fun _ int { return }      //!error missing return value (of type int)
+fun _ int { return true } //!error returning bool from function with result type int
+fun _ int { true }        //!error returning bool from function with result type int

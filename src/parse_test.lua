@@ -113,25 +113,53 @@ do
 end
 
 
+local function strip_prefix(s, prefix_len) --> string
+    s = s:sub(prefix_len + 1)
+    if s:sub(1, 1) == ":" then
+        -- "error: x" => "error x"
+        s = s:sub(2)
+    end
+    return trim_string(s)
+end
+
+
 local function test_parse_and_resolve_fixture(filename)
     if test_verbose then
         dlog("parse & resolve %s", filename)
     end
     unit = unit_create_file(filename)
     local diag_errors, diag_messages = test_parse_and_resolve(unit)
+    local err_comment_prefix = "//!error"
+    local error_comments = collect_comments(unit, err_comment_prefix)
+
+    local function failme(format, ...)
+        FAIL(fmt("%s:\n" .. format, filename, ...))
+        printf("Got %d error(s):", #diag_errors)
+        for i, d in ipairs(diag_errors) do
+            print("  \"" .. d.msg .. "\"")
+        end
+        printf("Expected to find %d error match(es):", #error_comments)
+        for i, c in ipairs(error_comments) do
+            local findstr = strip_prefix(c.value, #err_comment_prefix)
+            print("  \"" .. findstr .. "\"")
+        end
+        if #diag_messages > 0 then
+            print("——————————————————————————————————————————————————————————————————————————")
+            print_diag_messages(diag_messages)
+            print("——————————————————————————————————————————————————————————————————————————")
+        end
+    end
 
     -- check if test is expected to succeed or fail by looking for "//!error" comments
     local diag_i = 1
-    local err_comment_prefix = "//!error"
-    local error_comments = collect_comments(unit, err_comment_prefix)
     for ci, c in ipairs(error_comments) do
         local line, col = srcpos_linecol(c.srcpos, unit.src)
-        local findstr = trim_string(c.value:sub(#err_comment_prefix + 1))
+        local findstr = strip_prefix(c.value, #err_comment_prefix)
         local diag = nil
         while diag_i <= #diag_errors do
             local d = diag_errors[diag_i]
             diag_i = diag_i + 1
-            if d.msg:lower():match(findstr) then
+            if d.msg:lower():find(findstr, 1, true) then
                 diag = d
                 break
             end
@@ -140,18 +168,7 @@ local function test_parse_and_resolve_fixture(filename)
             WARN("ignoring unexpected diagnostic error on line %d:\n  \"%s\"", line, d.msg)
         end
         if diag == nil then
-            FAIL(fmt("No matching diagnostic for expected error: \"%s\"", findstr))
-            printf("Got %d error(s):", #diag_errors)
-            for i, d in ipairs(diag_errors) do
-                print("  \"" .. d.msg .. "\"")
-            end
-            printf("Expected to find %d error match(es):", #error_comments)
-            for i, c in ipairs(error_comments) do
-                local findstr = trim_string(c.value:sub(#err_comment_prefix + 1))
-                print("  \"" .. findstr .. "\"")
-            end
-            print_diag_messages(diag_messages)
-            return
+            return failme("No matching diagnostic for expected error: \"%s\"", findstr)
         end
     end
 
@@ -159,8 +176,7 @@ local function test_parse_and_resolve_fixture(filename)
         print_diag_messages(diag_messages)
         return FAIL(fmt("parsing failed with %d error(s)", unit.errcount))
     elseif unit.errcount ~= #error_comments then
-        print_diag_messages(diag_messages)
-        return FAIL(fmt("expected %d error(s), got %d error(s)", #error_comments, unit.errcount))
+        return failme("expected %d error(s), got %d error(s)", #error_comments, unit.errcount)
     end
 end
 
